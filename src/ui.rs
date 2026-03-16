@@ -1,6 +1,7 @@
 use bytesize::ByteSize;
 use eframe::egui;
 
+use crate::icons::IconCache;
 use crate::tree::FileNode;
 
 fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
@@ -48,6 +49,7 @@ pub fn render_tree(
     focused_path: &mut Option<std::path::PathBuf>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
+    icon_cache: Option<&IconCache>,
 ) {
     // Skip hidden files unless show_hidden is enabled
     if !show_hidden && node.name.starts_with('.') {
@@ -92,9 +94,15 @@ pub fn render_tree(
             ui.add_space(24.0); // align with dir toggles
         }
 
-        // Icon — native folder/file icons
-        let icon = if node.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-        ui.label(icon);
+        // Icon — native system icons (with emoji fallback)
+        if let Some(icons) = icon_cache {
+            let tex = if node.is_dir { &icons.folder } else { &icons.file };
+            let icon_size = egui::vec2(16.0, 16.0);
+            ui.image(egui::load::SizedTexture::new(tex.id(), icon_size));
+        } else {
+            let icon = if node.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+            ui.label(icon);
+        }
 
         // Name — selectable for keyboard focus (highlighted when focused)
         let name_text = egui::RichText::new(&node.name).monospace();
@@ -132,6 +140,7 @@ pub fn render_tree(
                 focused_path,
                 category_filter,
                 show_hidden,
+                icon_cache,
             );
         }
     }

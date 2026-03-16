@@ -1,4 +1,5 @@
 mod categories;
+mod icons;
 mod scanner;
 mod tree;
 mod treemap;
@@ -136,6 +137,7 @@ struct App {
     category_filter: Option<categories::FileCategory>,
     category_stats: Option<categories::CategoryStats>,
     show_hidden: bool,
+    icon_cache: Option<icons::IconCache>,
 }
 
 impl Default for App {
@@ -165,6 +167,7 @@ impl Default for App {
             category_filter: None,
             category_stats: None,
             show_hidden,
+            icon_cache: None,
         }
     }
 }
@@ -239,6 +242,11 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Load system icons on first frame
+        if self.icon_cache.is_none() {
+            self.icon_cache = icons::IconCache::load(ctx);
+        }
+
         // Check if scan completed
         if let Some(ref rx) = self.receiver {
             if let Ok(tree) = rx.try_recv() {
@@ -725,6 +733,7 @@ impl eframe::App for App {
                                 &mut focused_path,
                                 cat_filter,
                                 show_hidden,
+                                self.icon_cache.as_ref(),
                             );
                         }
                     });

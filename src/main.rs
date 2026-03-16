@@ -145,6 +145,9 @@ struct App {
     last_scan_total_size: u64,
     show_categories: bool,
     tree_scroll_to_focus: bool,
+    /// Cached visible path list for keyboard navigation; rebuilt when dirty.
+    cached_visible_paths: Vec<PathBuf>,
+    visible_paths_dirty: bool,
 }
 
 impl Default for App {
@@ -180,6 +183,8 @@ impl Default for App {
             last_scan_total_size: 0,
             show_categories: false,
             tree_scroll_to_focus: false,
+            cached_visible_paths: Vec::new(),
+            visible_paths_dirty: true,
         }
     }
 }
@@ -223,6 +228,23 @@ impl App {
         });
     }
 
+    fn visible_paths(&mut self) -> &[PathBuf] {
+        if self.visible_paths_dirty {
+            self.cached_visible_paths.clear();
+            if let Some(ref tree) = self.tree {
+                ui::collect_visible_paths(
+                    tree,
+                    &self.search_query,
+                    self.category_filter,
+                    self.show_hidden,
+                    &mut self.cached_visible_paths,
+                );
+            }
+            self.visible_paths_dirty = false;
+        }
+        &self.cached_visible_paths
+    }
+
     fn batch_trash_selected(&mut self) {
         let paths = self
             .tree
@@ -235,6 +257,7 @@ impl App {
                 break;
             } else if let Some(ref mut tree) = self.tree {
                 ui::remove_node(tree, &path);
+                self.visible_paths_dirty = true;
             }
         }
     }
@@ -255,6 +278,7 @@ impl App {
                 Ok(()) => {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
+                        self.visible_paths_dirty = true;
                     }
                 }
                 Err(e) => {
@@ -286,12 +310,16 @@ impl eframe::App for App {
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;
+                self.visible_paths_dirty = true;
             }
         }
 
         // Keyboard shortcuts (only when no text input is focused)
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus {
+            // Ensure visible path cache is fresh before keyboard nav
+            self.visible_paths();
+
             // Arrow key navigation
             let (up, down, left, right) = ctx.input(|i| {
                 (
@@ -303,32 +331,25 @@ impl eframe::App for App {
             });
 
             if up || down {
-                if let Some(ref mut tree) = self.tree {
-                    let mut visible = Vec::new();
-                    ui::collect_visible_paths(
-                        tree,
-                        &self.search_query,
-                        self.category_filter,
-                        self.show_hidden,
-                        &mut visible,
-                    );
-                    if !visible.is_empty() {
-                        if let Some(ref focused) = self.focused_path {
-                            if let Some(idx) = visible.iter().position(|p| p == focused) {
-                                let new_idx = if up {
-                                    idx.saturating_sub(1)
-                                } else {
-                                    (idx + 1).min(visible.len() - 1)
-                                };
-                                self.focused_path = Some(visible[new_idx].clone());
-                            }
-                        } else {
-                            self.focused_path = Some(visible[0].clone());
+                let visible = &self.cached_visible_paths;
+                if !visible.is_empty() {
+                    if let Some(ref focused) = self.focused_path {
+                        if let Some(idx) = visible.iter().position(|p| p == focused) {
+                            let new_idx = if up {
+                                idx.saturating_sub(1)
+                            } else {
+                                (idx + 1).min(visible.len() - 1)
+                            };
+                            self.focused_path = Some(visible[new_idx].clone());
                         }
-                        // Clear selection so only the focused row is highlighted
-                        ui::clear_selection(tree);
-                        self.tree_scroll_to_focus = true;
+                    } else {
+                        self.focused_path = Some(visible[0].clone());
                     }
+                    // Clear selection so only the focused row is highlighted
+                    if let Some(ref mut tree) = self.tree {
+                        ui::clear_selection(tree);
+                    }
+                    self.tree_scroll_to_focus = true;
                 }
             }
 
@@ -341,6 +362,7 @@ impl eframe::App for App {
                             if left {
                                 if is_dir && expanded {
                                     ui::set_expanded(tree, focused, false);
+                                    self.visible_paths_dirty = true;
                                 } else if let Some(parent) =
                                     ui::find_parent_path(tree, focused)
                                 {
@@ -350,15 +372,9 @@ impl eframe::App for App {
                             } else if right {
                                 if is_dir && !expanded && has_children {
                                     ui::set_expanded(tree, focused, true);
+                                    self.visible_paths_dirty = true;
                                 } else if is_dir && expanded {
-                                    let mut visible = Vec::new();
-                                    ui::collect_visible_paths(
-                                        tree,
-                                        &self.search_query,
-                                        self.category_filter,
-                                        self.show_hidden,
-                                        &mut visible,
-                                    );
+                                    let visible = &self.cached_visible_paths;
                                     if let Some(idx) =
                                         visible.iter().position(|p| p == focused)
                                     {
@@ -386,6 +402,7 @@ impl eframe::App for App {
                 if space {
                     if let Some(ref mut tree) = self.tree {
                         ui::toggle_expand(tree, focused);
+                        self.visible_paths_dirty = true;
                     }
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
@@ -394,6 +411,7 @@ impl eframe::App for App {
                         self.error = Some(format!("Trash failed: {e}"));
                     } else if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, focused);
+                        self.visible_paths_dirty = true;
                     }
                     self.focused_path = None;
                 }
@@ -473,6 +491,7 @@ impl eframe::App for App {
                 Ok(()) => {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
+                        self.visible_paths_dirty = true;
                     }
                 }
                 Err(e) => {
@@ -549,9 +568,11 @@ impl eframe::App for App {
                     if response.changed() {
                         // Convert to lowercase once; node_matches uses lowercase comparison
                         self.search_query = self.search_query.to_lowercase();
+                        self.visible_paths_dirty = true;
                     }
                     if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
                         self.search_query.clear();
+                        self.visible_paths_dirty = true;
                     }
                 }
 
@@ -563,6 +584,7 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.show_hidden = !self.show_hidden;
+                        self.visible_paths_dirty = true;
                         // Persist preference
                         if let Some(ref path) = self.last_scan_path {
                             save_config(path, self.show_hidden);
@@ -584,6 +606,7 @@ impl eframe::App for App {
                         self.show_categories = !self.show_categories;
                         if !self.show_categories {
                             self.category_filter = None;
+                            self.visible_paths_dirty = true;
                         }
                     }
                 }
@@ -654,6 +677,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.category_filter = None;
+                            self.visible_paths_dirty = true;
                         }
 
                         ui.add_space(4.0);
@@ -717,6 +741,7 @@ impl eframe::App for App {
                                 } else {
                                     self.category_filter = Some(cat);
                                 }
+                                self.visible_paths_dirty = true;
                             }
 
                             ui.add_space(2.0);
@@ -943,6 +968,7 @@ impl eframe::App for App {
                                     self.error = Some(format!("Trash failed: {e}"));
                                 } else if let Some(ref mut tree) = self.tree {
                                     ui::remove_node(tree, path);
+                                    self.visible_paths_dirty = true;
                                 }
                             }
                             ui::TreeAction::ConfirmDelete(path) => {
@@ -962,6 +988,10 @@ impl eframe::App for App {
                     }
                     // Apply selection/expand changes
                     if let Some(ref mut tree) = self.tree {
+                        // Mark visible paths dirty if any expand/collapse actions occurred
+                        if actions.iter().any(|a| matches!(a, ui::TreeAction::ToggleExpand(_))) {
+                            self.visible_paths_dirty = true;
+                        }
                         ui::apply_tree_actions(tree, &actions);
                     }
                 }

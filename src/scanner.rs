@@ -6,6 +6,92 @@ use walkdir::WalkDir;
 
 use crate::tree::FileNode;
 
+/// Information about a mounted volume.
+pub struct VolumeInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Get total and available bytes for the filesystem containing `path`.
+#[cfg(unix)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+
+    let c_path = CString::new(path.to_str()?).ok()?;
+    let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    let block_size = stat.f_frsize;
+    let total = stat.f_blocks as u64 * block_size;
+    let available = stat.f_bavail as u64 * block_size;
+    Some((total, available))
+}
+
+#[cfg(not(unix))]
+pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// List mounted volumes. On macOS, reads `/Volumes/` and includes root `/`.
+pub fn list_volumes() -> Vec<VolumeInfo> {
+    let mut volumes = Vec::new();
+
+    // Root filesystem
+    if let Some((total, available)) = disk_space(Path::new("/")) {
+        volumes.push(VolumeInfo {
+            name: "Macintosh HD".to_string(),
+            path: PathBuf::from("/"),
+            total_bytes: total,
+            available_bytes: available,
+        });
+    }
+
+    // /Volumes entries (excludes self-referencing "Macintosh HD" symlink if present)
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Skip the root volume alias (symlink to /)
+            if let Ok(target) = std::fs::read_link(&path) {
+                if target == Path::new("/") {
+                    continue;
+                }
+            }
+
+            // Skip if it resolves to root
+            if let Ok(canonical) = std::fs::canonicalize(&path) {
+                if canonical == Path::new("/") {
+                    continue;
+                }
+            }
+
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+
+                if let Some((total, available)) = disk_space(&path) {
+                    volumes.push(VolumeInfo {
+                        name,
+                        path,
+                        total_bytes: total,
+                        available_bytes: available,
+                    });
+                }
+            }
+        }
+    }
+
+    volumes
+}
+
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,

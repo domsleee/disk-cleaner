@@ -721,6 +721,7 @@ impl eframe::App for App {
                     let cat_filter = self.category_filter;
                     let show_hidden = self.show_hidden;
                     let mut focused_path = self.focused_path.clone();
+                    let mut row_clicks = Vec::new();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         if let Some(ref mut tree) = self.tree {
                             let root_size = tree.size;
@@ -734,10 +735,17 @@ impl eframe::App for App {
                                 cat_filter,
                                 show_hidden,
                                 self.icon_cache.as_ref(),
+                                &mut row_clicks,
                             );
                         }
                     });
                     self.focused_path = focused_path;
+                    // Apply selection changes from row clicks
+                    if !row_clicks.is_empty() {
+                        if let Some(ref mut tree) = self.tree {
+                            ui::apply_row_clicks(tree, &row_clicks);
+                        }
+                    }
                 }
                 ViewMode::Treemap => {
                     if let Some(ref tree) = self.tree {

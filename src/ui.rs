@@ -39,6 +39,30 @@ pub fn count_selected(node: &FileNode) -> usize {
     }
 }
 
+/// Clear the `selected` flag on all nodes in the tree.
+pub fn clear_selection(node: &mut FileNode) {
+    node.selected = false;
+    for child in &mut node.children {
+        clear_selection(child);
+    }
+}
+
+/// Set `selected = true` on the node matching `target`. Returns true if found.
+fn select_node(node: &mut FileNode, target: &std::path::Path) -> bool {
+    if node.path == target {
+        node.selected = true;
+        return true;
+    }
+    node.children.iter_mut().any(|c| select_node(c, target))
+}
+
+/// Tracks row clicks that occurred during rendering so the caller can
+/// update selection state after the full tree has been rendered.
+pub struct RowClick {
+    pub path: std::path::PathBuf,
+    pub shift: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_tree(
     ui: &mut egui::Ui,
@@ -50,6 +74,7 @@ pub fn render_tree(
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
     icon_cache: Option<&IconCache>,
+    row_clicks: &mut Vec<RowClick>,
 ) {
     // Skip hidden files unless show_hidden is enabled
     if !show_hidden && node.name.starts_with('.') {
@@ -77,12 +102,13 @@ pub fn render_tree(
         1.0
     };
     let is_focused = focused_path.as_deref() == Some(node.path.as_path());
+    let is_selected = node.selected;
 
-    ui.horizontal(|ui| {
+    // Paint selection background behind row content
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+
+    let row_response = ui.horizontal(|ui| {
         ui.add_space(indent);
-
-        // Multi-select checkbox
-        ui.checkbox(&mut node.selected, "");
 
         // Expand/collapse toggle for directories
         if node.is_dir {
@@ -104,9 +130,15 @@ pub fn render_tree(
             ui.label(icon);
         }
 
-        // Name — selectable for keyboard focus (highlighted when focused)
+        // Name — selectable for keyboard focus (highlighted when focused/selected)
         let name_text = egui::RichText::new(&node.name).monospace();
-        if ui.selectable_label(is_focused, name_text).clicked() {
+        let name_response = ui.selectable_label(is_focused || is_selected, name_text);
+        if name_response.clicked() {
+            let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+            row_clicks.push(RowClick {
+                path: node.path.clone(),
+                shift,
+            });
             *focused_path = Some(node.path.clone());
         }
 
@@ -124,7 +156,16 @@ pub fn render_tree(
         // Size label — right-aligned with fixed width for alignment
         let size_text = egui::RichText::new(format!("{:>10}", size_str)).monospace();
         ui.label(size_text);
-    });
+    }).response;
+
+    // Fill in the selection background now that we know the row rect
+    if is_selected {
+        let sel_color = ui.visuals().selection.bg_fill.linear_multiply(0.3);
+        ui.painter().set(
+            bg_idx,
+            egui::Shape::rect_filled(row_response.rect, 0.0, sel_color),
+        );
+    }
 
     // Render children if expanded (or auto-expanded by active filter)
     let show_children = node.is_dir && (node.expanded || !filter.is_empty());
@@ -141,9 +182,34 @@ pub fn render_tree(
                 category_filter,
                 show_hidden,
                 icon_cache,
+                row_clicks,
             );
         }
     }
+}
+
+/// Process row clicks collected during rendering to update selection state.
+pub fn apply_row_clicks(tree: &mut FileNode, clicks: &[RowClick]) {
+    for click in clicks {
+        if click.shift {
+            // Shift/Cmd+click: toggle the clicked node's selection
+            toggle_selected(tree, &click.path);
+        } else {
+            // Plain click: deselect all, then select clicked node
+            clear_selection(tree);
+            select_node(tree, &click.path);
+        }
+    }
+}
+
+fn toggle_selected(node: &mut FileNode, target: &std::path::Path) -> bool {
+    if node.path == target {
+        node.selected = !node.selected;
+        return true;
+    }
+    node.children
+        .iter_mut()
+        .any(|c| toggle_selected(c, target))
 }
 
 /// Toggle expand/collapse for the node at `target`. Returns true if found.

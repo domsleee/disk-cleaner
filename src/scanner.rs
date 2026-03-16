@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -99,14 +100,57 @@ pub struct ScanProgress {
     pub cancelled: AtomicBool,
 }
 
+/// Build a set of paths to skip during scanning to avoid double-counting.
+/// On macOS APFS, `/System/Volumes/Data` contains the real user data but is also
+/// accessible via firmlinks (e.g. `/Users` → `/System/Volumes/Data/Users`).
+/// Scanning from `/` without skipping Data counts everything twice.
+fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
+    let mut skip = HashSet::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        let data_vol = Path::new("/System/Volumes/Data");
+        // Only skip Data volume when scanning from a path that isn't under it
+        if !root.starts_with(data_vol) {
+            // Read firmlinks list to find which paths are mirrored
+            if let Ok(content) = std::fs::read_to_string("/usr/share/firmlinks") {
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() == 2 {
+                        // Each firmlink: /Source\tDataRelative
+                        // Skip /System/Volumes/Data/<DataRelative> since /Source covers it
+                        let data_path = data_vol.join(parts[1]);
+                        if root.starts_with(&data_path) || !root.starts_with(data_vol) {
+                            skip.insert(data_path);
+                        }
+                    }
+                }
+            }
+            // Also skip other volume mounts that inflate size
+            for sub in &["Preboot", "Recovery", "VM", "Update", "BaseSystem",
+                         "FieldService", "FieldServiceDiagnostic", "FieldServiceRepair",
+                         "iSCPreboot", "xarts", "Hardware"] {
+                let p = Path::new("/System/Volumes").join(sub);
+                if p.exists() && !root.starts_with(&p) {
+                    skip.insert(p);
+                }
+            }
+        }
+    }
+
+    let _ = root; // suppress unused warning on non-macOS
+    Arc::new(skip)
+}
+
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
-    let mut root_node = walk_dir(root, &progress);
+    let skip = build_skip_set(root);
+    let mut root_node = walk_dir(root, &progress, &skip);
     root_node.expanded = true;
     root_node
 }
 
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
-fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>) -> FileNode {
+fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -144,7 +188,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>) -> FileNode {
             let path = entry.path();
 
             if ft.is_dir() {
-                Some(walk_dir(&path, progress))
+                if skip.contains(&path) {
+                    return None;
+                }
+                Some(walk_dir(&path, progress, skip))
             } else if ft.is_file() {
                 let metadata = entry.metadata().ok()?;
                 let len = metadata.len();
@@ -265,5 +312,24 @@ mod tests {
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress);
         assert!(!root.children[0].expanded);
+    }
+
+    #[test]
+    fn cancelled_scan_returns_empty_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file.bin"), vec![0u8; 100]).unwrap();
+        fs::write(tmp.path().join("root.txt"), "data").unwrap();
+
+        let progress = new_progress();
+        // Cancel before scanning starts
+        progress.cancelled.store(true, Ordering::Relaxed);
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        // Cancelled scan should produce an empty root with no children
+        assert!(root.children.is_empty());
+        assert_eq!(root.size, 0);
+        assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
     }
 }

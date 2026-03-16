@@ -1,3 +1,4 @@
+mod app_icon;
 mod categories;
 mod icons;
 mod scanner;
@@ -99,7 +100,9 @@ fn main() -> eframe::Result {
     }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_icon(app_icon::generate()),
         ..Default::default()
     };
 

@@ -851,6 +851,7 @@ dependencies = [
  "eframe",
  "rfd",
  "serde_json",
+ "tempfile",
  "trash",
  "walkdir",
 ]

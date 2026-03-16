@@ -21,8 +21,7 @@ fn size_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
 
 /// Returns true if this node's name matches the query or any descendant does.
 pub fn node_matches(node: &FileNode, query: &str) -> bool {
-    node.name.to_lowercase().contains(query)
-        || node.children.iter().any(|c| node_matches(c, query))
+    node.name.to_lowercase().contains(query) || node.children.iter().any(|c| node_matches(c, query))
 }
 
 pub fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
@@ -103,8 +102,7 @@ pub fn render_tree(
         let painter = ui.painter();
         painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
         let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-        let fill_rect =
-            egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_height));
+        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_height));
         painter.rect_filled(fill_rect, 2.0, color);
 
         // Size label
@@ -124,7 +122,15 @@ pub fn render_tree(
     if show_children {
         let node_size = node.size;
         for child in &mut node.children {
-            render_tree(ui, child, depth + 1, node_size, actions, filter, focused_path);
+            render_tree(
+                ui,
+                child,
+                depth + 1,
+                node_size,
+                actions,
+                filter,
+                focused_path,
+            );
         }
     }
 }
@@ -157,4 +163,114 @@ pub fn remove_node(node: &mut FileNode, target: &std::path::Path) -> Option<u64>
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{dir, leaf};
+
+    #[test]
+    fn node_matches_direct_name() {
+        let node = leaf("readme.md", 10);
+        assert!(node_matches(&node, "readme"));
+        assert!(node_matches(&node, "readme")); // query is pre-lowercased by caller
+        assert!(!node_matches(&node, "cargo"));
+    }
+
+    #[test]
+    fn node_matches_descendant() {
+        let tree = dir("root", vec![dir("src", vec![leaf("main.rs", 50)])]);
+        assert!(node_matches(&tree, "main"));
+        assert!(node_matches(&tree, "src"));
+        assert!(!node_matches(&tree, "missing"));
+    }
+
+    #[test]
+    fn collect_selected_returns_selected_nodes() {
+        let mut tree = dir(
+            "root",
+            vec![leaf("a.txt", 10), leaf("b.txt", 20), leaf("c.txt", 30)],
+        );
+        tree.children[0].selected = true;
+        tree.children[2].selected = true;
+
+        let selected = collect_selected(&tree);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&tree.children[0].path));
+        assert!(selected.contains(&tree.children[2].path));
+    }
+
+    #[test]
+    fn collect_selected_stops_at_selected_parent() {
+        let mut tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 5)])]);
+        tree.children[0].selected = true;
+
+        let selected = collect_selected(&tree);
+        // Should return the parent, not recurse into children
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], tree.children[0].path);
+    }
+
+    #[test]
+    fn count_selected_counts_correctly() {
+        let mut tree = dir(
+            "root",
+            vec![leaf("a.txt", 10), leaf("b.txt", 20), leaf("c.txt", 30)],
+        );
+        assert_eq!(count_selected(&tree), 0);
+        tree.children[1].selected = true;
+        assert_eq!(count_selected(&tree), 1);
+        tree.children[2].selected = true;
+        assert_eq!(count_selected(&tree), 2);
+    }
+
+    #[test]
+    fn toggle_expand_flips_target() {
+        let mut tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 1)])]);
+        assert!(!tree.children[0].expanded);
+
+        toggle_expand(&mut tree, std::path::Path::new("sub"));
+        assert!(tree.children[0].expanded);
+
+        toggle_expand(&mut tree, std::path::Path::new("sub"));
+        assert!(!tree.children[0].expanded);
+    }
+
+    #[test]
+    fn toggle_expand_returns_false_for_missing() {
+        let mut tree = dir("root", vec![]);
+        assert!(!toggle_expand(&mut tree, std::path::Path::new("nope")));
+    }
+
+    #[test]
+    fn remove_node_direct_child() {
+        let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        assert_eq!(tree.size, 30);
+
+        let removed = remove_node(&mut tree, std::path::Path::new("a.txt"));
+        assert_eq!(removed, Some(10));
+        assert_eq!(tree.size, 20);
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].name, "b.txt");
+    }
+
+    #[test]
+    fn remove_node_nested() {
+        let mut tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 100)])]);
+        assert_eq!(tree.size, 100);
+
+        let removed = remove_node(&mut tree, std::path::Path::new("deep.txt"));
+        assert_eq!(removed, Some(100));
+        assert_eq!(tree.size, 0);
+        assert_eq!(tree.children[0].size, 0);
+        assert!(tree.children[0].children.is_empty());
+    }
+
+    #[test]
+    fn remove_node_returns_none_for_missing() {
+        let mut tree = dir("root", vec![leaf("a.txt", 10)]);
+        assert_eq!(remove_node(&mut tree, std::path::Path::new("nope")), None);
+        assert_eq!(tree.size, 10); // unchanged
+    }
 }

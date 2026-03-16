@@ -141,6 +141,8 @@ struct App {
     category_stats: Option<categories::CategoryStats>,
     show_hidden: bool,
     icon_cache: Option<icons::IconCache>,
+    last_scan_file_count: u64,
+    last_scan_total_size: u64,
 }
 
 impl Default for App {
@@ -172,6 +174,8 @@ impl Default for App {
             category_stats: None,
             show_hidden,
             icon_cache: None,
+            last_scan_file_count: 0,
+            last_scan_total_size: 0,
         }
     }
 }
@@ -273,6 +277,8 @@ impl eframe::App for App {
                 if let Some(ref mut t) = self.tree {
                     tree::auto_expand(t, 0, 2);
                 }
+                self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
+                self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;
@@ -612,13 +618,31 @@ impl eframe::App for App {
                 });
         }
 
-        // Bottom status bar with version
+        // Bottom status bar with scan info + version
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .small()
-                        .weak(),
+                if let Some(ref path) = self.scan_path {
+                    if !self.scanning && self.last_scan_file_count > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} \u{2014} {} files \u{2014} {}",
+                                path.display(),
+                                self.last_scan_file_count,
+                                bytesize::ByteSize::b(self.last_scan_total_size)
+                            ))
+                            .small(),
+                        );
+                    }
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .small()
+                                .weak(),
+                        );
+                    },
                 );
             });
         });

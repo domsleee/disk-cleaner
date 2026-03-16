@@ -984,6 +984,7 @@ dependencies = [
  "criterion",
  "dirs",
  "eframe",
+ "libc",
  "rfd",
  "serde_json",
  "tempfile",

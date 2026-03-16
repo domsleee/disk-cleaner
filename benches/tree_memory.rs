@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
+use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
@@ -128,5 +129,106 @@ fn bench_tree_ops(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_memory_synthetic, bench_tree_ops);
+/// Memory benchmark for a large synthetic tree (10,000 files / 500 dirs)
+fn bench_memory_large_synthetic(c: &mut Criterion) {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..500 {
+        let dir = tmp.path().join(format!("dir_{i:04}"));
+        fs::create_dir(&dir).unwrap();
+        for j in 0..20 {
+            fs::write(dir.join(format!("file_{j}.dat")), vec![0u8; 4096]).unwrap();
+        }
+    }
+
+    c.bench_function("memory_10000_files_500_dirs", |b| {
+        b.iter(|| {
+            let progress = new_progress();
+            scanner::scan_directory(tmp.path(), progress)
+        })
+    });
+
+    // Print memory report for large tree
+    reset_tracking();
+    let progress = new_progress();
+    let before = ALLOCATED.load(Ordering::SeqCst);
+    let tree = scanner::scan_directory(tmp.path(), progress.clone());
+    let after = ALLOCATED.load(Ordering::SeqCst);
+    let nodes = count_nodes(&tree);
+    let files = progress.file_count.load(Ordering::Relaxed);
+    eprintln!("\n=== Memory Report: 10,000 files / 500 dirs ===");
+    eprintln!("Nodes: {nodes}");
+    eprintln!("Files scanned: {files}");
+    eprintln!(
+        "Memory delta: {} bytes ({:.1} KB)",
+        after.saturating_sub(before),
+        after.saturating_sub(before) as f64 / 1024.0
+    );
+    eprintln!(
+        "Bytes per node: {:.0}",
+        after.saturating_sub(before) as f64 / nodes as f64
+    );
+    eprintln!(
+        "Peak allocation: {} bytes ({:.1} KB)",
+        PEAK.load(Ordering::SeqCst),
+        PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+    );
+    eprintln!("================================================\n");
+    std::hint::black_box(tree);
+}
+
+/// Benchmark squarify treemap layout at various sizes (render performance)
+fn bench_squarify(c: &mut Criterion) {
+    // 100 items — typical directory
+    let sizes_100: Vec<f64> = (1..=100).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_100_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_100, 0.0, 0.0, 1200.0, 800.0))
+    });
+
+    // 1000 items — large directory
+    let sizes_1000: Vec<f64> = (1..=1000).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_1000_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_1000, 0.0, 0.0, 1200.0, 800.0))
+    });
+
+    // 10,000 items — stress test
+    let sizes_10k: Vec<f64> = (1..=10_000).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_10000_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_10k, 0.0, 0.0, 1200.0, 800.0))
+    });
+}
+
+/// Benchmark tree navigation (find_node, breadcrumbs) used during rendering
+fn bench_tree_navigation(c: &mut Criterion) {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..100 {
+        let dir = tmp.path().join(format!("dir_{i:03}"));
+        fs::create_dir(&dir).unwrap();
+        for j in 0..10 {
+            fs::write(dir.join(format!("file_{j}.bin")), vec![0u8; 1024]).unwrap();
+        }
+    }
+
+    let progress = new_progress();
+    let tree = scanner::scan_directory(tmp.path(), progress);
+
+    // Find a deep node
+    let deep_path = tmp.path().join("dir_050").join("file_5.bin");
+    c.bench_function("find_node_1100_nodes", |b| {
+        b.iter(|| treemap::find_node(&tree, &deep_path))
+    });
+
+    let dir_path = tmp.path().join("dir_050");
+    c.bench_function("breadcrumbs_1100_nodes", |b| {
+        b.iter(|| treemap::breadcrumbs(&tree, &dir_path))
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_memory_synthetic,
+    bench_memory_large_synthetic,
+    bench_tree_ops,
+    bench_squarify,
+    bench_tree_navigation,
+);
 criterion_main!(benches);

@@ -26,20 +26,33 @@ fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("disk-cleaner").join("config.json"))
 }
 
-fn load_last_path() -> Option<PathBuf> {
-    let path = config_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let last = json["last_path"].as_str()?;
-    Some(PathBuf::from(last))
+fn load_config() -> (Option<PathBuf>, bool) {
+    let path = match config_path() {
+        Some(p) => p,
+        None => return (None, false),
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return (None, false),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(_) => return (None, false),
+    };
+    let last = json["last_path"].as_str().map(PathBuf::from);
+    let show_hidden = json["show_hidden"].as_bool().unwrap_or(false);
+    (last, show_hidden)
 }
 
-fn save_last_path(path: &std::path::Path) {
+fn save_config(last_path: &std::path::Path, show_hidden: bool) {
     if let Some(config) = config_path() {
         if let Some(parent) = config.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let json = serde_json::json!({ "last_path": path.to_string_lossy() });
+        let json = serde_json::json!({
+            "last_path": last_path.to_string_lossy(),
+            "show_hidden": show_hidden,
+        });
         let _ = std::fs::write(config, json.to_string());
     }
 }
@@ -77,10 +90,12 @@ struct App {
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
     category_filter: Option<categories::FileCategory>,
     category_stats: Option<categories::CategoryStats>,
+    show_hidden: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
+        let (last_scan_path, show_hidden) = load_config();
         Self {
             tree: None,
             scanning: false,
@@ -95,7 +110,7 @@ impl Default for App {
             confirm_batch_delete: false,
             search_query: String::new(),
             focused_path: None,
-            last_scan_path: load_last_path(),
+            last_scan_path,
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
@@ -104,13 +119,14 @@ impl Default for App {
             scan_disk_info: None,
             category_filter: None,
             category_stats: None,
+            show_hidden,
         }
     }
 }
 
 impl App {
     fn start_scan(&mut self, path: PathBuf) {
-        save_last_path(&path);
+        save_config(&path, self.show_hidden);
         self.last_scan_path = Some(path.clone());
         self.scanning = true;
         self.error = None;
@@ -373,6 +389,25 @@ impl eframe::App for App {
                     }
                     if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
                         self.search_query.clear();
+                    }
+                }
+
+                // Hidden files toggle
+                if self.tree.is_some() {
+                    ui.separator();
+                    if ui
+                        .selectable_label(self.show_hidden, "Show hidden")
+                        .clicked()
+                    {
+                        self.show_hidden = !self.show_hidden;
+                        // Persist preference
+                        if let Some(ref path) = self.last_scan_path {
+                            save_config(path, self.show_hidden);
+                        }
+                        // Recompute stats
+                        if let Some(ref tree) = self.tree {
+                            self.category_stats = Some(categories::compute_stats(tree));
+                        }
                     }
                 }
 
@@ -648,6 +683,7 @@ impl eframe::App for App {
                 ViewMode::Tree => {
                     let filter = self.search_query.clone();
                     let cat_filter = self.category_filter;
+                    let show_hidden = self.show_hidden;
                     let mut focused_path = self.focused_path.clone();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let mut actions = Vec::new();
@@ -662,6 +698,7 @@ impl eframe::App for App {
                                 &filter,
                                 &mut focused_path,
                                 cat_filter,
+                                show_hidden,
                             );
                         }
                         self.process_actions(actions);
@@ -677,6 +714,7 @@ impl eframe::App for App {
                             &self.focused_path,
                             self.treemap_zoom_anim,
                             self.category_filter,
+                            self.show_hidden,
                         );
                         for action in tm_actions {
                             match action {

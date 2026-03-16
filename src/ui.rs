@@ -54,7 +54,13 @@ pub fn render_tree(
     filter: &str,
     focused_path: &mut Option<std::path::PathBuf>,
     category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
 ) {
+    // Skip hidden files unless show_hidden is enabled
+    if !show_hidden && node.name.starts_with('.') {
+        return;
+    }
+
     // Skip nodes that don't match the active text filter
     if !filter.is_empty() && !node_matches(node, filter) {
         return;
@@ -140,6 +146,7 @@ pub fn render_tree(
                 filter,
                 focused_path,
                 category_filter,
+                show_hidden,
             );
         }
     }

@@ -211,11 +211,7 @@ impl eframe::App for App {
         let mut close_batch_dialog = false;
 
         if self.confirm_batch_delete {
-            let selected_count = self
-                .tree
-                .as_ref()
-                .map(ui::count_selected)
-                .unwrap_or(0);
+            let selected_count = self.tree.as_ref().map(ui::count_selected).unwrap_or(0);
             egui::Window::new("Confirm Batch Delete")
                 .collapsible(false)
                 .resizable(false)
@@ -326,11 +322,7 @@ impl eframe::App for App {
                 }
 
                 // Batch operation buttons (only shown when items are selected)
-                let selected_count = self
-                    .tree
-                    .as_ref()
-                    .map(ui::count_selected)
-                    .unwrap_or(0);
+                let selected_count = self.tree.as_ref().map(ui::count_selected).unwrap_or(0);
                 if selected_count > 0 {
                     ui.separator();
                     if ui
@@ -352,8 +344,14 @@ impl eframe::App for App {
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
                     let size = self.scan_progress.total_size.load(Ordering::Relaxed);
                     let size_str = bytesize::ByteSize::b(size).to_string();
-                    let path_str = self.scan_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                    ui.monospace(format!("Indexing: {path_str} {files} files, {size_str} ..."));
+                    let path_str = self
+                        .scan_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    ui.monospace(format!(
+                        "Indexing: {path_str} {files} files, {size_str} ..."
+                    ));
                     ctx.request_repaint();
                 }
 
@@ -387,7 +385,15 @@ impl eframe::App for App {
                 let mut actions = Vec::new();
                 if let Some(ref mut tree) = self.tree {
                     let root_size = tree.size;
-                    ui::render_tree(ui, tree, 0, root_size, &mut actions, &filter, &mut focused_path);
+                    ui::render_tree(
+                        ui,
+                        tree,
+                        0,
+                        root_size,
+                        &mut actions,
+                        &filter,
+                        &mut focused_path,
+                    );
                 }
                 self.process_actions(actions);
             });

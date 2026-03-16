@@ -4,13 +4,13 @@ use eframe::egui;
 use crate::icons::IconCache;
 use crate::tree::FileNode;
 
-/// Paint a disclosure triangle (▶ or ▼) as a clickable toggle.
-/// Uses the painter directly so it renders in any font.
-fn disclosure_toggle(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+/// Paint a disclosure triangle (▶ or ▼). Visual only — click detection is
+/// handled by the unified row interaction.
+fn paint_disclosure(ui: &mut egui::Ui, expanded: bool) -> egui::Rect {
     let size = egui::vec2(16.0, 16.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
+        let color = ui.visuals().text_color();
         let center = rect.center();
         let half = 4.0;
         let triangle = if expanded {
@@ -30,11 +30,11 @@ fn disclosure_toggle(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
         };
         ui.painter().add(egui::Shape::convex_polygon(
             triangle,
-            visuals.fg_stroke.color,
+            color,
             egui::Stroke::NONE,
         ));
     }
-    response
+    rect
 }
 
 fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
@@ -89,164 +89,275 @@ fn select_node(node: &mut FileNode, target: &std::path::Path) -> bool {
     node.children.iter_mut().any(|c| select_node(c, target))
 }
 
-/// Tracks row clicks that occurred during rendering so the caller can
-/// update selection state after the full tree has been rendered.
-pub struct RowClick {
-    pub path: std::path::PathBuf,
-    pub shift: bool,
+/// Actions produced by tree rendering, applied after the frame.
+pub enum TreeAction {
+    ToggleExpand(std::path::PathBuf),
+    Click {
+        path: std::path::PathBuf,
+        shift: bool,
+    },
+    Focus(std::path::PathBuf),
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn render_tree(
-    ui: &mut egui::Ui,
-    node: &mut FileNode,
+/// Flattened row data for virtualized rendering.
+struct VisibleRow {
+    path: std::path::PathBuf,
+    name: String,
+    size: u64,
+    is_dir: bool,
+    expanded: bool,
+    selected: bool,
+    depth: usize,
+    parent_size: u64,
+    children_count: usize,
+}
+
+fn collect_visible_rows(
+    node: &FileNode,
     depth: usize,
     parent_size: u64,
     filter: &str,
-    focused_path: &mut Option<std::path::PathBuf>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    icon_cache: Option<&IconCache>,
-    row_clicks: &mut Vec<RowClick>,
+    result: &mut Vec<VisibleRow>,
 ) {
-    // Skip hidden files unless show_hidden is enabled
     if !show_hidden && node.name.starts_with('.') {
         return;
     }
-
-    // Skip nodes that don't match the active text filter
     if !filter.is_empty() && !node_matches(node, filter) {
         return;
     }
-
-    // Skip nodes that don't match the category filter
     if let Some(cat) = category_filter {
         if !crate::categories::node_matches_category(node, cat) {
             return;
         }
     }
 
-    let indent = depth as f32 * 20.0;
-    let size_str = ByteSize::b(node.size).to_string();
-    let bcolor = bar_color(node.size, ui);
-    let proportion = if parent_size > 0 {
-        (node.size as f64 / parent_size as f64) as f32
-    } else {
-        1.0
-    };
-    let is_focused = focused_path.as_deref() == Some(node.path.as_path());
-    let is_selected = node.selected;
+    result.push(VisibleRow {
+        path: node.path.clone(),
+        name: node.name.clone(),
+        size: node.size,
+        is_dir: node.is_dir,
+        expanded: node.expanded,
+        selected: node.selected,
+        depth,
+        parent_size,
+        children_count: node.children.len(),
+    });
 
-    // Paint selection background behind row content
-    let bg_idx = ui.painter().add(egui::Shape::Noop);
-
-    let row_response = ui.horizontal(|ui| {
-        ui.add_space(indent);
-
-        // Expand/collapse toggle for directories
-        if node.is_dir {
-            if disclosure_toggle(ui, node.expanded).clicked() {
-                node.expanded = !node.expanded;
-            }
-        } else {
-            // Allocate same 16x16 rect as disclosure toggle so icons align
-            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-        }
-
-        // Icon — native system icons (with emoji fallback)
-        if let Some(icons) = icon_cache {
-            let tex = if node.is_dir { &icons.folder } else { &icons.file };
-            let icon_size = egui::vec2(16.0, 16.0);
-            ui.image(egui::load::SizedTexture::new(tex.id(), icon_size));
-        } else {
-            let icon = if node.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-            ui.label(icon);
-        }
-
-        // Name — selectable for keyboard focus (highlighted when focused/selected)
-        let name_text = egui::RichText::new(&node.name).monospace();
-        let name_response = ui.selectable_label(is_focused || is_selected, name_text);
-        if node.is_dir {
-            name_response.clone().on_hover_text(format!(
-                "{}\n{} \u{2014} {} items",
-                node.path.display(),
-                ByteSize::b(node.size),
-                node.children.len()
-            ));
-        } else {
-            name_response.clone().on_hover_text(format!(
-                "{}\n{}",
-                node.path.display(),
-                ByteSize::b(node.size)
-            ));
-        }
-        if name_response.clicked() {
-            let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
-            row_clicks.push(RowClick {
-                path: node.path.clone(),
-                shift,
-            });
-            *focused_path = Some(node.path.clone());
-        }
-
-        // Size bar + label — right-aligned so they stay in a fixed column
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let size_text = egui::RichText::new(format!("{:>10}", size_str)).monospace();
-            ui.label(size_text);
-
-            let bar_width = 80.0_f32;
-            let bar_height = 10.0_f32;
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
-            let painter = ui.painter();
-            painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-            let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-            let fill_rect =
-                egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_height));
-            painter.rect_filled(fill_rect, 2.0, bcolor);
-        });
-    }).response;
-
-    // Fill in the selection background now that we know the row rect
-    if is_selected {
-        let sel_color = ui.visuals().selection.bg_fill.linear_multiply(0.3);
-        ui.painter().set(
-            bg_idx,
-            egui::Shape::rect_filled(row_response.rect, 0.0, sel_color),
-        );
-    }
-
-    // Render children if expanded (or auto-expanded by active filter)
     let show_children = node.is_dir && (node.expanded || !filter.is_empty());
     if show_children {
-        let node_size = node.size;
-        for child in &mut node.children {
-            render_tree(
-                ui,
+        for child in &node.children {
+            collect_visible_rows(
                 child,
                 depth + 1,
-                node_size,
+                node.size,
                 filter,
-                focused_path,
                 category_filter,
                 show_hidden,
-                icon_cache,
-                row_clicks,
+                result,
             );
         }
     }
 }
 
-/// Process row clicks collected during rendering to update selection state.
-pub fn apply_row_clicks(tree: &mut FileNode, clicks: &[RowClick]) {
-    for click in clicks {
-        if click.shift {
-            // Shift/Cmd+click: toggle the clicked node's selection
-            toggle_selected(tree, &click.path);
-        } else {
-            // Plain click: deselect all, then select clicked node
-            clear_selection(tree);
-            select_node(tree, &click.path);
+/// Render the tree view with virtualized scrolling. Returns actions to apply.
+#[allow(clippy::too_many_arguments)]
+pub fn render_tree(
+    ui: &mut egui::Ui,
+    tree: &FileNode,
+    root_size: u64,
+    filter: &str,
+    focused_path: &Option<std::path::PathBuf>,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    icon_cache: Option<&IconCache>,
+    scroll_to_focus: bool,
+) -> Vec<TreeAction> {
+    let mut rows = Vec::new();
+    collect_visible_rows(
+        tree,
+        0,
+        root_size,
+        filter,
+        category_filter,
+        show_hidden,
+        &mut rows,
+    );
+
+    let total_rows = rows.len();
+    let row_height = 20.0_f32;
+    let mut actions = Vec::new();
+
+    let focused_idx =
+        focused_path
+            .as_ref()
+            .and_then(|fp| rows.iter().position(|r| r.path == *fp));
+
+    let row_total = row_height + ui.spacing().item_spacing.y;
+
+    let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+
+    // Scroll to focused row when arrow keys move focus
+    if scroll_to_focus {
+        if let Some(idx) = focused_idx {
+            let target_y = idx as f32 * row_total;
+            let viewport_h = ui.available_height();
+            scroll_area = scroll_area.vertical_scroll_offset(
+                (target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0),
+            );
+        }
+    }
+
+    scroll_area.show_rows(ui, row_height, total_rows, |ui, range| {
+        for i in range {
+            let row = &rows[i];
+            let indent = row.depth as f32 * 20.0;
+            let bcolor = bar_color(row.size, ui);
+            let proportion = if row.parent_size > 0 {
+                (row.size as f64 / row.parent_size as f64) as f32
+            } else {
+                1.0
+            };
+            let is_focused = Some(i) == focused_idx;
+
+            // Placeholder for background fill (painted after we know the row rect)
+            let bg_idx = ui.painter().add(egui::Shape::Noop);
+
+            let row_response = ui.horizontal(|ui| {
+                ui.set_min_height(row_height);
+                ui.add_space(indent);
+
+                // Disclosure toggle (visual only — click handled by row interaction)
+                let toggle_right = if row.is_dir {
+                    paint_disclosure(ui, row.expanded).right()
+                } else {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    rect.right()
+                };
+
+                // Icon
+                if let Some(icons) = icon_cache {
+                    let tex = if row.is_dir { &icons.folder } else { &icons.file };
+                    ui.image(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(16.0, 16.0),
+                    ));
+                } else {
+                    let icon = if row.is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+                    ui.label(icon);
+                }
+
+                // Name
+                ui.label(egui::RichText::new(&row.name).monospace());
+
+                // Size bar + label (right-aligned)
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let size_str = ByteSize::b(row.size).to_string();
+                        ui.label(
+                            egui::RichText::new(format!("{:>10}", size_str)).monospace(),
+                        );
+
+                        let bar_width = 80.0_f32;
+                        let bar_h = 10.0_f32;
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(bar_width, bar_h),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+                        let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
+                        let fill_rect =
+                            egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h));
+                        painter.rect_filled(fill_rect, 2.0, bcolor);
+                    },
+                );
+
+                toggle_right
+            });
+
+            let toggle_right = row_response.inner;
+            let row_rect = row_response.response.rect;
+
+            // Single row interaction — toggle vs click determined by pointer position
+            let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
+            let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
+
+            if row_interact.clicked() {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    if row.is_dir && pos.x <= toggle_right {
+                        // Click on disclosure triangle area → toggle expand
+                        actions.push(TreeAction::ToggleExpand(row.path.clone()));
+                    } else {
+                        // Click on content area → select/focus
+                        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                        actions.push(TreeAction::Click {
+                            path: row.path.clone(),
+                            shift,
+                        });
+                        actions.push(TreeAction::Focus(row.path.clone()));
+                    }
+                }
+            }
+
+            // Tooltip (lazy via closure — avoids format! allocation unless hovered)
+            if row.is_dir {
+                let children_count = row.children_count;
+                let size = row.size;
+                let path = &row.path;
+                row_interact.on_hover_ui(|ui| {
+                    ui.label(format!(
+                        "{}\n{} \u{2014} {} items",
+                        path.display(),
+                        ByteSize::b(size),
+                        children_count
+                    ));
+                });
+            } else {
+                let size = row.size;
+                let path = &row.path;
+                row_interact.on_hover_ui(|ui| {
+                    ui.label(format!("{}\n{}", path.display(), ByteSize::b(size)));
+                });
+            }
+
+            // Focus/selection background — both use blue selection color
+            if row.selected || is_focused {
+                let bg_color = if row.selected {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.3)
+                } else {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.4)
+                };
+                ui.painter().set(
+                    bg_idx,
+                    egui::Shape::rect_filled(row_rect, 0.0, bg_color),
+                );
+            }
+        }
+    });
+
+    actions
+}
+
+/// Apply tree actions to update tree state after rendering.
+pub fn apply_tree_actions(tree: &mut FileNode, actions: &[TreeAction]) {
+    for action in actions {
+        match action {
+            TreeAction::ToggleExpand(path) => {
+                toggle_expand(tree, path);
+            }
+            TreeAction::Click { path, shift } => {
+                if *shift {
+                    toggle_selected(tree, path);
+                } else {
+                    clear_selection(tree);
+                    select_node(tree, path);
+                }
+            }
+            TreeAction::Focus(_) => {} // handled by caller updating focused_path
         }
     }
 }
@@ -289,6 +400,70 @@ pub fn remove_node(node: &mut FileNode, target: &std::path::Path) -> Option<u64>
     }
 
     None
+}
+
+/// Collect paths of all visible nodes in render order (for keyboard navigation).
+pub fn collect_visible_paths(
+    node: &FileNode,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    result: &mut Vec<std::path::PathBuf>,
+) {
+    if !show_hidden && node.name.starts_with('.') {
+        return;
+    }
+    if !filter.is_empty() && !node_matches(node, filter) {
+        return;
+    }
+    if let Some(cat) = category_filter {
+        if !crate::categories::node_matches_category(node, cat) {
+            return;
+        }
+    }
+
+    result.push(node.path.clone());
+
+    let show_children = node.is_dir && (node.expanded || !filter.is_empty());
+    if show_children {
+        for child in &node.children {
+            collect_visible_paths(child, filter, category_filter, show_hidden, result);
+        }
+    }
+}
+
+/// Find the parent path of a node in the tree.
+pub fn find_parent_path(node: &FileNode, target: &std::path::Path) -> Option<std::path::PathBuf> {
+    for child in &node.children {
+        if child.path == target {
+            return Some(node.path.clone());
+        }
+        if let Some(parent) = find_parent_path(child, target) {
+            return Some(parent);
+        }
+    }
+    None
+}
+
+/// Find a node by path and return (is_dir, expanded, has_children).
+pub fn find_node_info(node: &FileNode, target: &std::path::Path) -> Option<(bool, bool, bool)> {
+    if node.path == target {
+        return Some((node.is_dir, node.expanded, !node.children.is_empty()));
+    }
+    node.children
+        .iter()
+        .find_map(|c| find_node_info(c, target))
+}
+
+/// Set expanded state for a node at target path. Returns true if found.
+pub fn set_expanded(node: &mut FileNode, target: &std::path::Path, expanded: bool) -> bool {
+    if node.path == target {
+        node.expanded = expanded;
+        return true;
+    }
+    node.children
+        .iter_mut()
+        .any(|c| set_expanded(c, target, expanded))
 }
 
 #[cfg(test)]

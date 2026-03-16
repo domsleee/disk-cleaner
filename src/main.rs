@@ -303,7 +303,7 @@ impl eframe::App for App {
             });
 
             if up || down {
-                if let Some(ref tree) = self.tree {
+                if let Some(ref mut tree) = self.tree {
                     let mut visible = Vec::new();
                     ui::collect_visible_paths(
                         tree,
@@ -325,6 +325,8 @@ impl eframe::App for App {
                         } else {
                             self.focused_path = Some(visible[0].clone());
                         }
+                        // Clear selection so only the focused row is highlighted
+                        ui::clear_selection(tree);
                         self.tree_scroll_to_focus = true;
                     }
                 }
@@ -702,9 +704,10 @@ impl eframe::App for App {
 
                             ui.horizontal(|ui| {
                                 ui.small(format!(
-                                    "{} | {} files",
+                                    "{} | {} files | {:.1}%",
                                     bytesize::ByteSize::b(size),
-                                    count
+                                    count,
+                                    fraction * 100.0
                                 ));
                             });
 
@@ -929,10 +932,32 @@ impl eframe::App for App {
                         Vec::new()
                     };
                     self.tree_scroll_to_focus = false;
-                    // Update focused_path from actions
+                    // Handle actions from tree rendering
                     for action in &actions {
-                        if let ui::TreeAction::Focus(path) = action {
-                            self.focused_path = Some(path.clone());
+                        match action {
+                            ui::TreeAction::Focus(path) => {
+                                self.focused_path = Some(path.clone());
+                            }
+                            ui::TreeAction::Trash(path) => {
+                                if let Err(e) = trash::delete(path) {
+                                    self.error = Some(format!("Trash failed: {e}"));
+                                } else if let Some(ref mut tree) = self.tree {
+                                    ui::remove_node(tree, path);
+                                }
+                            }
+                            ui::TreeAction::ConfirmDelete(path) => {
+                                self.confirm_delete = Some(path.clone());
+                            }
+                            ui::TreeAction::RevealInFinder(path) => {
+                                let _ = std::process::Command::new("open")
+                                    .arg("-R")
+                                    .arg(path)
+                                    .spawn();
+                            }
+                            ui::TreeAction::CopyPath(path) => {
+                                ctx.copy_text(path.display().to_string());
+                            }
+                            _ => {}
                         }
                     }
                     // Apply selection/expand changes

@@ -3,7 +3,7 @@
 
 use disk_cleaner::scanner::{self, ScanProgress};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 fn main() {
@@ -23,6 +23,7 @@ fn main() {
     let progress = Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        cancelled: AtomicBool::new(false),
     });
 
     let tree = scanner::scan_directory(&path, progress.clone());

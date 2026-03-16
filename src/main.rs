@@ -153,6 +153,7 @@ impl Default for App {
             scan_progress: Arc::new(ScanProgress {
                 file_count: 0.into(),
                 total_size: 0.into(),
+                cancelled: false.into(),
             }),
             receiver: None,
             error: None,
@@ -176,7 +177,20 @@ impl Default for App {
 }
 
 impl App {
+    fn cancel_scan(&mut self) {
+        self.scan_progress
+            .cancelled
+            .store(true, Ordering::Relaxed);
+        self.scanning = false;
+        self.receiver = None;
+    }
+
     fn start_scan(&mut self, path: PathBuf) {
+        // Cancel any in-progress scan so its threads release the rayon pool
+        self.scan_progress
+            .cancelled
+            .store(true, Ordering::Relaxed);
+
         save_config(&path, self.show_hidden);
         self.last_scan_path = Some(path.clone());
         self.scanning = true;
@@ -188,6 +202,7 @@ impl App {
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
             total_size: 0.into(),
+            cancelled: false.into(),
         });
         self.scan_progress = progress.clone();
 
@@ -483,6 +498,9 @@ impl eframe::App for App {
                 }
 
                 if self.scanning {
+                    if ui.small_button("Cancel").clicked() {
+                        self.cancel_scan();
+                    }
                     ui.spinner();
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
                     let size = self.scan_progress.total_size.load(Ordering::Relaxed);
@@ -596,6 +614,17 @@ impl eframe::App for App {
                     }
                 });
         }
+
+        // Bottom status bar with version
+        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
+            });
+        });
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -725,7 +754,9 @@ impl eframe::App for App {
                     let show_hidden = self.show_hidden;
                     let mut focused_path = self.focused_path.clone();
                     let mut row_clicks = Vec::new();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                         if let Some(ref mut tree) = self.tree {
                             let root_size = tree.size;
                             ui::render_tree(

@@ -706,7 +706,8 @@ impl eframe::App for App {
 
                                     ui.horizontal(|ui| {
                                         ui.label(format!(
-                                            "{} free",
+                                            "{:.0}% used — {} free",
+                                            fraction * 100.0,
                                             bytesize::ByteSize::b(vol.available_bytes)
                                         ));
                                         ui.with_layout(

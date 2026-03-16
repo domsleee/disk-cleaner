@@ -19,6 +19,12 @@ fn size_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
+/// Returns true if this node's name matches the query or any descendant does.
+pub fn node_matches(node: &FileNode, query: &str) -> bool {
+    node.name.to_lowercase().contains(query)
+        || node.children.iter().any(|c| node_matches(c, query))
+}
+
 pub fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
     let mut result = Vec::new();
     if node.selected {
@@ -45,7 +51,13 @@ pub fn render_tree(
     depth: usize,
     parent_size: u64,
     actions: &mut Vec<NodeAction>,
+    filter: &str,
 ) {
+    // Skip nodes that don't match the active filter
+    if !filter.is_empty() && !node_matches(node, filter) {
+        return;
+    }
+
     let indent = depth as f32 * 20.0;
     let size_str = ByteSize::b(node.size).to_string();
     let color = size_color(node.size, ui);
@@ -103,11 +115,12 @@ pub fn render_tree(
         }
     });
 
-    // Render children if expanded
-    if node.is_dir && node.expanded {
+    // Render children if expanded (or auto-expanded by active filter)
+    let show_children = node.is_dir && (node.expanded || !filter.is_empty());
+    if show_children {
         let node_size = node.size;
         for child in &mut node.children {
-            render_tree(ui, child, depth + 1, node_size, actions);
+            render_tree(ui, child, depth + 1, node_size, actions, filter);
         }
     }
 }

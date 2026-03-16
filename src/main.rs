@@ -35,6 +35,7 @@ struct App {
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
     confirm_batch_delete: bool,
+    search_query: String,
 }
 
 impl Default for App {
@@ -51,6 +52,7 @@ impl Default for App {
             error: None,
             confirm_delete: None,
             confirm_batch_delete: false,
+            search_query: String::new(),
         }
     }
 }
@@ -249,6 +251,24 @@ impl eframe::App for App {
                     }
                 }
 
+                // Search/filter bar
+                if self.tree.is_some() {
+                    ui.separator();
+                    ui.label("Filter:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("file name...")
+                            .desired_width(200.0),
+                    );
+                    if response.changed() {
+                        // Convert to lowercase once; node_matches uses lowercase comparison
+                        self.search_query = self.search_query.to_lowercase();
+                    }
+                    if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
+                        self.search_query.clear();
+                    }
+                }
+
                 // Batch operation buttons (only shown when items are selected)
                 let selected_count = self
                     .tree
@@ -296,11 +316,12 @@ impl eframe::App for App {
                 return;
             }
 
+            let filter = self.search_query.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut actions = Vec::new();
                 if let Some(ref mut tree) = self.tree {
                     let root_size = tree.size;
-                    ui::render_tree(ui, tree, 0, root_size, &mut actions);
+                    ui::render_tree(ui, tree, 0, root_size, &mut actions, &filter);
                 }
                 self.process_actions(actions);
             });

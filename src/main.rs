@@ -71,6 +71,9 @@ struct App {
     view_mode: ViewMode,
     treemap_zoom: Option<PathBuf>,
     treemap_zoom_anim: Option<f64>,
+    volumes: Vec<scanner::VolumeInfo>,
+    volumes_last_refresh: Option<std::time::Instant>,
+    scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
 }
 
 impl Default for App {
@@ -93,6 +96,9 @@ impl Default for App {
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
+            volumes: scanner::list_volumes(),
+            volumes_last_refresh: Some(std::time::Instant::now()),
+            scan_disk_info: None,
         }
     }
 }
@@ -105,6 +111,7 @@ impl App {
         self.error = None;
         self.tree = None;
         self.scan_path = Some(path.clone());
+        self.scan_disk_info = scanner::disk_space(&path);
 
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
@@ -380,6 +387,20 @@ impl eframe::App for App {
                     }
                 }
 
+                // Disk space info (shown when scan is done)
+                if self.tree.is_some() && !self.scanning {
+                    if let Some((total, available)) = self.scan_disk_info {
+                        ui.separator();
+                        let used = total.saturating_sub(available);
+                        ui.monospace(format!(
+                            "{} used / {} ({} free)",
+                            bytesize::ByteSize::b(used),
+                            bytesize::ByteSize::b(total),
+                            bytesize::ByteSize::b(available),
+                        ));
+                    }
+                }
+
                 if self.scanning {
                     ui.spinner();
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
@@ -405,17 +426,120 @@ impl eframe::App for App {
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tree.is_none() && !self.scanning {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading("Click \"Open Directory...\" to scan a folder");
-                        if let Some(ref last) = self.last_scan_path.clone() {
-                            ui.add_space(12.0);
-                            let label = format!("Resume last scan: {}", last.display());
-                            if ui.button(label).clicked() {
-                                self.start_scan(last.clone());
-                            }
+                // Refresh volume list every 5 seconds
+                let should_refresh = self
+                    .volumes_last_refresh
+                    .is_none_or(|t| t.elapsed().as_secs() >= 5);
+                if should_refresh {
+                    self.volumes = scanner::list_volumes();
+                    self.volumes_last_refresh = Some(std::time::Instant::now());
+                }
+
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.heading("Disk Cleaner");
+                    ui.add_space(20.0);
+
+                    // Volume list
+                    if !self.volumes.is_empty() {
+                        ui.label(egui::RichText::new("Volumes").strong().size(14.0));
+                        ui.add_space(8.0);
+
+                        let mut scan_path: Option<PathBuf> = None;
+                        for vol in &self.volumes {
+                            let used = vol.total_bytes.saturating_sub(vol.available_bytes);
+                            let fraction = if vol.total_bytes > 0 {
+                                used as f32 / vol.total_bytes as f32
+                            } else {
+                                0.0
+                            };
+
+                            egui::Frame::group(ui.style())
+                                .inner_margin(12.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(400.0);
+                                    ui.horizontal(|ui| {
+                                        ui.strong(&vol.name);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.monospace(
+                                                    bytesize::ByteSize::b(vol.total_bytes)
+                                                        .to_string(),
+                                                );
+                                            },
+                                        );
+                                    });
+
+                                    // Capacity bar
+                                    let bar_height = 14.0;
+                                    let (bar_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), bar_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    let painter = ui.painter();
+                                    painter.rect_filled(
+                                        bar_rect,
+                                        3.0,
+                                        ui.visuals().extreme_bg_color,
+                                    );
+                                    let fill_w =
+                                        (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(1.0);
+                                    let fill_rect = egui::Rect::from_min_size(
+                                        bar_rect.min,
+                                        egui::vec2(fill_w, bar_height),
+                                    );
+                                    let fill_color = if fraction > 0.9 {
+                                        egui::Color32::from_rgb(220, 60, 60)
+                                    } else if fraction > 0.7 {
+                                        egui::Color32::from_rgb(220, 150, 50)
+                                    } else {
+                                        egui::Color32::from_rgb(52, 152, 219)
+                                    };
+                                    painter.rect_filled(fill_rect, 3.0, fill_color);
+
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "{} free",
+                                            bytesize::ByteSize::b(vol.available_bytes)
+                                        ));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Scan").clicked() {
+                                                    scan_path = Some(vol.path.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            ui.add_space(4.0);
                         }
-                    });
+
+                        if let Some(path) = scan_path {
+                            self.start_scan(path);
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+
+                    // Folder pick alternative
+                    if ui.button("Open Directory...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.start_scan(path);
+                        }
+                    }
+
+                    // Resume last scan
+                    if let Some(ref last) = self.last_scan_path.clone() {
+                        ui.add_space(8.0);
+                        let label = format!("Resume last scan: {}", last.display());
+                        if ui.button(label).clicked() {
+                            self.start_scan(last.clone());
+                        }
+                    }
                 });
                 return;
             }

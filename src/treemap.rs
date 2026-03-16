@@ -378,7 +378,14 @@ pub fn render_treemap(
     // Hover tooltip
     if let Some(idx) = hovered_idx {
         let child = children[idx];
-        egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), ui.id().with("treemap_tip"), |ui| {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with("treemap_tip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
             ui.label(egui::RichText::new(&child.name).strong());
             ui.label(ByteSize::b(child.size).to_string());
             if child.is_dir {

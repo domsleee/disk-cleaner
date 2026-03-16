@@ -166,6 +166,20 @@ pub fn render_tree(
         // Name — selectable for keyboard focus (highlighted when focused/selected)
         let name_text = egui::RichText::new(&node.name).monospace();
         let name_response = ui.selectable_label(is_focused || is_selected, name_text);
+        if node.is_dir {
+            name_response.clone().on_hover_text(format!(
+                "{}\n{} \u{2014} {} items",
+                node.path.display(),
+                ByteSize::b(node.size),
+                node.children.len()
+            ));
+        } else {
+            name_response.clone().on_hover_text(format!(
+                "{}\n{}",
+                node.path.display(),
+                ByteSize::b(node.size)
+            ));
+        }
         if name_response.clicked() {
             let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             row_clicks.push(RowClick {

@@ -1,8 +1,9 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use walkdir::WalkDir;
+
+use rayon::iter::ParallelBridge;
+use rayon::prelude::ParallelIterator;
 
 use crate::tree::FileNode;
 
@@ -95,87 +96,91 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
+    pub cancelled: AtomicBool,
 }
 
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
-    let mut sizes: HashMap<PathBuf, u64> = HashMap::new();
-    let mut dirs: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-
-    // First pass: collect all entries and file sizes
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path().to_path_buf();
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        if metadata.is_file() {
-            let len = metadata.len();
-            sizes.insert(path.clone(), len);
-            progress.file_count.fetch_add(1, Ordering::Relaxed);
-            progress.total_size.fetch_add(len, Ordering::Relaxed);
-        } else if metadata.is_dir() {
-            dirs.entry(path.clone()).or_default();
-        }
-
-        // Register this entry under its parent
-        if let Some(parent) = path.parent() {
-            if parent.starts_with(root) || parent == root {
-                dirs.entry(parent.to_path_buf()).or_default().push(path);
-            }
-        }
-    }
-
-    // Build tree recursively
-    fn build_node(
-        path: &Path,
-        sizes: &HashMap<PathBuf, u64>,
-        dirs: &HashMap<PathBuf, Vec<PathBuf>>,
-    ) -> FileNode {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-        if let Some(children_paths) = dirs.get(path) {
-            // It's a directory
-            let mut children: Vec<FileNode> = children_paths
-                .iter()
-                .filter(|p| p.as_path() != path) // skip self-reference
-                .map(|p| build_node(p, sizes, dirs))
-                .collect();
-
-            children.sort_by(|a, b| b.size.cmp(&a.size));
-
-            let size = children.iter().map(|c| c.size).sum();
-
-            FileNode {
-                name,
-                path: path.to_path_buf(),
-                size,
-                is_dir: true,
-                children,
-                expanded: false,
-                selected: false,
-            }
-        } else {
-            // It's a file
-            let size = sizes.get(path).copied().unwrap_or(0);
-            FileNode {
-                name,
-                path: path.to_path_buf(),
-                size,
-                is_dir: false,
-                children: Vec::new(),
-                expanded: false,
-                selected: false,
-            }
-        }
-    }
-
-    let mut root_node = build_node(root, &sizes, &dirs);
-    root_node.expanded = true; // expand root by default
+    let mut root_node = walk_dir(root, &progress);
+    root_node.expanded = true;
     root_node
+}
+
+/// Parallel recursive directory walk, following dust's par_bridge() pattern.
+fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>) -> FileNode {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.to_string_lossy().to_string());
+
+    let empty_dir = FileNode {
+        name: name.clone(),
+        path: dir.to_path_buf(),
+        size: 0,
+        is_dir: true,
+        children: Vec::new(),
+        expanded: false,
+        selected: false,
+    };
+
+    // Bail out early if scan was cancelled
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return empty_dir;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return empty_dir,
+    };
+
+    let mut children: Vec<FileNode> = entries
+        .into_iter()
+        .par_bridge()
+        .filter_map(|entry| {
+            if progress.cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let ft = entry.file_type().ok()?;
+            let path = entry.path();
+
+            if ft.is_dir() {
+                Some(walk_dir(&path, progress))
+            } else if ft.is_file() {
+                let metadata = entry.metadata().ok()?;
+                let len = metadata.len();
+                progress.file_count.fetch_add(1, Ordering::Relaxed);
+                progress.total_size.fetch_add(len, Ordering::Relaxed);
+                let fname = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Some(FileNode {
+                    name: fname,
+                    path,
+                    size: len,
+                    is_dir: false,
+                    children: Vec::new(),
+                    expanded: false,
+                    selected: false,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    children.sort_by(|a, b| b.size.cmp(&a.size));
+    let size = children.iter().map(|c| c.size).sum();
+
+    FileNode {
+        name,
+        path: dir.to_path_buf(),
+        size,
+        is_dir: true,
+        children,
+        expanded: false,
+        selected: false,
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +192,7 @@ mod tests {
         Arc::new(ScanProgress {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
         })
     }
 

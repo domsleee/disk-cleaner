@@ -83,9 +83,20 @@ fn bench_memory_synthetic(c: &mut Criterion) {
     eprintln!("\n=== Memory Report: 1000 files / 100 dirs ===");
     eprintln!("Nodes: {nodes}");
     eprintln!("Files scanned: {files}");
-    eprintln!("Memory delta: {} bytes ({:.1} KB)", after.saturating_sub(before), after.saturating_sub(before) as f64 / 1024.0);
-    eprintln!("Bytes per node: {:.0}", after.saturating_sub(before) as f64 / nodes as f64);
-    eprintln!("Peak allocation: {} bytes ({:.1} KB)", PEAK.load(Ordering::SeqCst), PEAK.load(Ordering::SeqCst) as f64 / 1024.0);
+    eprintln!(
+        "Memory delta: {} bytes ({:.1} KB)",
+        after.saturating_sub(before),
+        after.saturating_sub(before) as f64 / 1024.0
+    );
+    eprintln!(
+        "Bytes per node: {:.0}",
+        after.saturating_sub(before) as f64 / nodes as f64
+    );
+    eprintln!(
+        "Peak allocation: {} bytes ({:.1} KB)",
+        PEAK.load(Ordering::SeqCst),
+        PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+    );
     eprintln!("=============================================\n");
     std::hint::black_box(tree);
 }

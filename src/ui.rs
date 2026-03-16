@@ -97,6 +97,10 @@ pub enum TreeAction {
         shift: bool,
     },
     Focus(std::path::PathBuf),
+    Trash(std::path::PathBuf),
+    ConfirmDelete(std::path::PathBuf),
+    RevealInFinder(std::path::PathBuf),
+    CopyPath(std::path::PathBuf),
 }
 
 /// Flattened row data for virtualized rendering.
@@ -110,6 +114,7 @@ struct VisibleRow {
     depth: usize,
     parent_size: u64,
     children_count: usize,
+    category: crate::categories::FileCategory,
 }
 
 fn collect_visible_rows(
@@ -143,6 +148,11 @@ fn collect_visible_rows(
         depth,
         parent_size,
         children_count: node.children.len(),
+        category: if node.is_dir {
+            crate::categories::FileCategory::Other
+        } else {
+            crate::categories::categorize(&node.name)
+        },
     });
 
     let show_children = node.is_dir && (node.expanded || !filter.is_empty());
@@ -210,10 +220,15 @@ pub fn render_tree(
     }
 
     scroll_area.show_rows(ui, row_height, total_rows, |ui, range| {
+        let full_width = ui.max_rect();
         for i in range {
             let row = &rows[i];
             let indent = row.depth as f32 * 20.0;
-            let bcolor = bar_color(row.size, ui);
+            let bcolor = if row.is_dir {
+                bar_color(row.size, ui)
+            } else {
+                row.category.color()
+            };
             let proportion = if row.parent_size > 0 {
                 (row.size as f64 / row.parent_size as f64) as f32
             } else {
@@ -252,29 +267,39 @@ pub fn render_tree(
                 // Name
                 ui.label(egui::RichText::new(&row.name).monospace());
 
-                // Size bar + label (right-aligned)
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let size_str = ByteSize::b(row.size).to_string();
-                        ui.label(
-                            egui::RichText::new(format!("{:>10}", size_str)).monospace(),
-                        );
-
-                        let bar_width = 80.0_f32;
-                        let bar_h = 10.0_f32;
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(bar_width, bar_h),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                        let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                        let fill_rect =
-                            egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_h));
-                        painter.rect_filled(fill_rect, 2.0, bcolor);
-                    },
+                // Size bar + label (painted at fixed right-edge positions for alignment)
+                let row_max = ui.max_rect();
+                let painter = ui.painter();
+                let bar_width = 80.0_f32;
+                let bar_h = 10.0_f32;
+                let text_margin = 8.0_f32;
+                let size_str = ByteSize::b(row.size).to_string();
+                let size_text = format!("{:>10}", size_str);
+                let font_id = egui::FontId::monospace(
+                    ui.style().text_styles[&egui::TextStyle::Body].size,
                 );
+                let text_galley = painter.layout_no_wrap(
+                    size_text,
+                    font_id,
+                    ui.visuals().text_color(),
+                );
+                let text_width = text_galley.size().x;
+                let text_x = row_max.right() - text_margin - text_width;
+                let text_y = row_max.center().y - text_galley.size().y / 2.0;
+                painter.galley(egui::pos2(text_x, text_y), text_galley, ui.visuals().text_color());
+
+                let bar_gap = 4.0_f32;
+                let bar_x = text_x - bar_gap - bar_width;
+                let bar_y = row_max.center().y - bar_h / 2.0;
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(bar_x, bar_y),
+                    egui::vec2(bar_width, bar_h),
+                );
+                painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
+                let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
+                let fill_rect =
+                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
             });
@@ -302,6 +327,31 @@ pub fn render_tree(
                     }
                 }
             }
+
+            // Right-click context menu
+            let ctx_path = row.path.clone();
+            row_interact.context_menu(|ui| {
+                if ui.button("Open in Finder").clicked() {
+                    actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
+                    ui.close();
+                }
+                if ui.button("Copy Path").clicked() {
+                    actions.push(TreeAction::CopyPath(ctx_path.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Move to Trash").clicked() {
+                    actions.push(TreeAction::Trash(ctx_path.clone()));
+                    ui.close();
+                }
+                if ui
+                    .button(egui::RichText::new("Delete Permanently").color(egui::Color32::RED))
+                    .clicked()
+                {
+                    actions.push(TreeAction::ConfirmDelete(ctx_path.clone()));
+                    ui.close();
+                }
+            });
 
             // Tooltip (lazy via closure — avoids format! allocation unless hovered)
             if row.is_dir {
@@ -331,9 +381,13 @@ pub fn render_tree(
                 } else {
                     ui.visuals().selection.bg_fill.linear_multiply(0.4)
                 };
+                let highlight_rect = egui::Rect::from_x_y_ranges(
+                    full_width.x_range(),
+                    row_rect.y_range(),
+                );
                 ui.painter().set(
                     bg_idx,
-                    egui::Shape::rect_filled(row_rect, 0.0, bg_color),
+                    egui::Shape::rect_filled(highlight_rect, 0.0, bg_color),
                 );
             }
         }
@@ -357,7 +411,11 @@ pub fn apply_tree_actions(tree: &mut FileNode, actions: &[TreeAction]) {
                     select_node(tree, path);
                 }
             }
-            TreeAction::Focus(_) => {} // handled by caller updating focused_path
+            TreeAction::Focus(_)
+            | TreeAction::Trash(_)
+            | TreeAction::ConfirmDelete(_)
+            | TreeAction::RevealInFinder(_)
+            | TreeAction::CopyPath(_) => {} // handled by caller
         }
     }
 }

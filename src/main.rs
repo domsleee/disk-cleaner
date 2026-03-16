@@ -270,6 +270,9 @@ impl eframe::App for App {
             if let Ok(tree) = rx.try_recv() {
                 self.category_stats = Some(categories::compute_stats(&tree));
                 self.tree = Some(tree);
+                if let Some(ref mut t) = self.tree {
+                    tree::auto_expand(t, 0, 2);
+                }
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;

@@ -44,6 +44,7 @@ pub fn count_selected(node: &FileNode) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_tree(
     ui: &mut egui::Ui,
     node: &mut FileNode,
@@ -52,10 +53,18 @@ pub fn render_tree(
     actions: &mut Vec<NodeAction>,
     filter: &str,
     focused_path: &mut Option<std::path::PathBuf>,
+    category_filter: Option<crate::categories::FileCategory>,
 ) {
-    // Skip nodes that don't match the active filter
+    // Skip nodes that don't match the active text filter
     if !filter.is_empty() && !node_matches(node, filter) {
         return;
+    }
+
+    // Skip nodes that don't match the category filter
+    if let Some(cat) = category_filter {
+        if !crate::categories::node_matches_category(node, cat) {
+            return;
+        }
     }
 
     let indent = depth as f32 * 20.0;
@@ -130,6 +139,7 @@ pub fn render_tree(
                 actions,
                 filter,
                 focused_path,
+                category_filter,
             );
         }
     }

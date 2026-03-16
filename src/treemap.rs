@@ -261,6 +261,7 @@ pub fn render_treemap(
     zoom_path: &Option<PathBuf>,
     focused_path: &Option<PathBuf>,
     zoom_anim_start: Option<f64>,
+    category_filter: Option<crate::categories::FileCategory>,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
 
@@ -326,8 +327,15 @@ pub fn render_treemap(
         return actions;
     }
 
-    // Filter out zero-size children
-    let children: Vec<&FileNode> = view_node.children.iter().filter(|c| c.size > 0).collect();
+    // Filter children by size and optional category
+    let children: Vec<&FileNode> = view_node
+        .children
+        .iter()
+        .filter(|c| c.size > 0)
+        .filter(|c| {
+            category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
+        })
+        .collect();
     if children.is_empty() {
         return actions;
     }

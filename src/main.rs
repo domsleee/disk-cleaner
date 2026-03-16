@@ -1,3 +1,4 @@
+mod categories;
 mod scanner;
 mod tree;
 mod treemap;
@@ -74,6 +75,8 @@ struct App {
     volumes: Vec<scanner::VolumeInfo>,
     volumes_last_refresh: Option<std::time::Instant>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
+    category_filter: Option<categories::FileCategory>,
+    category_stats: Option<categories::CategoryStats>,
 }
 
 impl Default for App {
@@ -99,6 +102,8 @@ impl Default for App {
             volumes: scanner::list_volumes(),
             volumes_last_refresh: Some(std::time::Instant::now()),
             scan_disk_info: None,
+            category_filter: None,
+            category_stats: None,
         }
     }
 }
@@ -193,9 +198,11 @@ impl eframe::App for App {
         // Check if scan completed
         if let Some(ref rx) = self.receiver {
             if let Ok(tree) = rx.try_recv() {
+                self.category_stats = Some(categories::compute_stats(&tree));
                 self.tree = Some(tree);
                 self.scanning = false;
                 self.receiver = None;
+                self.category_filter = None;
             }
         }
 
@@ -423,6 +430,99 @@ impl eframe::App for App {
             });
         });
 
+        // Category side panel (only when scan results are available)
+        if self.tree.is_some() && !self.scanning {
+            egui::SidePanel::left("categories")
+                .resizable(true)
+                .default_width(200.0)
+                .min_width(160.0)
+                .show(ctx, |ui| {
+                    ui.heading("File Types");
+                    ui.add_space(4.0);
+
+                    if let Some(ref stats) = self.category_stats {
+                        let total_size: u64 = stats.entries.iter().map(|e| e.1).sum();
+
+                        // "All files" option to clear filter
+                        let all_selected = self.category_filter.is_none();
+                        if ui
+                            .selectable_label(
+                                all_selected,
+                                egui::RichText::new("All files").strong(),
+                            )
+                            .clicked()
+                        {
+                            self.category_filter = None;
+                        }
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        for &(cat, size, count) in &stats.entries {
+                            let is_active =
+                                self.category_filter.as_ref().is_some_and(|f| *f == cat);
+                            let fraction = if total_size > 0 {
+                                size as f32 / total_size as f32
+                            } else {
+                                0.0
+                            };
+
+                            let response = ui
+                                .horizontal(|ui| {
+                                    // Color swatch
+                                    let (swatch_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(12.0, 12.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(swatch_rect, 2.0, cat.color());
+
+                                    let label = if is_active {
+                                        egui::RichText::new(cat.label()).strong()
+                                    } else {
+                                        egui::RichText::new(cat.label())
+                                    };
+                                    let _ = ui.selectable_label(is_active, label);
+                                })
+                                .response;
+
+                            // Size bar under the label
+                            let bar_height = 4.0;
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), bar_height),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(bar_rect, 1.0, ui.visuals().extreme_bg_color);
+                            let fill_w = (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(1.0);
+                            let fill_rect = egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(fill_w, bar_height),
+                            );
+                            painter.rect_filled(fill_rect, 1.0, cat.color());
+
+                            ui.horizontal(|ui| {
+                                ui.small(format!(
+                                    "{} | {} files",
+                                    bytesize::ByteSize::b(size),
+                                    count
+                                ));
+                            });
+
+                            if response.clicked() {
+                                if is_active {
+                                    self.category_filter = None;
+                                } else {
+                                    self.category_filter = Some(cat);
+                                }
+                            }
+
+                            ui.add_space(2.0);
+                        }
+                    }
+                });
+        }
+
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tree.is_none() && !self.scanning {
@@ -547,6 +647,7 @@ impl eframe::App for App {
             match self.view_mode {
                 ViewMode::Tree => {
                     let filter = self.search_query.clone();
+                    let cat_filter = self.category_filter;
                     let mut focused_path = self.focused_path.clone();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let mut actions = Vec::new();
@@ -560,6 +661,7 @@ impl eframe::App for App {
                                 &mut actions,
                                 &filter,
                                 &mut focused_path,
+                                cat_filter,
                             );
                         }
                         self.process_actions(actions);
@@ -574,6 +676,7 @@ impl eframe::App for App {
                             &self.treemap_zoom,
                             &self.focused_path,
                             self.treemap_zoom_anim,
+                            self.category_filter,
                         );
                         for action in tm_actions {
                             match action {

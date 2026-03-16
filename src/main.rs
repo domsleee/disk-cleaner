@@ -501,21 +501,15 @@ impl eframe::App for App {
                 }
 
                 if self.scanning {
-                    if ui.small_button("Cancel").clicked() {
+                    ui.separator();
+                    if ui.button("Cancel").clicked() {
                         self.cancel_scan();
                     }
                     ui.spinner();
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
                     let size = self.scan_progress.total_size.load(Ordering::Relaxed);
                     let size_str = bytesize::ByteSize::b(size).to_string();
-                    let path_str = self
-                        .scan_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    ui.monospace(format!(
-                        "Indexing: {path_str} {files} files, {size_str} ..."
-                    ));
+                    ui.monospace(format!("Scanning: {files} files, {size_str}"));
                     ctx.request_repaint();
                 }
 
@@ -631,7 +625,43 @@ impl eframe::App for App {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.tree.is_none() && !self.scanning {
+            // Full-page scanning UI
+            if self.scanning {
+                ui.vertical_centered(|ui| {
+                    let available = ui.available_height();
+                    ui.add_space(available * 0.3);
+
+                    ui.spinner();
+                    ui.add_space(12.0);
+
+                    let path_str = self
+                        .scan_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    ui.heading("Scanning");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&path_str)
+                            .weak()
+                            .size(13.0),
+                    );
+                    ui.add_space(16.0);
+
+                    let files = self.scan_progress.file_count.load(Ordering::Relaxed);
+                    let size = self.scan_progress.total_size.load(Ordering::Relaxed);
+                    let size_str = bytesize::ByteSize::b(size).to_string();
+                    ui.monospace(format!("{files} files — {size_str}"));
+
+                    ui.add_space(24.0);
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_scan();
+                    }
+                });
+                return;
+            }
+
+            if self.tree.is_none() {
                 // Refresh volume list every 5 seconds
                 let should_refresh = self
                     .volumes_last_refresh

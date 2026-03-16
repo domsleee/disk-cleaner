@@ -57,7 +57,47 @@ fn save_config(last_path: &std::path::Path, show_hidden: bool) {
     }
 }
 
+fn print_help() {
+    eprintln!("Usage: disk-cleaner [OPTIONS] [PATH]");
+    eprintln!();
+    eprintln!("Arguments:");
+    eprintln!("  [PATH]  Directory to scan on launch");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -h, --help  Print this help message");
+}
+
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut initial_path: Option<PathBuf> = None;
+
+    for arg in &args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => {
+                if other.starts_with('-') {
+                    eprintln!("Unknown option: {other}");
+                    print_help();
+                    std::process::exit(1);
+                }
+                if initial_path.is_some() {
+                    eprintln!("Error: multiple paths provided");
+                    print_help();
+                    std::process::exit(1);
+                }
+                let p = PathBuf::from(other);
+                if !p.is_dir() {
+                    eprintln!("Error: not a directory: {other}");
+                    std::process::exit(1);
+                }
+                initial_path = Some(p);
+            }
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
         ..Default::default()
@@ -66,7 +106,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Disk Cleaner",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(move |_cc| {
+            let mut app = App::default();
+            if let Some(path) = initial_path {
+                app.start_scan(path);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 

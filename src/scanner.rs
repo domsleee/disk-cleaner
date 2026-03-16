@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::FileNode;
+use crate::tree::{DirNode, FileLeaf, FileNode};
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -145,26 +145,19 @@ fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     let skip = build_skip_set(root);
     let mut root_node = walk_dir(root, &progress, &skip);
-    root_node.expanded = true;
+    root_node.set_expanded(true);
     root_node
 }
 
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| dir.to_string_lossy().to_string());
-
-    let empty_dir = FileNode {
-        name: name.clone(),
+    let empty_dir = FileNode::Dir(DirNode {
         path: dir.to_path_buf(),
         size: 0,
-        is_dir: true,
         children: Vec::new(),
         expanded: false,
         selected: false,
-    };
+    });
 
     // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
@@ -197,37 +190,27 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let fname = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                Some(FileNode {
-                    name: fname,
+                Some(FileNode::File(FileLeaf {
                     path,
                     size: len,
-                    is_dir: false,
-                    children: Vec::new(),
-                    expanded: false,
                     selected: false,
-                })
+                }))
             } else {
                 None
             }
         })
         .collect();
 
-    children.sort_by(|a, b| b.size.cmp(&a.size));
-    let size = children.iter().map(|c| c.size).sum();
+    children.sort_by(|a, b| b.size().cmp(&a.size()));
+    let size = children.iter().map(|c| c.size()).sum();
 
-    FileNode {
-        name,
+    FileNode::Dir(DirNode {
         path: dir.to_path_buf(),
         size,
-        is_dir: true,
         children,
         expanded: false,
         selected: false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -249,10 +232,10 @@ mod tests {
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress.clone());
 
-        assert!(root.is_dir);
-        assert!(root.children.is_empty());
-        assert_eq!(root.size, 0);
-        assert!(root.expanded);
+        assert!(root.is_dir());
+        assert!(root.children().is_empty());
+        assert_eq!(root.size(), 0);
+        assert!(root.expanded());
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
     }
 
@@ -265,13 +248,13 @@ mod tests {
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress.clone());
 
-        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children().len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
         assert_eq!(progress.total_size.load(Ordering::Relaxed), 7);
-        assert_eq!(root.size, 7);
+        assert_eq!(root.size(), 7);
         // Children sorted by size descending
-        assert_eq!(root.children[0].size, 5);
-        assert_eq!(root.children[1].size, 2);
+        assert_eq!(root.children()[0].size(), 5);
+        assert_eq!(root.children()[1].size(), 2);
     }
 
     #[test]
@@ -285,16 +268,16 @@ mod tests {
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress.clone());
 
-        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children().len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
-        assert_eq!(root.size, 101);
+        assert_eq!(root.size(), 101);
 
         // sub dir (100 bytes) should sort before root.txt (1 byte)
-        let sub_node = &root.children[0];
-        assert!(sub_node.is_dir);
-        assert_eq!(sub_node.name, "sub");
-        assert_eq!(sub_node.size, 100);
-        assert_eq!(sub_node.children.len(), 1);
+        let sub_node = &root.children()[0];
+        assert!(sub_node.is_dir());
+        assert_eq!(sub_node.name(), "sub");
+        assert_eq!(sub_node.size(), 100);
+        assert_eq!(sub_node.children().len(), 1);
     }
 
     #[test]
@@ -302,7 +285,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress);
-        assert!(root.expanded);
+        assert!(root.expanded());
     }
 
     #[test]
@@ -311,7 +294,7 @@ mod tests {
         fs::create_dir(tmp.path().join("child")).unwrap();
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress);
-        assert!(!root.children[0].expanded);
+        assert!(!root.children()[0].expanded());
     }
 
     #[test]
@@ -328,8 +311,8 @@ mod tests {
         let root = scan_directory(tmp.path(), progress.clone());
 
         // Cancelled scan should produce an empty root with no children
-        assert!(root.children.is_empty());
-        assert_eq!(root.size, 0);
+        assert!(root.children().is_empty());
+        assert_eq!(root.size(), 0);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
     }
 }

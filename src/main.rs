@@ -492,7 +492,7 @@ impl eframe::App for App {
 
                 if self.tree.is_some() && ui.button("Re-scan").clicked() {
                     if let Some(ref tree) = self.tree {
-                        let path = tree.path.clone();
+                        let path = tree.path().to_path_buf();
                         self.start_scan(path);
                     }
                 }
@@ -916,7 +916,7 @@ impl eframe::App for App {
             match self.view_mode {
                 ViewMode::Tree => {
                     let actions = if let Some(ref tree) = self.tree {
-                        let root_size = tree.size;
+                        let root_size = tree.size();
                         ui::render_tree(
                             ui,
                             tree,
@@ -979,7 +979,7 @@ impl eframe::App for App {
                         for action in tm_actions {
                             match action {
                                 TreemapAction::ZoomTo(path) => {
-                                    let is_root = tree.path == path;
+                                    let is_root = tree.path() == path;
                                     let new_zoom = if is_root { None } else { Some(path) };
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));

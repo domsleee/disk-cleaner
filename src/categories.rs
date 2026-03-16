@@ -84,23 +84,23 @@ pub fn compute_stats(tree: &FileNode) -> CategoryStats {
 }
 
 fn collect_stats(node: &FileNode, map: &mut HashMap<FileCategory, (u64, usize)>) {
-    if !node.is_dir {
-        let cat = categorize(&node.name);
+    if !node.is_dir() {
+        let cat = categorize(node.name());
         let entry = map.entry(cat).or_insert((0, 0));
-        entry.0 += node.size;
+        entry.0 += node.size();
         entry.1 += 1;
     }
-    for child in &node.children {
+    for child in node.children() {
         collect_stats(child, map);
     }
 }
 
 /// Returns true if this node (or any descendant) matches the given category.
 pub fn node_matches_category(node: &FileNode, cat: FileCategory) -> bool {
-    if !node.is_dir {
-        return categorize(&node.name) == cat;
+    if !node.is_dir() {
+        return categorize(node.name()) == cat;
     }
-    node.children.iter().any(|c| node_matches_category(c, cat))
+    node.children().iter().any(|c| node_matches_category(c, cat))
 }
 
 #[cfg(test)]

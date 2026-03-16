@@ -200,10 +200,10 @@ fn squarify_impl(
 
 /// Find a node by path in the file tree.
 pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    if node.path == target {
+    if node.path() == target {
         return Some(node);
     }
-    for child in &node.children {
+    for child in node.children() {
         if let Some(found) = find_node(child, target) {
             return Some(found);
         }
@@ -213,25 +213,25 @@ pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> 
 
 /// Build breadcrumb trail from root to `target`.
 pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
-    let mut trail = vec![(root.name.clone(), root.path.clone())];
-    if root.path == target {
+    let mut trail = vec![(root.name().to_string(), root.path().to_path_buf())];
+    if root.path() == target {
         return trail;
     }
     if breadcrumbs_walk(root, target, &mut trail) {
         trail
     } else {
-        vec![(root.name.clone(), root.path.clone())]
+        vec![(root.name().to_string(), root.path().to_path_buf())]
     }
 }
 
 fn breadcrumbs_walk(node: &FileNode, target: &Path, trail: &mut Vec<(String, PathBuf)>) -> bool {
-    for child in &node.children {
-        if child.path == target {
-            trail.push((child.name.clone(), child.path.clone()));
+    for child in node.children() {
+        if child.path() == target {
+            trail.push((child.name().to_string(), child.path().to_path_buf()));
             return true;
         }
-        if child.is_dir {
-            trail.push((child.name.clone(), child.path.clone()));
+        if child.is_dir() {
+            trail.push((child.name().to_string(), child.path().to_path_buf()));
             if breadcrumbs_walk(child, target, trail) {
                 return true;
             }
@@ -276,7 +276,7 @@ pub fn render_treemap(
     let crumbs = zoom_path
         .as_ref()
         .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name.clone(), root.path.clone())]);
+        .unwrap_or_else(|| vec![(root.name().to_string(), root.path().to_path_buf())]);
 
     ui.horizontal(|ui| {
         for (i, (name, path)) in crumbs.iter().enumerate() {
@@ -292,7 +292,7 @@ pub fn render_treemap(
                 actions.push(TreemapAction::ZoomTo(path.clone()));
             }
         }
-        ui.label(format!("  ({})", ByteSize::b(view_node.size)));
+        ui.label(format!("  ({})", ByteSize::b(view_node.size())));
     });
 
     ui.add_space(4.0);
@@ -317,7 +317,7 @@ pub fn render_treemap(
     // Background
     painter.rect_filled(full_rect, 0.0, ui.visuals().extreme_bg_color);
 
-    if view_node.children.is_empty() {
+    if view_node.children().is_empty() {
         painter.text(
             full_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -330,10 +330,10 @@ pub fn render_treemap(
 
     // Filter children by size, hidden status, and optional category
     let children: Vec<&FileNode> = view_node
-        .children
+        .children()
         .iter()
-        .filter(|c| c.size > 0)
-        .filter(|c| show_hidden || !c.name.starts_with('.'))
+        .filter(|c| c.size() > 0)
+        .filter(|c| show_hidden || !c.name().starts_with('.'))
         .filter(|c| {
             category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
         })
@@ -342,7 +342,7 @@ pub fn render_treemap(
         return actions;
     }
 
-    let sizes: Vec<f64> = children.iter().map(|c| c.size as f64).collect();
+    let sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
     let rects = squarify(
         &sizes,
         full_rect.min.x,
@@ -360,9 +360,9 @@ pub fn render_treemap(
             continue;
         }
 
-        let is_focused = focused_path.as_ref().is_some_and(|fp| *fp == child.path);
+        let is_focused = focused_path.as_ref().is_some_and(|fp| fp.as_path() == child.path());
 
-        if child.is_dir && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
+        if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
             paint_directory(&painter, child, r, is_focused, focused_path, alpha);
         } else {
             paint_leaf(&painter, child, r, is_focused, alpha);
@@ -386,12 +386,12 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
-            ui.label(egui::RichText::new(&child.name).strong());
-            ui.label(ByteSize::b(child.size).to_string());
-            if child.is_dir {
-                ui.label(format!("{} items", child.children.len()));
+            ui.label(egui::RichText::new(child.name()).strong());
+            ui.label(ByteSize::b(child.size()).to_string());
+            if child.is_dir() {
+                ui.label(format!("{} items", child.children().len()));
             }
-            ui.label(child.path.display().to_string());
+            ui.label(child.path().display().to_string());
         });
     }
 
@@ -401,10 +401,10 @@ pub fn render_treemap(
             for (i, child) in children.iter().enumerate() {
                 let r = rects[i].shrink(GAP);
                 if r.contains(pos) {
-                    if child.is_dir {
-                        actions.push(TreemapAction::ZoomTo(child.path.clone()));
+                    if child.is_dir() {
+                        actions.push(TreemapAction::ZoomTo(child.path().to_path_buf()));
                     }
-                    actions.push(TreemapAction::Focus(child.path.clone()));
+                    actions.push(TreemapAction::Focus(child.path().to_path_buf()));
                     break;
                 }
             }
@@ -430,7 +430,7 @@ fn paint_leaf(
     is_focused: bool,
     alpha: f32,
 ) {
-    let color = apply_alpha(extension_color(&node.name, node.is_dir), alpha);
+    let color = apply_alpha(extension_color(node.name(), node.is_dir()), alpha);
     painter.rect_filled(rect, 2.0, color);
 
     if is_focused {
@@ -445,14 +445,14 @@ fn paint_leaf(
     // Label if large enough
     if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
         let tc = apply_alpha(
-            text_color_for_bg(extension_color(&node.name, node.is_dir)),
+            text_color_for_bg(extension_color(node.name(), node.is_dir())),
             alpha,
         );
         let font = egui::FontId::proportional(11.0);
         let text = if rect.height() > 30.0 {
-            format!("{}\n{}", node.name, ByteSize::b(node.size))
+            format!("{}\n{}", node.name(), ByteSize::b(node.size()))
         } else {
-            node.name.clone()
+            node.name().to_string()
         };
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, tc);
     }
@@ -466,8 +466,8 @@ fn paint_directory(
     focused_path: &Option<PathBuf>,
     alpha: f32,
 ) {
-    let bg = apply_alpha(extension_color(&node.name, true), alpha);
-    let header_bg = apply_alpha(darken(extension_color(&node.name, true), 15), alpha);
+    let bg = apply_alpha(extension_color(node.name(), true), alpha);
+    let header_bg = apply_alpha(darken(extension_color(node.name(), true), 15), alpha);
 
     // Background
     painter.rect_filled(rect, 2.0, bg);
@@ -487,11 +487,11 @@ fn paint_directory(
 
     // Header text
     let tc = apply_alpha(
-        text_color_for_bg(darken(extension_color(&node.name, true), 15)),
+        text_color_for_bg(darken(extension_color(node.name(), true), 15)),
         alpha,
     );
     if rect.width() > MIN_LABEL_W {
-        let label = format!("{} ({})", node.name, ByteSize::b(node.size));
+        let label = format!("{} ({})", node.name(), ByteSize::b(node.size()));
         painter.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -507,12 +507,12 @@ fn paint_directory(
         egui::pos2(rect.max.x - 1.0, rect.max.y - 1.0),
     );
 
-    if content_rect.width() > 4.0 && content_rect.height() > 4.0 && !node.children.is_empty() {
-        let nested: Vec<&FileNode> = node.children.iter().filter(|c| c.size > 0).collect();
+    if content_rect.width() > 4.0 && content_rect.height() > 4.0 && !node.children().is_empty() {
+        let nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
         if nested.is_empty() {
             return;
         }
-        let child_sizes: Vec<f64> = nested.iter().map(|c| c.size as f64).collect();
+        let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
         let child_rects = squarify(
             &child_sizes,
             content_rect.min.x,
@@ -526,10 +526,10 @@ fn paint_directory(
             if cr.width() <= 0.0 || cr.height() <= 0.0 {
                 continue;
             }
-            let color = apply_alpha(extension_color(&child.name, child.is_dir), alpha);
+            let color = apply_alpha(extension_color(child.name(), child.is_dir()), alpha);
             painter.rect_filled(cr, 1.0, color);
 
-            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == child.path);
+            let child_focused = focused_path.as_ref().is_some_and(|fp| fp.as_path() == child.path());
             if child_focused {
                 painter.rect_stroke(
                     cr,
@@ -542,13 +542,13 @@ fn paint_directory(
             // Label if large enough
             if cr.width() > MIN_LABEL_W && cr.height() > 12.0 {
                 let tc = apply_alpha(
-                    text_color_for_bg(extension_color(&child.name, child.is_dir)),
+                    text_color_for_bg(extension_color(child.name(), child.is_dir())),
                     alpha,
                 );
                 painter.text(
                     cr.center(),
                     egui::Align2::CENTER_CENTER,
-                    &child.name,
+                    child.name(),
                     egui::FontId::proportional(10.0),
                     tc,
                 );

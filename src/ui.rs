@@ -52,6 +52,7 @@ pub fn render_tree(
     parent_size: u64,
     actions: &mut Vec<NodeAction>,
     filter: &str,
+    focused_path: &mut Option<std::path::PathBuf>,
 ) {
     // Skip nodes that don't match the active filter
     if !filter.is_empty() && !node_matches(node, filter) {
@@ -66,6 +67,7 @@ pub fn render_tree(
     } else {
         1.0
     };
+    let is_focused = focused_path.as_deref() == Some(node.path.as_path());
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
@@ -87,9 +89,11 @@ pub fn render_tree(
         let icon = if node.is_dir { "D" } else { "F" };
         ui.monospace(icon);
 
-        // Name (colored by size tier)
+        // Name — selectable for keyboard focus (highlighted when focused)
         let name_text = egui::RichText::new(&node.name).monospace().color(color);
-        ui.label(name_text);
+        if ui.selectable_label(is_focused, name_text).clicked() {
+            *focused_path = Some(node.path.clone());
+        }
 
         // Size bar — proportional to parent
         let bar_width = 100.0_f32;
@@ -120,9 +124,18 @@ pub fn render_tree(
     if show_children {
         let node_size = node.size;
         for child in &mut node.children {
-            render_tree(ui, child, depth + 1, node_size, actions, filter);
+            render_tree(ui, child, depth + 1, node_size, actions, filter, focused_path);
         }
     }
+}
+
+/// Toggle expand/collapse for the node at `target`. Returns true if found.
+pub fn toggle_expand(node: &mut FileNode, target: &std::path::Path) -> bool {
+    if node.path == target {
+        node.expanded = !node.expanded;
+        return true;
+    }
+    node.children.iter_mut().any(|c| toggle_expand(c, target))
 }
 
 /// Remove a node from the tree by path, returning the removed size so parents can update.

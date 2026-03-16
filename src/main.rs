@@ -36,6 +36,7 @@ struct App {
     confirm_delete: Option<PathBuf>,
     confirm_batch_delete: bool,
     search_query: String,
+    focused_path: Option<PathBuf>,
 }
 
 impl Default for App {
@@ -53,6 +54,7 @@ impl Default for App {
             confirm_delete: None,
             confirm_batch_delete: false,
             search_query: String::new(),
+            focused_path: None,
         }
     }
 }
@@ -147,6 +149,34 @@ impl eframe::App for App {
                 self.tree = Some(tree);
                 self.scanning = false;
                 self.receiver = None;
+            }
+        }
+
+        // Keyboard shortcuts (only when no text input is focused)
+        let has_text_focus = ctx.memory(|m| m.focused().is_some());
+        if !has_text_focus {
+            if let Some(ref focused) = self.focused_path.clone() {
+                let (space, shift_del, del) = ctx.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Space),
+                        i.modifiers.shift && i.key_pressed(egui::Key::Delete),
+                        !i.modifiers.shift && i.key_pressed(egui::Key::Delete),
+                    )
+                });
+                if space {
+                    if let Some(ref mut tree) = self.tree {
+                        ui::toggle_expand(tree, focused);
+                    }
+                } else if shift_del {
+                    self.confirm_delete = Some(focused.clone());
+                } else if del {
+                    if let Err(e) = trash::delete(focused) {
+                        self.error = Some(format!("Trash failed: {e}"));
+                    } else if let Some(ref mut tree) = self.tree {
+                        ui::remove_node(tree, focused);
+                    }
+                    self.focused_path = None;
+                }
             }
         }
 
@@ -317,14 +347,16 @@ impl eframe::App for App {
             }
 
             let filter = self.search_query.clone();
+            let mut focused_path = self.focused_path.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut actions = Vec::new();
                 if let Some(ref mut tree) = self.tree {
                     let root_size = tree.size;
-                    ui::render_tree(ui, tree, 0, root_size, &mut actions, &filter);
+                    ui::render_tree(ui, tree, 0, root_size, &mut actions, &filter, &mut focused_path);
                 }
                 self.process_actions(actions);
             });
+            self.focused_path = focused_path;
         });
     }
 }

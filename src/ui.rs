@@ -19,6 +19,26 @@ fn size_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
+pub fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    if node.selected {
+        result.push(node.path.clone());
+    } else {
+        for child in &node.children {
+            result.extend(collect_selected(child));
+        }
+    }
+    result
+}
+
+pub fn count_selected(node: &FileNode) -> usize {
+    if node.selected {
+        1
+    } else {
+        node.children.iter().map(count_selected).sum()
+    }
+}
+
 pub fn render_tree(
     ui: &mut egui::Ui,
     node: &mut FileNode,
@@ -37,6 +57,9 @@ pub fn render_tree(
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
+
+        // Multi-select checkbox
+        ui.checkbox(&mut node.selected, "");
 
         // Expand/collapse toggle for directories
         if node.is_dir {

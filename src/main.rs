@@ -34,6 +34,7 @@ struct App {
     receiver: Option<mpsc::Receiver<FileNode>>,
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
+    confirm_batch_delete: bool,
 }
 
 impl Default for App {
@@ -49,6 +50,7 @@ impl Default for App {
             receiver: None,
             error: None,
             confirm_delete: None,
+            confirm_batch_delete: false,
         }
     }
 }
@@ -91,6 +93,48 @@ impl App {
             }
         }
     }
+
+    fn batch_trash_selected(&mut self) {
+        let paths = self
+            .tree
+            .as_ref()
+            .map(ui::collect_selected)
+            .unwrap_or_default();
+        for path in paths {
+            if let Err(e) = trash::delete(&path) {
+                self.error = Some(format!("Trash failed: {e}"));
+                break;
+            } else if let Some(ref mut tree) = self.tree {
+                ui::remove_node(tree, &path);
+            }
+        }
+    }
+
+    fn batch_delete_selected(&mut self) {
+        let paths = self
+            .tree
+            .as_ref()
+            .map(ui::collect_selected)
+            .unwrap_or_default();
+        for path in paths {
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => {
+                    if let Some(ref mut tree) = self.tree {
+                        ui::remove_node(tree, &path);
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("Delete failed: {e}"));
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -104,7 +148,46 @@ impl eframe::App for App {
             }
         }
 
-        // Delete confirmation dialog
+        // Batch delete confirmation dialog
+        let mut do_batch_delete = false;
+        let mut close_batch_dialog = false;
+
+        if self.confirm_batch_delete {
+            let selected_count = self
+                .tree
+                .as_ref()
+                .map(ui::count_selected)
+                .unwrap_or(0);
+            egui::Window::new("Confirm Batch Delete")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Permanently delete {} selected item(s)? This cannot be undone.",
+                        selected_count
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes, delete all").clicked() {
+                            do_batch_delete = true;
+                            close_batch_dialog = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_batch_dialog = true;
+                        }
+                    });
+                });
+        }
+
+        if close_batch_dialog {
+            self.confirm_batch_delete = false;
+        }
+
+        if do_batch_delete {
+            self.batch_delete_selected();
+        }
+
+        // Single-item delete confirmation dialog
         let mut do_delete: Option<PathBuf> = None;
         let mut close_dialog = false;
 
@@ -163,6 +246,28 @@ impl eframe::App for App {
                     if let Some(ref tree) = self.tree {
                         let path = tree.path.clone();
                         self.start_scan(path);
+                    }
+                }
+
+                // Batch operation buttons (only shown when items are selected)
+                let selected_count = self
+                    .tree
+                    .as_ref()
+                    .map(ui::count_selected)
+                    .unwrap_or(0);
+                if selected_count > 0 {
+                    ui.separator();
+                    if ui
+                        .button(format!("Trash Selected ({selected_count})"))
+                        .clicked()
+                    {
+                        self.batch_trash_selected();
+                    }
+                    if ui
+                        .button(format!("Delete Selected ({selected_count})"))
+                        .clicked()
+                    {
+                        self.confirm_batch_delete = true;
                     }
                 }
 

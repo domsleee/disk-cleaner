@@ -63,5 +63,10 @@ fn bench_scan_self(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_scan_synthetic, bench_scan_deep, bench_scan_self);
+criterion_group!(
+    benches,
+    bench_scan_synthetic,
+    bench_scan_deep,
+    bench_scan_self
+);
 criterion_main!(benches);

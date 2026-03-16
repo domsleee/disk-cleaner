@@ -1,5 +1,6 @@
 mod scanner;
 mod tree;
+mod treemap;
 mod ui;
 
 use eframe::egui;
@@ -11,7 +12,14 @@ use std::thread;
 
 use scanner::ScanProgress;
 use tree::FileNode;
+use treemap::TreemapAction;
 use ui::NodeAction;
+
+#[derive(PartialEq)]
+enum ViewMode {
+    Tree,
+    Treemap,
+}
 
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("disk-cleaner").join("config.json"))
@@ -60,6 +68,9 @@ struct App {
     search_query: String,
     focused_path: Option<PathBuf>,
     last_scan_path: Option<PathBuf>,
+    view_mode: ViewMode,
+    treemap_zoom: Option<PathBuf>,
+    treemap_zoom_anim: Option<f64>,
 }
 
 impl Default for App {
@@ -79,6 +90,9 @@ impl Default for App {
             search_query: String::new(),
             focused_path: None,
             last_scan_path: load_last_path(),
+            view_mode: ViewMode::Tree,
+            treemap_zoom: None,
+            treemap_zoom_anim: None,
         }
     }
 }
@@ -303,6 +317,33 @@ impl eframe::App for App {
                     }
                 }
 
+                // View mode toggle
+                if self.tree.is_some() {
+                    ui.separator();
+                    let tree_label = if self.view_mode == ViewMode::Tree {
+                        egui::RichText::new("Tree").strong()
+                    } else {
+                        egui::RichText::new("Tree")
+                    };
+                    let map_label = if self.view_mode == ViewMode::Treemap {
+                        egui::RichText::new("Treemap").strong()
+                    } else {
+                        egui::RichText::new("Treemap")
+                    };
+                    if ui
+                        .selectable_label(self.view_mode == ViewMode::Tree, tree_label)
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::Tree;
+                    }
+                    if ui
+                        .selectable_label(self.view_mode == ViewMode::Treemap, map_label)
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::Treemap;
+                    }
+                }
+
                 // Search/filter bar
                 if self.tree.is_some() {
                     ui.separator();
@@ -379,25 +420,55 @@ impl eframe::App for App {
                 return;
             }
 
-            let filter = self.search_query.clone();
-            let mut focused_path = self.focused_path.clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut actions = Vec::new();
-                if let Some(ref mut tree) = self.tree {
-                    let root_size = tree.size;
-                    ui::render_tree(
-                        ui,
-                        tree,
-                        0,
-                        root_size,
-                        &mut actions,
-                        &filter,
-                        &mut focused_path,
-                    );
+            match self.view_mode {
+                ViewMode::Tree => {
+                    let filter = self.search_query.clone();
+                    let mut focused_path = self.focused_path.clone();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut actions = Vec::new();
+                        if let Some(ref mut tree) = self.tree {
+                            let root_size = tree.size;
+                            ui::render_tree(
+                                ui,
+                                tree,
+                                0,
+                                root_size,
+                                &mut actions,
+                                &filter,
+                                &mut focused_path,
+                            );
+                        }
+                        self.process_actions(actions);
+                    });
+                    self.focused_path = focused_path;
                 }
-                self.process_actions(actions);
-            });
-            self.focused_path = focused_path;
+                ViewMode::Treemap => {
+                    if let Some(ref tree) = self.tree {
+                        let tm_actions = treemap::render_treemap(
+                            ui,
+                            tree,
+                            &self.treemap_zoom,
+                            &self.focused_path,
+                            self.treemap_zoom_anim,
+                        );
+                        for action in tm_actions {
+                            match action {
+                                TreemapAction::ZoomTo(path) => {
+                                    let is_root = tree.path == path;
+                                    let new_zoom = if is_root { None } else { Some(path) };
+                                    if new_zoom != self.treemap_zoom {
+                                        self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
+                                        self.treemap_zoom = new_zoom;
+                                    }
+                                }
+                                TreemapAction::Focus(path) => {
+                                    self.focused_path = Some(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
     }
 }

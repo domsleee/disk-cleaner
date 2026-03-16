@@ -111,9 +111,10 @@ pub enum TreeAction {
 }
 
 /// Flattened row data for virtualized rendering.
-struct VisibleRow {
-    path: std::path::PathBuf,
-    name: String,
+/// Borrows path/name from the tree to avoid per-frame cloning.
+struct VisibleRow<'a> {
+    path: &'a std::path::Path,
+    name: &'a str,
     size: u64,
     is_dir: bool,
     expanded: bool,
@@ -124,14 +125,14 @@ struct VisibleRow {
     category: crate::categories::FileCategory,
 }
 
-fn collect_visible_rows(
-    node: &FileNode,
+fn collect_visible_rows<'a>(
+    node: &'a FileNode,
     depth: usize,
     parent_size: u64,
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    result: &mut Vec<VisibleRow>,
+    result: &mut Vec<VisibleRow<'a>>,
 ) {
     if !show_hidden && node.name().starts_with('.') {
         return;
@@ -146,8 +147,8 @@ fn collect_visible_rows(
     }
 
     result.push(VisibleRow {
-        path: node.path().to_path_buf(),
-        name: node.name().to_string(),
+        path: node.path(),
+        name: node.name(),
         size: node.size(),
         is_dir: node.is_dir(),
         expanded: node.expanded(),
@@ -209,7 +210,7 @@ pub fn render_tree(
     let focused_idx =
         focused_path
             .as_ref()
-            .and_then(|fp| rows.iter().position(|r| r.path == *fp));
+            .and_then(|fp| rows.iter().position(|r| r.path == fp.as_path()));
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
@@ -272,7 +273,7 @@ pub fn render_tree(
                 }
 
                 // Name
-                ui.label(egui::RichText::new(&row.name).monospace());
+                ui.label(egui::RichText::new(row.name).monospace());
 
                 // Size bar + label (painted at fixed right-edge positions for alignment)
                 let row_max = ui.max_rect();
@@ -322,21 +323,21 @@ pub fn render_tree(
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                     if row.is_dir && pos.x <= toggle_right {
                         // Click on disclosure triangle area → toggle expand
-                        actions.push(TreeAction::ToggleExpand(row.path.clone()));
+                        actions.push(TreeAction::ToggleExpand(row.path.to_path_buf()));
                     } else {
                         // Click on content area → select/focus
                         let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                         actions.push(TreeAction::Click {
-                            path: row.path.clone(),
+                            path: row.path.to_path_buf(),
                             shift,
                         });
-                        actions.push(TreeAction::Focus(row.path.clone()));
+                        actions.push(TreeAction::Focus(row.path.to_path_buf()));
                     }
                 }
             }
 
             // Right-click context menu
-            let ctx_path = row.path.clone();
+            let ctx_path = row.path.to_path_buf();
             row_interact.context_menu(|ui| {
                 if ui.button("Open in Finder").clicked() {
                     actions.push(TreeAction::RevealInFinder(ctx_path.clone()));

@@ -51,6 +51,25 @@ fn bench_scan_deep(c: &mut Criterion) {
     });
 }
 
+/// Benchmark scanning a large synthetic tree (10,000 files / 500 dirs)
+fn bench_scan_large_synthetic(c: &mut Criterion) {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..500 {
+        let dir = tmp.path().join(format!("dir_{i:04}"));
+        fs::create_dir(&dir).unwrap();
+        for j in 0..20 {
+            fs::write(dir.join(format!("file_{j}.dat")), vec![0u8; 4096]).unwrap();
+        }
+    }
+
+    c.bench_function("scan_10000_files_500_dirs", |b| {
+        b.iter(|| {
+            let progress = new_progress();
+            scanner::scan_directory(tmp.path(), progress)
+        })
+    });
+}
+
 /// Benchmark scanning the project's own directory (real-world data)
 fn bench_scan_self(c: &mut Criterion) {
     let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -63,10 +82,30 @@ fn bench_scan_self(c: &mut Criterion) {
     });
 }
 
+/// Benchmark scanning ~/git (real-world, large directory)
+fn bench_scan_home_git(c: &mut Criterion) {
+    let home_git = dirs::home_dir()
+        .map(|h| h.join("git"))
+        .filter(|p| p.is_dir());
+
+    if let Some(git_dir) = home_git {
+        c.bench_function("scan_home_git", |b| {
+            b.iter(|| {
+                let progress = new_progress();
+                scanner::scan_directory(&git_dir, progress)
+            })
+        });
+    } else {
+        eprintln!("Skipping ~/git benchmark: directory not found");
+    }
+}
+
 criterion_group!(
     benches,
     bench_scan_synthetic,
     bench_scan_deep,
-    bench_scan_self
+    bench_scan_large_synthetic,
+    bench_scan_self,
+    bench_scan_home_git,
 );
 criterion_main!(benches);

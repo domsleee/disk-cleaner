@@ -13,6 +13,28 @@ use scanner::ScanProgress;
 use tree::FileNode;
 use ui::NodeAction;
 
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("disk-cleaner").join("config.json"))
+}
+
+fn load_last_path() -> Option<PathBuf> {
+    let path = config_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let last = json["last_path"].as_str()?;
+    Some(PathBuf::from(last))
+}
+
+fn save_last_path(path: &std::path::Path) {
+    if let Some(config) = config_path() {
+        if let Some(parent) = config.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let json = serde_json::json!({ "last_path": path.to_string_lossy() });
+        let _ = std::fs::write(config, json.to_string());
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
@@ -37,6 +59,7 @@ struct App {
     confirm_batch_delete: bool,
     search_query: String,
     focused_path: Option<PathBuf>,
+    last_scan_path: Option<PathBuf>,
 }
 
 impl Default for App {
@@ -55,12 +78,15 @@ impl Default for App {
             confirm_batch_delete: false,
             search_query: String::new(),
             focused_path: None,
+            last_scan_path: load_last_path(),
         }
     }
 }
 
 impl App {
     fn start_scan(&mut self, path: PathBuf) {
+        save_last_path(&path);
+        self.last_scan_path = Some(path.clone());
         self.scanning = true;
         self.error = None;
         self.tree = None;
@@ -341,7 +367,16 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.tree.is_none() && !self.scanning {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("Click \"Open Directory...\" to scan a folder");
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Click \"Open Directory...\" to scan a folder");
+                        if let Some(ref last) = self.last_scan_path.clone() {
+                            ui.add_space(12.0);
+                            let label = format!("Resume last scan: {}", last.display());
+                            if ui.button(label).clicked() {
+                                self.start_scan(last.clone());
+                            }
+                        }
+                    });
                 });
                 return;
             }

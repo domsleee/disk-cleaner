@@ -143,6 +143,8 @@ struct App {
     icon_cache: Option<icons::IconCache>,
     last_scan_file_count: u64,
     last_scan_total_size: u64,
+    show_categories: bool,
+    tree_scroll_to_focus: bool,
 }
 
 impl Default for App {
@@ -176,6 +178,8 @@ impl Default for App {
             icon_cache: None,
             last_scan_file_count: 0,
             last_scan_total_size: 0,
+            show_categories: false,
+            tree_scroll_to_focus: false,
         }
     }
 }
@@ -288,6 +292,87 @@ impl eframe::App for App {
         // Keyboard shortcuts (only when no text input is focused)
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus {
+            // Arrow key navigation
+            let (up, down, left, right) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                )
+            });
+
+            if up || down {
+                if let Some(ref tree) = self.tree {
+                    let mut visible = Vec::new();
+                    ui::collect_visible_paths(
+                        tree,
+                        &self.search_query,
+                        self.category_filter,
+                        self.show_hidden,
+                        &mut visible,
+                    );
+                    if !visible.is_empty() {
+                        if let Some(ref focused) = self.focused_path {
+                            if let Some(idx) = visible.iter().position(|p| p == focused) {
+                                let new_idx = if up {
+                                    idx.saturating_sub(1)
+                                } else {
+                                    (idx + 1).min(visible.len() - 1)
+                                };
+                                self.focused_path = Some(visible[new_idx].clone());
+                            }
+                        } else {
+                            self.focused_path = Some(visible[0].clone());
+                        }
+                        self.tree_scroll_to_focus = true;
+                    }
+                }
+            }
+
+            if left || right {
+                if let Some(ref focused) = self.focused_path.clone() {
+                    if let Some(ref mut tree) = self.tree {
+                        if let Some((is_dir, expanded, has_children)) =
+                            ui::find_node_info(tree, focused)
+                        {
+                            if left {
+                                if is_dir && expanded {
+                                    ui::set_expanded(tree, focused, false);
+                                } else if let Some(parent) =
+                                    ui::find_parent_path(tree, focused)
+                                {
+                                    self.focused_path = Some(parent);
+                                    self.tree_scroll_to_focus = true;
+                                }
+                            } else if right {
+                                if is_dir && !expanded && has_children {
+                                    ui::set_expanded(tree, focused, true);
+                                } else if is_dir && expanded {
+                                    let mut visible = Vec::new();
+                                    ui::collect_visible_paths(
+                                        tree,
+                                        &self.search_query,
+                                        self.category_filter,
+                                        self.show_hidden,
+                                        &mut visible,
+                                    );
+                                    if let Some(idx) =
+                                        visible.iter().position(|p| p == focused)
+                                    {
+                                        if idx + 1 < visible.len() {
+                                            self.focused_path =
+                                                Some(visible[idx + 1].clone());
+                                            self.tree_scroll_to_focus = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(ref focused) = self.focused_path.clone() {
                 let (space, shift_del, del) = ctx.input(|i| {
                     (
@@ -487,6 +572,20 @@ impl eframe::App for App {
                     }
                 }
 
+                // File types panel toggle
+                if self.tree.is_some() {
+                    ui.separator();
+                    if ui
+                        .selectable_label(self.show_categories, "File Types")
+                        .clicked()
+                    {
+                        self.show_categories = !self.show_categories;
+                        if !self.show_categories {
+                            self.category_filter = None;
+                        }
+                    }
+                }
+
                 // Batch operation buttons (only shown when items are selected)
                 let selected_count = self.tree.as_ref().map(ui::count_selected).unwrap_or(0);
                 if selected_count > 0 {
@@ -511,7 +610,7 @@ impl eframe::App for App {
                         ui.separator();
                         let used = total.saturating_sub(available);
                         ui.monospace(format!(
-                            "{} used / {} ({} free)",
+                            "Disk: {} used / {} ({} free)",
                             bytesize::ByteSize::b(used),
                             bytesize::ByteSize::b(total),
                             bytesize::ByteSize::b(available),
@@ -520,15 +619,7 @@ impl eframe::App for App {
                 }
 
                 if self.scanning {
-                    ui.separator();
-                    if ui.button("Cancel").clicked() {
-                        self.cancel_scan();
-                    }
-                    ui.spinner();
-                    let files = self.scan_progress.file_count.load(Ordering::Relaxed);
-                    let size = self.scan_progress.total_size.load(Ordering::Relaxed);
-                    let size_str = bytesize::ByteSize::b(size).to_string();
-                    ui.monospace(format!("Scanning: {files} files, {size_str}"));
+                    // Full-page scanning UI is in CentralPanel; just keep repainting
                     ctx.request_repaint();
                 }
 
@@ -538,8 +629,8 @@ impl eframe::App for App {
             });
         });
 
-        // Category side panel (only when scan results are available)
-        if self.tree.is_some() && !self.scanning {
+        // Category side panel (toggled via toolbar button)
+        if self.tree.is_some() && !self.scanning && self.show_categories {
             egui::SidePanel::left("categories")
                 .resizable(true)
                 .default_width(200.0)
@@ -638,7 +729,7 @@ impl eframe::App for App {
                     if !self.scanning && self.last_scan_file_count > 0 {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} \u{2014} {} files \u{2014} {}",
+                                "Scanned: {} \u{2014} {} files \u{2014} {}",
                                 path.display(),
                                 self.last_scan_file_count,
                                 bytesize::ByteSize::b(self.last_scan_total_size)
@@ -736,10 +827,11 @@ impl eframe::App for App {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                ui.monospace(
-                                                    bytesize::ByteSize::b(vol.total_bytes)
-                                                        .to_string(),
-                                                );
+                                                ui.monospace(format!(
+                                                    "Disk: {} used of {}",
+                                                    bytesize::ByteSize::b(used),
+                                                    bytesize::ByteSize::b(vol.total_bytes),
+                                                ));
                                             },
                                         );
                                     });
@@ -820,36 +912,32 @@ impl eframe::App for App {
 
             match self.view_mode {
                 ViewMode::Tree => {
-                    let filter = self.search_query.clone();
-                    let cat_filter = self.category_filter;
-                    let show_hidden = self.show_hidden;
-                    let mut focused_path = self.focused_path.clone();
-                    let mut row_clicks = Vec::new();
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                        if let Some(ref mut tree) = self.tree {
-                            let root_size = tree.size;
-                            ui::render_tree(
-                                ui,
-                                tree,
-                                0,
-                                root_size,
-                                &filter,
-                                &mut focused_path,
-                                cat_filter,
-                                show_hidden,
-                                self.icon_cache.as_ref(),
-                                &mut row_clicks,
-                            );
+                    let actions = if let Some(ref tree) = self.tree {
+                        let root_size = tree.size;
+                        ui::render_tree(
+                            ui,
+                            tree,
+                            root_size,
+                            &self.search_query,
+                            &self.focused_path,
+                            self.category_filter,
+                            self.show_hidden,
+                            self.icon_cache.as_ref(),
+                            self.tree_scroll_to_focus,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    self.tree_scroll_to_focus = false;
+                    // Update focused_path from actions
+                    for action in &actions {
+                        if let ui::TreeAction::Focus(path) = action {
+                            self.focused_path = Some(path.clone());
                         }
-                    });
-                    self.focused_path = focused_path;
-                    // Apply selection changes from row clicks
-                    if !row_clicks.is_empty() {
-                        if let Some(ref mut tree) = self.tree {
-                            ui::apply_row_clicks(tree, &row_clicks);
-                        }
+                    }
+                    // Apply selection/expand changes
+                    if let Some(ref mut tree) = self.tree {
+                        ui::apply_tree_actions(tree, &actions);
                     }
                 }
                 ViewMode::Treemap => {

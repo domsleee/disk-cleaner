@@ -17,7 +17,7 @@ use scanner::ScanProgress;
 use tree::FileNode;
 use treemap::TreemapAction;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
     Tree,
     Treemap,
@@ -413,27 +413,40 @@ impl eframe::App for App {
                 // View mode toggle
                 if self.tree.is_some() {
                     ui.separator();
-                    let tree_label = if self.view_mode == ViewMode::Tree {
-                        egui::RichText::new("Tree").strong()
-                    } else {
-                        egui::RichText::new("Tree")
-                    };
-                    let map_label = if self.view_mode == ViewMode::Treemap {
-                        egui::RichText::new("Treemap").strong()
-                    } else {
-                        egui::RichText::new("Treemap")
-                    };
-                    if ui
-                        .selectable_label(self.view_mode == ViewMode::Tree, tree_label)
-                        .clicked()
+                    for (label, mode) in [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
                     {
-                        self.view_mode = ViewMode::Tree;
-                    }
-                    if ui
-                        .selectable_label(self.view_mode == ViewMode::Treemap, map_label)
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::Treemap;
+                        let is_active = self.view_mode == mode;
+                        let text = if is_active {
+                            egui::RichText::new(label).strong().size(14.0)
+                        } else {
+                            egui::RichText::new(label)
+                                .size(14.0)
+                                .color(ui.visuals().weak_text_color())
+                        };
+
+                        let btn = egui::Button::new(text)
+                            .frame(false)
+                            .min_size(egui::vec2(0.0, 24.0));
+                        let response = ui.add(btn);
+
+                        // Draw underline for active tab
+                        if is_active {
+                            let rect = response.rect;
+                            let painter = ui.painter();
+                            let accent = egui::Color32::from_rgb(100, 180, 255);
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                    egui::vec2(rect.width(), 2.0),
+                                ),
+                                0.0,
+                                accent,
+                            );
+                        }
+
+                        if response.clicked() {
+                            self.view_mode = mode;
+                        }
                     }
                 }
 

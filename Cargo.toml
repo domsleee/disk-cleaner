@@ -30,3 +30,9 @@ harness = false
 [[bench]]
 name = "tree_memory"
 harness = false
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

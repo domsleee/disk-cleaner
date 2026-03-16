@@ -14,7 +14,6 @@ use std::thread;
 use scanner::ScanProgress;
 use tree::FileNode;
 use treemap::TreemapAction;
-use ui::NodeAction;
 
 #[derive(PartialEq)]
 enum ViewMode {
@@ -193,23 +192,6 @@ impl App {
             let tree = scanner::scan_directory(&path, progress);
             let _ = tx.send(tree);
         });
-    }
-
-    fn process_actions(&mut self, actions: Vec<NodeAction>) {
-        for action in actions {
-            match action {
-                NodeAction::Trash(path) => {
-                    if let Err(e) = trash::delete(&path) {
-                        self.error = Some(format!("Trash failed: {e}"));
-                    } else if let Some(ref mut tree) = self.tree {
-                        ui::remove_node(tree, &path);
-                    }
-                }
-                NodeAction::Delete(path) => {
-                    self.confirm_delete = Some(path);
-                }
-            }
-        }
     }
 
     fn batch_trash_selected(&mut self) {
@@ -732,7 +714,6 @@ impl eframe::App for App {
                     let show_hidden = self.show_hidden;
                     let mut focused_path = self.focused_path.clone();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let mut actions = Vec::new();
                         if let Some(ref mut tree) = self.tree {
                             let root_size = tree.size;
                             ui::render_tree(
@@ -740,14 +721,12 @@ impl eframe::App for App {
                                 tree,
                                 0,
                                 root_size,
-                                &mut actions,
                                 &filter,
                                 &mut focused_path,
                                 cat_filter,
                                 show_hidden,
                             );
                         }
-                        self.process_actions(actions);
                     });
                     self.focused_path = focused_path;
                 }

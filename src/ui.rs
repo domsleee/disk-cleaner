@@ -4,6 +4,39 @@ use eframe::egui;
 use crate::icons::IconCache;
 use crate::tree::FileNode;
 
+/// Paint a disclosure triangle (▶ or ▼) as a clickable toggle.
+/// Uses the painter directly so it renders in any font.
+fn disclosure_toggle(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+    let size = egui::vec2(16.0, 16.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let center = rect.center();
+        let half = 4.0;
+        let triangle = if expanded {
+            // Down-pointing triangle
+            vec![
+                egui::pos2(center.x - half, center.y - half * 0.5),
+                egui::pos2(center.x + half, center.y - half * 0.5),
+                egui::pos2(center.x, center.y + half * 0.75),
+            ]
+        } else {
+            // Right-pointing triangle
+            vec![
+                egui::pos2(center.x - half * 0.5, center.y - half),
+                egui::pos2(center.x + half * 0.75, center.y),
+                egui::pos2(center.x - half * 0.5, center.y + half),
+            ]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            triangle,
+            visuals.fg_stroke.color,
+            egui::Stroke::NONE,
+        ));
+    }
+    response
+}
+
 fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
     if size > 1_000_000_000 {
         egui::Color32::from_rgb(52, 152, 219) // blue >1GB
@@ -112,12 +145,12 @@ pub fn render_tree(
 
         // Expand/collapse toggle for directories
         if node.is_dir {
-            let label = if node.expanded { "\u{25BE}" } else { "\u{25B8}" };
-            if ui.small_button(label).clicked() {
+            if disclosure_toggle(ui, node.expanded).clicked() {
                 node.expanded = !node.expanded;
             }
         } else {
-            ui.add_space(24.0); // align with dir toggles
+            // Allocate same 16x16 rect as disclosure toggle so icons align
+            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
         }
 
         // Icon — native system icons (with emoji fallback)
@@ -142,20 +175,22 @@ pub fn render_tree(
             *focused_path = Some(node.path.clone());
         }
 
-        // Size bar — proportional to parent
-        let bar_width = 80.0_f32;
-        let bar_height = 10.0_f32;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-        let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_height));
-        painter.rect_filled(fill_rect, 2.0, bcolor);
+        // Size bar + label — right-aligned so they stay in a fixed column
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let size_text = egui::RichText::new(format!("{:>10}", size_str)).monospace();
+            ui.label(size_text);
 
-        // Size label — right-aligned with fixed width for alignment
-        let size_text = egui::RichText::new(format!("{:>10}", size_str)).monospace();
-        ui.label(size_text);
+            let bar_width = 80.0_f32;
+            let bar_height = 10.0_f32;
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(bar_width, bar_height), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+            let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
+            let fill_rect =
+                egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, bar_height));
+            painter.rect_filled(fill_rect, 2.0, bcolor);
+        });
     }).response;
 
     // Fill in the selection background now that we know the row rect

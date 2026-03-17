@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use bytesize::ByteSize;
 use eframe::egui;
 
@@ -53,7 +56,8 @@ pub fn node_matches(node: &FileNode, query: &str) -> bool {
         || node.children().iter().any(|c| node_matches(c, query))
 }
 
-pub fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
+#[cfg(test)]
+pub(crate) fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
     let mut result = Vec::new();
     if node.selected() {
         result.push(node.path().to_path_buf());
@@ -65,7 +69,8 @@ pub fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
     result
 }
 
-pub fn count_selected(node: &FileNode) -> usize {
+#[cfg(test)]
+pub(crate) fn count_selected(node: &FileNode) -> usize {
     if node.selected() {
         1
     } else {
@@ -73,8 +78,10 @@ pub fn count_selected(node: &FileNode) -> usize {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 /// Clear the `selected` flag on all nodes in the tree.
-pub fn clear_selection(node: &mut FileNode) {
+pub(crate) fn clear_selection(node: &mut FileNode) {
     node.set_selected(false);
     if let FileNode::Dir(d) = node {
         for child in &mut d.children {
@@ -83,7 +90,8 @@ pub fn clear_selection(node: &mut FileNode) {
     }
 }
 
-/// Set `selected = true` on the node matching `target`. Returns true if found.
+#[cfg(test)]
+#[allow(dead_code)]
 fn select_node(node: &mut FileNode, target: &std::path::Path) -> bool {
     if node.path() == target {
         node.set_selected(true);
@@ -118,7 +126,6 @@ struct VisibleRow<'a> {
     size: u64,
     is_dir: bool,
     expanded: bool,
-    selected: bool,
     depth: usize,
     parent_size: u64,
     children_count: usize,
@@ -152,7 +159,6 @@ fn collect_visible_rows<'a>(
         size: node.size(),
         is_dir: node.is_dir(),
         expanded: node.expanded(),
-        selected: node.selected(),
         depth,
         parent_size,
         children_count: node.children().len(),
@@ -191,6 +197,7 @@ pub fn render_tree(
     show_hidden: bool,
     icon_cache: Option<&IconCache>,
     scroll_to_focus: bool,
+    selected_paths: &HashSet<PathBuf>,
 ) -> Vec<TreeAction> {
     let mut rows = Vec::new();
     collect_visible_rows(
@@ -388,8 +395,9 @@ pub fn render_tree(
             }
 
             // Focus/selection background — both use blue selection color
-            if row.selected || is_focused {
-                let bg_color = if row.selected {
+            let is_selected = selected_paths.contains(row.path);
+            if is_selected || is_focused {
+                let bg_color = if is_selected {
                     ui.visuals().selection.bg_fill.linear_multiply(0.3)
                 } else {
                     ui.visuals().selection.bg_fill.linear_multiply(0.4)
@@ -409,30 +417,8 @@ pub fn render_tree(
     actions
 }
 
-/// Apply tree actions to update tree state after rendering.
-pub fn apply_tree_actions(tree: &mut FileNode, actions: &[TreeAction]) {
-    for action in actions {
-        match action {
-            TreeAction::ToggleExpand(path) => {
-                toggle_expand(tree, path);
-            }
-            TreeAction::Click { path, shift } => {
-                if *shift {
-                    toggle_selected(tree, path);
-                } else {
-                    clear_selection(tree);
-                    select_node(tree, path);
-                }
-            }
-            TreeAction::Focus(_)
-            | TreeAction::Trash(_)
-            | TreeAction::ConfirmDelete(_)
-            | TreeAction::RevealInFinder(_)
-            | TreeAction::CopyPath(_) => {} // handled by caller
-        }
-    }
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 fn toggle_selected(node: &mut FileNode, target: &std::path::Path) -> bool {
     if node.path() == target {
         let new_val = !node.selected();

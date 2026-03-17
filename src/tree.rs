@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 pub struct FileLeaf {
     pub path: PathBuf,
     pub size: u64,
+    /// Selection state — kept on struct for scanner construction but tracked
+    /// centrally in App::selected_paths for O(1) clear/check.
+    #[allow(dead_code)]
     pub selected: bool,
 }
 
@@ -11,6 +14,7 @@ pub struct DirNode {
     pub size: u64,
     pub children: Vec<FileNode>,
     pub expanded: bool,
+    #[allow(dead_code)]
     pub selected: bool,
 }
 
@@ -61,6 +65,7 @@ impl FileNode {
         }
     }
 
+    #[cfg(test)]
     pub fn selected(&self) -> bool {
         match self {
             FileNode::File(f) => f.selected,
@@ -74,6 +79,7 @@ impl FileNode {
         }
     }
 
+    #[cfg(test)]
     pub fn set_selected(&mut self, val: bool) {
         match self {
             FileNode::File(f) => f.selected = val,

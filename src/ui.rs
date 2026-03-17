@@ -311,6 +311,16 @@ pub fn render_tree(
                 }
             }
 
+            // Right-click: select the row before showing context menu
+            if row_interact.secondary_clicked() {
+                actions.push(TreeAction::Click {
+                    path: row.path.clone(),
+                    shift: false,
+                    toggle: false,
+                });
+                actions.push(TreeAction::Focus(row.path.clone()));
+            }
+
             // Right-click context menu
             let ctx_path = row.path.clone();
             row_interact.context_menu(|ui| {

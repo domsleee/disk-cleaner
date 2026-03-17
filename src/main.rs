@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use scanner::ScanProgress;
 use tree::FileNode;
@@ -73,6 +74,8 @@ fn print_help() {
 }
 
 fn main() -> eframe::Result {
+    let process_start = Instant::now();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_path: Option<PathBuf> = None;
 
@@ -115,6 +118,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             let mut app = App::default();
+            app.process_start = Some(process_start);
             if let Some(path) = initial_path {
                 app.start_scan(path);
             }
@@ -156,6 +160,12 @@ struct App {
     selected_paths: HashSet<PathBuf>,
     /// Smart cleanup suggestions computed after scan.
     suggestion_report: Option<suggestions::SuggestionReport>,
+    /// Process start time for measuring startup latency.
+    process_start: Option<Instant>,
+    /// Frame-time tracking during scans.
+    scan_frame_times: Vec<Duration>,
+    /// Start of the current scan for total duration tracking.
+    scan_start_time: Option<Instant>,
 }
 
 impl Default for App {
@@ -195,6 +205,9 @@ impl Default for App {
             visible_paths_dirty: true,
             selected_paths: HashSet::new(),
             suggestion_report: None,
+            process_start: None,
+            scan_frame_times: Vec::new(),
+            scan_start_time: None,
         }
     }
 }
@@ -231,6 +244,9 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
+
+        self.scan_start_time = Some(Instant::now());
+        self.scan_frame_times.clear();
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
@@ -294,6 +310,13 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
+
+        // Log startup time on first frame
+        if let Some(start) = self.process_start.take() {
+            eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
+        }
+
         // Load system icons on first frame
         if self.icon_cache.is_none() {
             self.icon_cache = icons::IconCache::load(ctx);
@@ -314,6 +337,24 @@ impl eframe::App for App {
                 self.receiver = None;
                 self.category_filter = None;
                 self.visible_paths_dirty = true;
+
+                // Report frame-time stats for the scan
+                if let Some(scan_start) = self.scan_start_time.take() {
+                    let scan_dur = scan_start.elapsed();
+                    let ft = &mut self.scan_frame_times;
+                    ft.sort();
+                    let n = ft.len();
+                    if n > 0 {
+                        let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
+                        let p99 = ft[(n as f64 * 0.99) as usize];
+                        let over = ft.iter().filter(|d| **d > Duration::from_millis(16)).count();
+                        eprintln!("[perf] scan done in {scan_dur:?} ({} files)", self.last_scan_file_count);
+                        eprintln!("[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
+                            ft[0], ft[n / 2], ft[n - 1]);
+                        eprintln!("[perf] frames >16ms: {over}/{n} ({:.1}%)", over as f64 / n as f64 * 100.0);
+                    }
+                    ft.clear();
+                }
             }
         }
 
@@ -1072,5 +1113,10 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Record frame time while scanning
+        if self.scanning {
+            self.scan_frame_times.push(frame_start.elapsed());
+        }
     }
 }

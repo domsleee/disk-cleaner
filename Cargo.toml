@@ -31,6 +31,10 @@ harness = false
 name = "tree_memory"
 harness = false
 
+[[bench]]
+name = "tree_ops"
+harness = false
+
 [profile.release]
 lto = true
 strip = true

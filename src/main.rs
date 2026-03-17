@@ -2,6 +2,8 @@ mod app_icon;
 mod categories;
 mod icons;
 mod scanner;
+mod suggestions;
+mod suggestions_ui;
 mod tree;
 mod treemap;
 mod ui;
@@ -22,6 +24,7 @@ use treemap::TreemapAction;
 enum ViewMode {
     Tree,
     Treemap,
+    Suggestions,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -151,6 +154,8 @@ struct App {
     visible_paths_dirty: bool,
     /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
     selected_paths: HashSet<PathBuf>,
+    /// Smart cleanup suggestions computed after scan.
+    suggestion_report: Option<suggestions::SuggestionReport>,
 }
 
 impl Default for App {
@@ -189,6 +194,7 @@ impl Default for App {
             cached_visible_paths: Vec::new(),
             visible_paths_dirty: true,
             selected_paths: HashSet::new(),
+            suggestion_report: None,
         }
     }
 }
@@ -297,6 +303,7 @@ impl eframe::App for App {
         if let Some(ref rx) = self.receiver {
             if let Ok(tree) = rx.try_recv() {
                 self.category_stats = Some(categories::compute_stats(&tree));
+                self.suggestion_report = Some(suggestions::analyze(&tree));
                 self.tree = Some(tree);
                 if let Some(ref mut t) = self.tree {
                     tree::auto_expand(t, 0, 2);
@@ -512,7 +519,7 @@ impl eframe::App for App {
                 // View mode toggle
                 if self.tree.is_some() {
                     ui.separator();
-                    for (label, mode) in [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
+                    for (label, mode) in [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap), ("Suggestions", ViewMode::Suggestions)]
                     {
                         let is_active = self.view_mode == mode;
                         let text = if is_active {
@@ -1025,6 +1032,39 @@ impl eframe::App for App {
                                 }
                                 TreemapAction::Focus(path) => {
                                     self.focused_path = Some(path);
+                                }
+                            }
+                        }
+                    }
+                }
+                ViewMode::Suggestions => {
+                    if let Some(ref mut report) = self.suggestion_report {
+                        let sg_actions = suggestions_ui::render_suggestions(ui, report);
+                        for action in sg_actions {
+                            match action {
+                                suggestions_ui::SuggestionAction::ToggleGroup(idx) => {
+                                    report.groups[idx].expanded = !report.groups[idx].expanded;
+                                }
+                                suggestions_ui::SuggestionAction::TrashItem(path) => {
+                                    if let Err(e) = trash::delete(&path) {
+                                        self.error = Some(format!("Trash failed: {e}"));
+                                    } else if let Some(ref mut tree) = self.tree {
+                                        ui::remove_node(tree, &path);
+                                        self.visible_paths_dirty = true;
+                                    }
+                                }
+                                suggestions_ui::SuggestionAction::TrashGroup(idx) => {
+                                    let paths: Vec<PathBuf> =
+                                        report.groups[idx].items.iter().map(|i| i.path.clone()).collect();
+                                    for path in paths {
+                                        if let Err(e) = trash::delete(&path) {
+                                            self.error = Some(format!("Trash failed: {e}"));
+                                            break;
+                                        } else if let Some(ref mut tree) = self.tree {
+                                            ui::remove_node(tree, &path);
+                                            self.visible_paths_dirty = true;
+                                        }
+                                    }
                                 }
                             }
                         }

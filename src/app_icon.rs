@@ -1,6 +1,6 @@
 use eframe::egui::IconData;
 
-const SIZE: u32 = 128;
+const SIZE: u32 = 1024;
 const CENTER: f64 = SIZE as f64 / 2.0;
 const OUTER_R: f64 = CENTER - 2.0;
 const INNER_R: f64 = OUTER_R * 0.38;

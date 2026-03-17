@@ -504,8 +504,7 @@ impl eframe::App for App {
                 }
 
                 if self.tree.is_some() && ui.button("Re-scan").clicked() {
-                    if let Some(ref tree) = self.tree {
-                        let path = tree.path().to_path_buf();
+                    if let Some(path) = self.scan_path.clone() {
                         self.start_scan(path);
                     }
                 }
@@ -1017,7 +1016,7 @@ impl eframe::App for App {
                         for action in tm_actions {
                             match action {
                                 TreemapAction::ZoomTo(path) => {
-                                    let is_root = tree.path() == path;
+                                    let is_root = std::path::Path::new(tree.name()) == path.as_path();
                                     let new_zoom = if is_root { None } else { Some(path) };
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));

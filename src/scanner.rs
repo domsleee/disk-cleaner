@@ -144,19 +144,31 @@ fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
 
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     let skip = build_skip_set(root);
+    // Root node gets the full absolute path as its name so that
+    // path reconstruction (root.name / child.name / ...) produces
+    // correct absolute paths.
     let mut root_node = walk_dir(root, &progress, &skip);
     root_node.set_expanded(true);
+    // Override name to be the full path (walk_dir used file_name only)
+    if let FileNode::Dir(d) = &mut root_node {
+        d.name = root.to_string_lossy().into_owned().into_boxed_str();
+    }
     root_node
 }
 
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
+    let dir_name: Box<str> = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned())
+        .into_boxed_str();
+
     let empty_dir = FileNode::Dir(DirNode {
-        path: dir.to_path_buf(),
+        name: dir_name.clone(),
         size: 0,
         children: Vec::new(),
         expanded: false,
-        selected: false,
     });
 
     // Bail out early if scan was cancelled
@@ -190,11 +202,8 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
-                Some(FileNode::File(FileLeaf {
-                    path,
-                    size: len,
-                    selected: false,
-                }))
+                let name = entry.file_name().to_string_lossy().into_owned().into_boxed_str();
+                Some(FileNode::File(FileLeaf { name, size: len }))
             } else {
                 None
             }
@@ -205,11 +214,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(DirNode {
-        path: dir.to_path_buf(),
+        name: dir_name,
         size,
         children,
         expanded: false,
-        selected: false,
     })
 }
 

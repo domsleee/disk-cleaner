@@ -1,21 +1,18 @@
-use std::path::{Path, PathBuf};
+//! Compact tree node — stores only the filename (not the full path) to
+//! reduce per-node memory.  Full paths are reconstructed during traversal
+//! by joining ancestor names.  The root node's name is the absolute scan
+//! path so that reconstruction produces correct absolute paths.
 
 pub struct FileLeaf {
-    pub path: PathBuf,
+    pub name: Box<str>,
     pub size: u64,
-    /// Selection state — kept on struct for scanner construction but tracked
-    /// centrally in App::selected_paths for O(1) clear/check.
-    #[allow(dead_code)]
-    pub selected: bool,
 }
 
 pub struct DirNode {
-    pub path: PathBuf,
+    pub name: Box<str>,
     pub size: u64,
     pub children: Vec<FileNode>,
     pub expanded: bool,
-    #[allow(dead_code)]
-    pub selected: bool,
 }
 
 pub enum FileNode {
@@ -24,19 +21,10 @@ pub enum FileNode {
 }
 
 impl FileNode {
-    /// Derive display name from the path's final component.
-    /// Falls back to the full path string for root paths like "/".
     pub fn name(&self) -> &str {
-        let p = self.path();
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_else(|| p.to_str().unwrap_or(""))
-    }
-
-    pub fn path(&self) -> &Path {
         match self {
-            FileNode::File(f) => &f.path,
-            FileNode::Dir(d) => &d.path,
+            FileNode::File(f) => &f.name,
+            FileNode::Dir(d) => &d.name,
         }
     }
 
@@ -65,25 +53,9 @@ impl FileNode {
         }
     }
 
-    #[cfg(test)]
-    pub fn selected(&self) -> bool {
-        match self {
-            FileNode::File(f) => f.selected,
-            FileNode::Dir(d) => d.selected,
-        }
-    }
-
     pub fn set_expanded(&mut self, val: bool) {
         if let FileNode::Dir(d) = self {
             d.expanded = val;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn set_selected(&mut self, val: bool) {
-        match self {
-            FileNode::File(f) => f.selected = val,
-            FileNode::Dir(d) => d.selected = val,
         }
     }
 
@@ -115,9 +87,8 @@ pub fn auto_expand(node: &mut FileNode, depth: usize, max_depth: usize) {
 #[cfg(test)]
 pub fn leaf(name: &str, size: u64) -> FileNode {
     FileNode::File(FileLeaf {
-        path: PathBuf::from(name),
+        name: name.into(),
         size,
-        selected: false,
     })
 }
 
@@ -125,11 +96,10 @@ pub fn leaf(name: &str, size: u64) -> FileNode {
 pub fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
     let size = children.iter().map(|c| c.size()).sum();
     FileNode::Dir(DirNode {
-        path: PathBuf::from(name),
+        name: name.into(),
         size,
         children,
         expanded: false,
-        selected: false,
     })
 }
 
@@ -139,7 +109,6 @@ mod tests {
 
     #[test]
     fn auto_expand_expands_large_children() {
-        // root (400): big_dir (300, 75%), small_dir (100, 25%)
         let mut root = dir("root", vec![
             dir("big_dir", vec![leaf("a.txt", 300)]),
             dir("small_dir", vec![leaf("b.txt", 100)]),
@@ -154,7 +123,6 @@ mod tests {
 
     #[test]
     fn auto_expand_skips_small_children() {
-        // root (400): big_dir (300), tiny_dir (10), rest is a file
         let mut root = dir("root", vec![
             dir("big_dir", vec![leaf("a.txt", 300)]),
             dir("tiny_dir", vec![leaf("b.txt", 10)]),
@@ -170,7 +138,6 @@ mod tests {
 
     #[test]
     fn auto_expand_respects_max_depth() {
-        // 3-level deep tree, but max_depth=1 should only expand first level
         let mut root = dir("root", vec![
             dir("lvl1", vec![
                 dir("lvl2", vec![leaf("deep.txt", 100)]),

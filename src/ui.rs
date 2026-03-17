@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bytesize::ByteSize;
 use eframe::egui;
@@ -56,72 +56,24 @@ pub fn node_matches(node: &FileNode, query: &str) -> bool {
         || node.children().iter().any(|c| node_matches(c, query))
 }
 
-#[cfg(test)]
-pub(crate) fn collect_selected(node: &FileNode) -> Vec<std::path::PathBuf> {
-    let mut result = Vec::new();
-    if node.selected() {
-        result.push(node.path().to_path_buf());
-    } else {
-        for child in node.children() {
-            result.extend(collect_selected(child));
-        }
-    }
-    result
-}
-
-#[cfg(test)]
-pub(crate) fn count_selected(node: &FileNode) -> usize {
-    if node.selected() {
-        1
-    } else {
-        node.children().iter().map(count_selected).sum()
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-/// Clear the `selected` flag on all nodes in the tree.
-pub(crate) fn clear_selection(node: &mut FileNode) {
-    node.set_selected(false);
-    if let FileNode::Dir(d) = node {
-        for child in &mut d.children {
-            clear_selection(child);
-        }
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn select_node(node: &mut FileNode, target: &std::path::Path) -> bool {
-    if node.path() == target {
-        node.set_selected(true);
-        return true;
-    }
-    if let FileNode::Dir(d) = node {
-        d.children.iter_mut().any(|c| select_node(c, target))
-    } else {
-        false
-    }
-}
-
 /// Actions produced by tree rendering, applied after the frame.
 pub enum TreeAction {
-    ToggleExpand(std::path::PathBuf),
+    ToggleExpand(PathBuf),
     Click {
-        path: std::path::PathBuf,
+        path: PathBuf,
         shift: bool,
     },
-    Focus(std::path::PathBuf),
-    Trash(std::path::PathBuf),
-    ConfirmDelete(std::path::PathBuf),
-    RevealInFinder(std::path::PathBuf),
-    CopyPath(std::path::PathBuf),
+    Focus(PathBuf),
+    Trash(PathBuf),
+    ConfirmDelete(PathBuf),
+    RevealInFinder(PathBuf),
+    CopyPath(PathBuf),
 }
 
 /// Flattened row data for virtualized rendering.
-/// Borrows path/name from the tree to avoid per-frame cloning.
+/// Path is reconstructed during traversal (owned); name borrows from the tree.
 struct VisibleRow<'a> {
-    path: &'a std::path::Path,
+    path: PathBuf,
     name: &'a str,
     size: u64,
     is_dir: bool,
@@ -132,10 +84,12 @@ struct VisibleRow<'a> {
     category: crate::categories::FileCategory,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_visible_rows<'a>(
     node: &'a FileNode,
     depth: usize,
     parent_size: u64,
+    current_path: &mut PathBuf,
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
@@ -154,7 +108,7 @@ fn collect_visible_rows<'a>(
     }
 
     result.push(VisibleRow {
-        path: node.path(),
+        path: current_path.clone(),
         name: node.name(),
         size: node.size(),
         is_dir: node.is_dir(),
@@ -172,15 +126,18 @@ fn collect_visible_rows<'a>(
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
     if show_children {
         for child in node.children() {
+            current_path.push(child.name());
             collect_visible_rows(
                 child,
                 depth + 1,
                 node.size(),
+                current_path,
                 filter,
                 category_filter,
                 show_hidden,
                 result,
             );
+            current_path.pop();
         }
     }
 }
@@ -192,7 +149,7 @@ pub fn render_tree(
     tree: &FileNode,
     root_size: u64,
     filter: &str,
-    focused_path: &Option<std::path::PathBuf>,
+    focused_path: &Option<PathBuf>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
     icon_cache: Option<&IconCache>,
@@ -200,10 +157,12 @@ pub fn render_tree(
     selected_paths: &HashSet<PathBuf>,
 ) -> Vec<TreeAction> {
     let mut rows = Vec::new();
+    let mut path_buf = PathBuf::from(tree.name());
     collect_visible_rows(
         tree,
         0,
         root_size,
+        &mut path_buf,
         filter,
         category_filter,
         show_hidden,
@@ -217,7 +176,7 @@ pub fn render_tree(
     let focused_idx =
         focused_path
             .as_ref()
-            .and_then(|fp| rows.iter().position(|r| r.path == fp.as_path()));
+            .and_then(|fp| rows.iter().position(|r| r.path == *fp));
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
@@ -335,21 +294,21 @@ pub fn render_tree(
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                     if row.is_dir && pos.x <= toggle_right {
                         // Click on disclosure triangle area → toggle expand
-                        actions.push(TreeAction::ToggleExpand(row.path.to_path_buf()));
+                        actions.push(TreeAction::ToggleExpand(row.path.clone()));
                     } else {
                         // Click on content area → select/focus
                         let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                         actions.push(TreeAction::Click {
-                            path: row.path.to_path_buf(),
+                            path: row.path.clone(),
                             shift,
                         });
-                        actions.push(TreeAction::Focus(row.path.to_path_buf()));
+                        actions.push(TreeAction::Focus(row.path.clone()));
                     }
                 }
             }
 
             // Right-click context menu
-            let ctx_path = row.path.to_path_buf();
+            let ctx_path = row.path.clone();
             row_interact.context_menu(|ui| {
                 if ui.button("Open in Finder").clicked() {
                     actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
@@ -395,7 +354,7 @@ pub fn render_tree(
             }
 
             // Focus/selection background — both use blue selection color
-            let is_selected = selected_paths.contains(row.path);
+            let is_selected = selected_paths.contains(&row.path);
             if is_selected || is_focused {
                 let bg_color = if is_selected {
                     ui.visuals().selection.bg_fill.linear_multiply(0.3)
@@ -417,54 +376,63 @@ pub fn render_tree(
     actions
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn toggle_selected(node: &mut FileNode, target: &std::path::Path) -> bool {
-    if node.path() == target {
-        let new_val = !node.selected();
-        node.set_selected(new_val);
-        return true;
-    }
-    if let FileNode::Dir(d) = node {
-        d.children
-            .iter_mut()
-            .any(|c| toggle_selected(c, target))
-    } else {
-        false
-    }
+/// Toggle expand/collapse for the node at `target`. Returns true if found.
+pub fn toggle_expand(node: &mut FileNode, target: &Path) -> bool {
+    let mut buf = PathBuf::from(node.name());
+    toggle_expand_inner(node, target, &mut buf)
 }
 
-/// Toggle expand/collapse for the node at `target`. Returns true if found.
-pub fn toggle_expand(node: &mut FileNode, target: &std::path::Path) -> bool {
-    if node.path() == target {
+fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> bool {
+    if buf.as_path() == target {
         let new_val = !node.expanded();
         node.set_expanded(new_val);
         return true;
     }
     if let FileNode::Dir(d) = node {
-        d.children.iter_mut().any(|c| toggle_expand(c, target))
-    } else {
-        false
+        for child in &mut d.children {
+            buf.push(child.name());
+            if toggle_expand_inner(child, target, buf) {
+                buf.pop();
+                return true;
+            }
+            buf.pop();
+        }
     }
+    false
 }
 
 /// Remove a node from the tree by path, returning the removed size so parents can update.
-pub fn remove_node(node: &mut FileNode, target: &std::path::Path) -> Option<u64> {
+pub fn remove_node(node: &mut FileNode, target: &Path) -> Option<u64> {
+    let mut buf = PathBuf::from(node.name());
+    remove_node_inner(node, target, &mut buf)
+}
+
+fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> Option<u64> {
     let d = node.as_dir_mut()?;
 
-    if let Some(pos) = d.children.iter().position(|c| c.path() == target) {
+    // Check direct children
+    let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
+        let child_path = buf.join(c.name());
+        if child_path == target { Some(i) } else { None }
+    });
+
+    if let Some(pos) = found_pos {
         let removed_size = d.children[pos].size();
         d.children.remove(pos);
         d.size -= removed_size;
         return Some(removed_size);
     }
 
+    // Recurse into child directories
     for child in &mut d.children {
         if child.is_dir() {
-            if let Some(removed_size) = remove_node(child, target) {
+            buf.push(child.name());
+            if let Some(removed_size) = remove_node_inner(child, target, buf) {
+                buf.pop();
                 d.size -= removed_size;
                 return Some(removed_size);
             }
+            buf.pop();
         }
     }
 
@@ -477,7 +445,19 @@ pub fn collect_visible_paths(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    result: &mut Vec<std::path::PathBuf>,
+    result: &mut Vec<PathBuf>,
+) {
+    let mut buf = PathBuf::from(node.name());
+    collect_visible_paths_inner(node, &mut buf, filter, category_filter, show_hidden, result);
+}
+
+fn collect_visible_paths_inner(
+    node: &FileNode,
+    current_path: &mut PathBuf,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    result: &mut Vec<PathBuf>,
 ) {
     if !show_hidden && node.name().starts_with('.') {
         return;
@@ -491,52 +471,85 @@ pub fn collect_visible_paths(
         }
     }
 
-    result.push(node.path().to_path_buf());
+    result.push(current_path.clone());
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
     if show_children {
         for child in node.children() {
-            collect_visible_paths(child, filter, category_filter, show_hidden, result);
+            current_path.push(child.name());
+            collect_visible_paths_inner(child, current_path, filter, category_filter, show_hidden, result);
+            current_path.pop();
         }
     }
 }
 
 /// Find the parent path of a node in the tree.
-pub fn find_parent_path(node: &FileNode, target: &std::path::Path) -> Option<std::path::PathBuf> {
+pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
+    let mut buf = PathBuf::from(node.name());
+    find_parent_path_inner(node, target, &mut buf)
+}
+
+fn find_parent_path_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<PathBuf> {
     for child in node.children() {
-        if child.path() == target {
-            return Some(node.path().to_path_buf());
+        let child_path = buf.join(child.name());
+        if child_path == target {
+            return Some(buf.clone());
         }
-        if let Some(parent) = find_parent_path(child, target) {
-            return Some(parent);
+        if child.is_dir() {
+            buf.push(child.name());
+            if let Some(parent) = find_parent_path_inner(child, target, buf) {
+                buf.pop();
+                return Some(parent);
+            }
+            buf.pop();
         }
     }
     None
 }
 
 /// Find a node by path and return (is_dir, expanded, has_children).
-pub fn find_node_info(node: &FileNode, target: &std::path::Path) -> Option<(bool, bool, bool)> {
-    if node.path() == target {
+pub fn find_node_info(node: &FileNode, target: &Path) -> Option<(bool, bool, bool)> {
+    let mut buf = PathBuf::from(node.name());
+    find_node_info_inner(node, target, &mut buf)
+}
+
+fn find_node_info_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<(bool, bool, bool)> {
+    if buf.as_path() == target {
         return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
     }
-    node.children()
-        .iter()
-        .find_map(|c| find_node_info(c, target))
+    for child in node.children() {
+        buf.push(child.name());
+        if let Some(info) = find_node_info_inner(child, target, buf) {
+            buf.pop();
+            return Some(info);
+        }
+        buf.pop();
+    }
+    None
 }
 
 /// Set expanded state for a node at target path. Returns true if found.
-pub fn set_expanded(node: &mut FileNode, target: &std::path::Path, expanded: bool) -> bool {
-    if node.path() == target {
+pub fn set_expanded(node: &mut FileNode, target: &Path, expanded: bool) -> bool {
+    let mut buf = PathBuf::from(node.name());
+    set_expanded_inner(node, target, expanded, &mut buf)
+}
+
+fn set_expanded_inner(node: &mut FileNode, target: &Path, expanded: bool, buf: &mut PathBuf) -> bool {
+    if buf.as_path() == target {
         node.set_expanded(expanded);
         return true;
     }
     if let FileNode::Dir(d) = node {
-        d.children
-            .iter_mut()
-            .any(|c| set_expanded(c, target, expanded))
-    } else {
-        false
+        for child in &mut d.children {
+            buf.push(child.name());
+            if set_expanded_inner(child, target, expanded, buf) {
+                buf.pop();
+                return true;
+            }
+            buf.pop();
+        }
     }
+    false
 }
 
 #[cfg(test)]
@@ -561,61 +574,21 @@ mod tests {
     }
 
     #[test]
-    fn collect_selected_returns_selected_nodes() {
-        let mut tree = dir(
-            "root",
-            vec![leaf("a.txt", 10), leaf("b.txt", 20), leaf("c.txt", 30)],
-        );
-        let d = tree.as_dir_mut().unwrap();
-        d.children[0].set_selected(true);
-        d.children[2].set_selected(true);
-
-        let selected = collect_selected(&tree);
-        assert_eq!(selected.len(), 2);
-        assert!(selected.contains(&tree.children()[0].path().to_path_buf()));
-        assert!(selected.contains(&tree.children()[2].path().to_path_buf()));
-    }
-
-    #[test]
-    fn collect_selected_stops_at_selected_parent() {
-        let mut tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 5)])]);
-        tree.as_dir_mut().unwrap().children[0].set_selected(true);
-
-        let selected = collect_selected(&tree);
-        // Should return the parent, not recurse into children
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0], tree.children()[0].path());
-    }
-
-    #[test]
-    fn count_selected_counts_correctly() {
-        let mut tree = dir(
-            "root",
-            vec![leaf("a.txt", 10), leaf("b.txt", 20), leaf("c.txt", 30)],
-        );
-        assert_eq!(count_selected(&tree), 0);
-        tree.as_dir_mut().unwrap().children[1].set_selected(true);
-        assert_eq!(count_selected(&tree), 1);
-        tree.as_dir_mut().unwrap().children[2].set_selected(true);
-        assert_eq!(count_selected(&tree), 2);
-    }
-
-    #[test]
     fn toggle_expand_flips_target() {
         let mut tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 1)])]);
         assert!(!tree.children()[0].expanded());
 
-        toggle_expand(&mut tree, std::path::Path::new("sub"));
+        toggle_expand(&mut tree, Path::new("root/sub"));
         assert!(tree.children()[0].expanded());
 
-        toggle_expand(&mut tree, std::path::Path::new("sub"));
+        toggle_expand(&mut tree, Path::new("root/sub"));
         assert!(!tree.children()[0].expanded());
     }
 
     #[test]
     fn toggle_expand_returns_false_for_missing() {
         let mut tree = dir("root", vec![]);
-        assert!(!toggle_expand(&mut tree, std::path::Path::new("nope")));
+        assert!(!toggle_expand(&mut tree, Path::new("nope")));
     }
 
     #[test]
@@ -623,7 +596,7 @@ mod tests {
         let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
         assert_eq!(tree.size(), 30);
 
-        let removed = remove_node(&mut tree, std::path::Path::new("a.txt"));
+        let removed = remove_node(&mut tree, Path::new("root/a.txt"));
         assert_eq!(removed, Some(10));
         assert_eq!(tree.size(), 20);
         assert_eq!(tree.children().len(), 1);
@@ -635,7 +608,7 @@ mod tests {
         let mut tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 100)])]);
         assert_eq!(tree.size(), 100);
 
-        let removed = remove_node(&mut tree, std::path::Path::new("deep.txt"));
+        let removed = remove_node(&mut tree, Path::new("root/sub/deep.txt"));
         assert_eq!(removed, Some(100));
         assert_eq!(tree.size(), 0);
         assert_eq!(tree.children()[0].size(), 0);
@@ -645,7 +618,7 @@ mod tests {
     #[test]
     fn remove_node_returns_none_for_missing() {
         let mut tree = dir("root", vec![leaf("a.txt", 10)]);
-        assert_eq!(remove_node(&mut tree, std::path::Path::new("nope")), None);
+        assert_eq!(remove_node(&mut tree, Path::new("nope")), None);
         assert_eq!(tree.size(), 10); // unchanged
     }
 }

@@ -8,10 +8,10 @@
 //! Usage: bench_perf [PATH]
 //!   PATH defaults to ~/git if it exists, otherwise the project directory.
 
+use disk_cleaner::categories;
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::suggestions;
 use disk_cleaner::tree;
-use disk_cleaner::categories;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -21,7 +21,11 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join("git")).filter(|p| p.is_dir()))
+        .or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join("git"))
+                .filter(|p| p.is_dir())
+        })
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
 
     if !path.is_dir() {
@@ -164,7 +168,10 @@ fn bench_frame_time(scan_path: &Path) {
     let p99_idx = (n as f64 * 0.99) as usize;
     let p99 = frame_times[p99_idx.min(n - 1)];
     let avg: Duration = frame_times.iter().sum::<Duration>() / n as u32;
-    let over_16ms = frame_times.iter().filter(|d| **d > Duration::from_millis(16)).count();
+    let over_16ms = frame_times
+        .iter()
+        .filter(|d| **d > Duration::from_millis(16))
+        .count();
 
     eprintln!("  Files scanned: {file_count}");
     eprintln!("  Total size:    {}", bytesize::ByteSize::b(total_size));
@@ -177,7 +184,10 @@ fn bench_frame_time(scan_path: &Path) {
     eprintln!("    Avg:    {avg:?}");
     eprintln!("    P99:    {p99:?}");
     eprintln!("    Max:    {max:?}");
-    eprintln!("    >16ms:  {over_16ms}/{n} frames ({:.1}%)", over_16ms as f64 / n as f64 * 100.0);
+    eprintln!(
+        "    >16ms:  {over_16ms}/{n} frames ({:.1}%)",
+        over_16ms as f64 / n as f64 * 100.0
+    );
     eprintln!();
     eprintln!("  Post-scan processing (categories + suggestions + auto_expand): {post_scan_dur:?}");
     eprintln!("  Target: all frames < 16ms (60fps)");

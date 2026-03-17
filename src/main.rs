@@ -117,8 +117,10 @@ fn main() -> eframe::Result {
         "Disk Cleaner",
         options,
         Box::new(move |_cc| {
-            let mut app = App::default();
-            app.process_start = Some(process_start);
+            let mut app = App {
+                process_start: Some(process_start),
+                ..Default::default()
+            };
             if let Some(path) = initial_path {
                 app.start_scan(path);
             }
@@ -214,18 +216,14 @@ impl Default for App {
 
 impl App {
     fn cancel_scan(&mut self) {
-        self.scan_progress
-            .cancelled
-            .store(true, Ordering::Relaxed);
+        self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
     }
 
     fn start_scan(&mut self, path: PathBuf) {
         // Cancel any in-progress scan so its threads release the rayon pool
-        self.scan_progress
-            .cancelled
-            .store(true, Ordering::Relaxed);
+        self.scan_progress.cancelled.store(true, Ordering::Relaxed);
 
         save_config(&path, self.show_hidden);
         self.last_scan_path = Some(path.clone());
@@ -347,11 +345,20 @@ impl eframe::App for App {
                     if n > 0 {
                         let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
                         let p99 = ft[(n as f64 * 0.99) as usize];
-                        let over = ft.iter().filter(|d| **d > Duration::from_millis(16)).count();
-                        eprintln!("[perf] scan done in {scan_dur:?} ({} files)", self.last_scan_file_count);
+                        let over = ft
+                            .iter()
+                            .filter(|d| **d > Duration::from_millis(16))
+                            .count();
+                        eprintln!(
+                            "[perf] scan done in {scan_dur:?} ({} files)",
+                            self.last_scan_file_count
+                        );
                         eprintln!("[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
                             ft[0], ft[n / 2], ft[n - 1]);
-                        eprintln!("[perf] frames >16ms: {over}/{n} ({:.1}%)", over as f64 / n as f64 * 100.0);
+                        eprintln!(
+                            "[perf] frames >16ms: {over}/{n} ({:.1}%)",
+                            over as f64 / n as f64 * 100.0
+                        );
                     }
                     ft.clear();
                 }
@@ -405,9 +412,7 @@ impl eframe::App for App {
                                 if is_dir && expanded {
                                     ui::set_expanded(tree, focused, false);
                                     self.visible_paths_dirty = true;
-                                } else if let Some(parent) =
-                                    ui::find_parent_path(tree, focused)
-                                {
+                                } else if let Some(parent) = ui::find_parent_path(tree, focused) {
                                     self.focused_path = Some(parent);
                                     self.tree_scroll_to_focus = true;
                                 }
@@ -417,12 +422,9 @@ impl eframe::App for App {
                                     self.visible_paths_dirty = true;
                                 } else if is_dir && expanded {
                                     let visible = &self.cached_visible_paths;
-                                    if let Some(idx) =
-                                        visible.iter().position(|p| p == focused)
-                                    {
+                                    if let Some(idx) = visible.iter().position(|p| p == focused) {
                                         if idx + 1 < visible.len() {
-                                            self.focused_path =
-                                                Some(visible[idx + 1].clone());
+                                            self.focused_path = Some(visible[idx + 1].clone());
                                             self.tree_scroll_to_focus = true;
                                         }
                                     }
@@ -560,8 +562,11 @@ impl eframe::App for App {
                 // View mode toggle
                 if self.tree.is_some() {
                     ui.separator();
-                    for (label, mode) in [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap), ("Suggestions", ViewMode::Suggestions)]
-                    {
+                    for (label, mode) in [
+                        ("Tree", ViewMode::Tree),
+                        ("Treemap", ViewMode::Treemap),
+                        ("Suggestions", ViewMode::Suggestions),
+                    ] {
                         let is_active = self.view_mode == mode;
                         let text = if is_active {
                             egui::RichText::new(label).strong().size(14.0)
@@ -807,16 +812,13 @@ impl eframe::App for App {
                         );
                     }
                 }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .small()
-                                .weak(),
-                        );
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .weak(),
+                    );
+                });
             });
         });
 
@@ -838,11 +840,7 @@ impl eframe::App for App {
                         .unwrap_or_default();
                     ui.heading("Scanning");
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(&path_str)
-                            .weak()
-                            .size(13.0),
-                    );
+                    ui.label(egui::RichText::new(&path_str).weak().size(13.0));
                     ui.add_space(16.0);
 
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
@@ -1064,7 +1062,8 @@ impl eframe::App for App {
                         for action in tm_actions {
                             match action {
                                 TreemapAction::ZoomTo(path) => {
-                                    let is_root = std::path::Path::new(tree.name()) == path.as_path();
+                                    let is_root =
+                                        std::path::Path::new(tree.name()) == path.as_path();
                                     let new_zoom = if is_root { None } else { Some(path) };
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
@@ -1095,8 +1094,11 @@ impl eframe::App for App {
                                     }
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
-                                    let paths: Vec<PathBuf> =
-                                        report.groups[idx].items.iter().map(|i| i.path.clone()).collect();
+                                    let paths: Vec<PathBuf> = report.groups[idx]
+                                        .items
+                                        .iter()
+                                        .map(|i| i.path.clone())
+                                        .collect();
                                     for path in paths {
                                         if let Err(e) = trash::delete(&path) {
                                             self.error = Some(format!("Trash failed: {e}"));

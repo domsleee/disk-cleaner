@@ -127,9 +127,11 @@ fn bench_node_matches(c: &mut Criterion) {
     for (label, tree) in &cases {
         let n = count_nodes(tree);
         // Hit case: search for a name that exists everywhere
-        group.bench_with_input(BenchmarkId::new("hit", format!("{label}_{n}")), tree, |b, t| {
-            b.iter(|| ui::node_matches(t, "file_0"))
-        });
+        group.bench_with_input(
+            BenchmarkId::new("hit", format!("{label}_{n}")),
+            tree,
+            |b, t| b.iter(|| ui::node_matches(t, "file_0")),
+        );
         // Miss case: search for a name that exists nowhere
         group.bench_with_input(
             BenchmarkId::new("miss", format!("{label}_{n}")),
@@ -158,11 +160,7 @@ fn bench_count_selected(c: &mut Criterion) {
         // Collect all paths, then select ~10% of them
         let mut all_paths = Vec::new();
         collect_paths(&tree, &mut PathBuf::new(), &mut all_paths);
-        let selected: HashSet<PathBuf> = all_paths
-            .iter()
-            .step_by(10)
-            .cloned()
-            .collect();
+        let selected: HashSet<PathBuf> = all_paths.iter().step_by(10).cloned().collect();
 
         let sel_count = selected.len();
         group.bench_with_input(
@@ -195,7 +193,12 @@ fn bench_count_selected(c: &mut Criterion) {
 
 fn build_unsorted_children(n: usize) -> Vec<FileNode> {
     (0..n)
-        .map(|i| make_leaf(&format!("f_{i}.dat"), ((n - i) as u64) * 1024 + (i as u64 % 7)))
+        .map(|i| {
+            make_leaf(
+                &format!("f_{i}.dat"),
+                ((n - i) as u64) * 1024 + (i as u64 % 7),
+            )
+        })
         .collect()
 }
 
@@ -219,5 +222,10 @@ fn bench_sort_by_size(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_node_matches, bench_count_selected, bench_sort_by_size);
+criterion_group!(
+    benches,
+    bench_node_matches,
+    bench_count_selected,
+    bench_sort_by_size
+);
 criterion_main!(benches);

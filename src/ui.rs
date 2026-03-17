@@ -62,6 +62,7 @@ pub enum TreeAction {
     Click {
         path: PathBuf,
         shift: bool,
+        toggle: bool,
     },
     Focus(PathBuf),
     Trash(PathBuf),
@@ -173,10 +174,9 @@ pub fn render_tree(
     let row_height = 20.0_f32;
     let mut actions = Vec::new();
 
-    let focused_idx =
-        focused_path
-            .as_ref()
-            .and_then(|fp| rows.iter().position(|r| r.path == *fp));
+    let focused_idx = focused_path
+        .as_ref()
+        .and_then(|fp| rows.iter().position(|r| r.path == *fp));
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
@@ -187,9 +187,8 @@ pub fn render_tree(
         if let Some(idx) = focused_idx {
             let target_y = idx as f32 * row_total;
             let viewport_h = ui.available_height();
-            scroll_area = scroll_area.vertical_scroll_offset(
-                (target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0),
-            );
+            scroll_area = scroll_area
+                .vertical_scroll_offset((target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0));
         }
     }
 
@@ -228,7 +227,11 @@ pub fn render_tree(
 
                 // Icon
                 if let Some(icons) = icon_cache {
-                    let tex = if row.is_dir { &icons.folder } else { &icons.file };
+                    let tex = if row.is_dir {
+                        &icons.folder
+                    } else {
+                        &icons.file
+                    };
                     ui.image(egui::load::SizedTexture::new(
                         tex.id(),
                         egui::vec2(16.0, 16.0),
@@ -249,18 +252,18 @@ pub fn render_tree(
                 let text_margin = 8.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
-                let font_id = egui::FontId::monospace(
-                    ui.style().text_styles[&egui::TextStyle::Body].size,
-                );
-                let text_galley = painter.layout_no_wrap(
-                    size_text,
-                    font_id,
-                    ui.visuals().text_color(),
-                );
+                let font_id =
+                    egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
+                let text_galley =
+                    painter.layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
                 let text_x = row_max.right() - text_margin - text_width;
                 let text_y = row_max.center().y - text_galley.size().y / 2.0;
-                painter.galley(egui::pos2(text_x, text_y), text_galley, ui.visuals().text_color());
+                painter.galley(
+                    egui::pos2(text_x, text_y),
+                    text_galley,
+                    ui.visuals().text_color(),
+                );
 
                 let bar_gap = 4.0_f32;
                 let bar_x = text_x - bar_gap - bar_width;
@@ -271,8 +274,7 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect =
-                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
@@ -286,9 +288,9 @@ pub fn render_tree(
 
             // Single row interaction — toggle vs click determined by pointer position
             let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
-            let row_interact =
-                ui.interact(row_rect, row_id, egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let row_interact = ui
+                .interact(row_rect, row_id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -297,10 +299,12 @@ pub fn render_tree(
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
                     } else {
                         // Click on content area → select/focus
-                        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                        let (shift, toggle) =
+                            ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                         actions.push(TreeAction::Click {
                             path: row.path.clone(),
                             shift,
+                            toggle,
                         });
                         actions.push(TreeAction::Focus(row.path.clone()));
                     }
@@ -361,10 +365,8 @@ pub fn render_tree(
                 } else {
                     ui.visuals().selection.bg_fill.linear_multiply(0.4)
                 };
-                let highlight_rect = egui::Rect::from_x_y_ranges(
-                    full_width.x_range(),
-                    row_rect.y_range(),
-                );
+                let highlight_rect =
+                    egui::Rect::from_x_y_ranges(full_width.x_range(), row_rect.y_range());
                 ui.painter().set(
                     bg_idx,
                     egui::Shape::rect_filled(highlight_rect, 0.0, bg_color),
@@ -413,7 +415,11 @@ fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> O
     // Check direct children
     let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
         let child_path = buf.join(c.name());
-        if child_path == target { Some(i) } else { None }
+        if child_path == target {
+            Some(i)
+        } else {
+            None
+        }
     });
 
     if let Some(pos) = found_pos {
@@ -477,7 +483,14 @@ fn collect_visible_paths_inner(
     if show_children {
         for child in node.children() {
             current_path.push(child.name());
-            collect_visible_paths_inner(child, current_path, filter, category_filter, show_hidden, result);
+            collect_visible_paths_inner(
+                child,
+                current_path,
+                filter,
+                category_filter,
+                show_hidden,
+                result,
+            );
             current_path.pop();
         }
     }
@@ -513,7 +526,11 @@ pub fn find_node_info(node: &FileNode, target: &Path) -> Option<(bool, bool, boo
     find_node_info_inner(node, target, &mut buf)
 }
 
-fn find_node_info_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<(bool, bool, bool)> {
+fn find_node_info_inner(
+    node: &FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+) -> Option<(bool, bool, bool)> {
     if buf.as_path() == target {
         return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
     }
@@ -534,7 +551,12 @@ pub fn set_expanded(node: &mut FileNode, target: &Path, expanded: bool) -> bool 
     set_expanded_inner(node, target, expanded, &mut buf)
 }
 
-fn set_expanded_inner(node: &mut FileNode, target: &Path, expanded: bool, buf: &mut PathBuf) -> bool {
+fn set_expanded_inner(
+    node: &mut FileNode,
+    target: &Path,
+    expanded: bool,
+    buf: &mut PathBuf,
+) -> bool {
     if buf.as_path() == target {
         node.set_expanded(expanded);
         return true;

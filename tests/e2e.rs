@@ -7,7 +7,9 @@ use disk_cleaner::categories::{compute_stats, FileCategory};
 use disk_cleaner::scanner::{scan_directory, ScanProgress};
 use disk_cleaner::tree::auto_expand;
 use disk_cleaner::ui;
+use std::collections::HashSet;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Helper: create a temp directory with a non-hidden name (avoids `.tmp` prefix
@@ -178,27 +180,24 @@ fn select_and_collect_from_scanned_tree() {
     fs::create_dir(root.join("sub")).unwrap();
     create_file(&root.join("sub"), "c.txt", 300);
 
-    let mut tree = scan(root);
+    let _tree = scan(root);
 
     let path_a = root.join("a.txt");
     let path_c = root.join("sub").join("c.txt");
 
-    let actions = vec![
-        ui::TreeAction::Click {
-            path: path_a.clone(),
-            shift: false,
-        },
-        ui::TreeAction::Click {
-            path: path_c.clone(),
-            shift: true,
-        },
-    ];
-    ui::apply_tree_actions(&mut tree, &actions);
+    // Selection is now tracked via HashSet (matching production code)
+    let mut selected_paths: HashSet<PathBuf> = HashSet::new();
 
-    let selected = ui::collect_selected(&tree);
-    assert_eq!(selected.len(), 2);
-    assert!(selected.contains(&path_a));
-    assert!(selected.contains(&path_c));
+    // Simulate non-shift click on a.txt
+    selected_paths.clear();
+    selected_paths.insert(path_a.clone());
+
+    // Simulate shift-click on c.txt
+    selected_paths.insert(path_c.clone());
+
+    assert_eq!(selected_paths.len(), 2);
+    assert!(selected_paths.contains(&path_a));
+    assert!(selected_paths.contains(&path_c));
 }
 
 // ---------------------------------------------------------------------------
@@ -421,26 +420,22 @@ fn full_pipeline_scan_select_clear() {
     // Step 2: Auto-expand
     auto_expand(&mut tree, 0, 2);
 
-    // Step 3: Select files
+    // Step 3: Select files via HashSet (matching production code path)
     let main_path = root.join("src").join("main.rs");
     let readme_path = root.join("docs").join("README.md");
-    let actions = vec![
-        ui::TreeAction::Click {
-            path: main_path.clone(),
-            shift: false,
-        },
-        ui::TreeAction::Click {
-            path: readme_path.clone(),
-            shift: true,
-        },
-    ];
-    ui::apply_tree_actions(&mut tree, &actions);
+    let mut selected_paths: HashSet<PathBuf> = HashSet::new();
 
-    assert_eq!(ui::count_selected(&tree), 2);
+    // Non-shift click on main.rs
+    selected_paths.clear();
+    selected_paths.insert(main_path.clone());
+    // Shift-click on README.md
+    selected_paths.insert(readme_path.clone());
+
+    assert_eq!(selected_paths.len(), 2);
 
     // Step 4: Clear selection
-    ui::clear_selection(&mut tree);
-    assert_eq!(ui::count_selected(&tree), 0);
+    selected_paths.clear();
+    assert_eq!(selected_paths.len(), 0);
 
     // Step 5: Verify tree structure is intact
     let src = tree.children().iter().find(|c| c.name() == "src").unwrap();

@@ -7,6 +7,7 @@ mod treemap;
 mod ui;
 
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -148,6 +149,8 @@ struct App {
     /// Cached visible path list for keyboard navigation; rebuilt when dirty.
     cached_visible_paths: Vec<PathBuf>,
     visible_paths_dirty: bool,
+    /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
+    selected_paths: HashSet<PathBuf>,
 }
 
 impl Default for App {
@@ -185,6 +188,7 @@ impl Default for App {
             tree_scroll_to_focus: false,
             cached_visible_paths: Vec::new(),
             visible_paths_dirty: true,
+            selected_paths: HashSet::new(),
         }
     }
 }
@@ -246,11 +250,7 @@ impl App {
     }
 
     fn batch_trash_selected(&mut self) {
-        let paths = self
-            .tree
-            .as_ref()
-            .map(ui::collect_selected)
-            .unwrap_or_default();
+        let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
         for path in paths {
             if let Err(e) = trash::delete(&path) {
                 self.error = Some(format!("Trash failed: {e}"));
@@ -263,11 +263,7 @@ impl App {
     }
 
     fn batch_delete_selected(&mut self) {
-        let paths = self
-            .tree
-            .as_ref()
-            .map(ui::collect_selected)
-            .unwrap_or_default();
+        let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
         for path in paths {
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
@@ -346,9 +342,7 @@ impl eframe::App for App {
                         self.focused_path = Some(visible[0].clone());
                     }
                     // Clear selection so only the focused row is highlighted
-                    if let Some(ref mut tree) = self.tree {
-                        ui::clear_selection(tree);
-                    }
+                    self.selected_paths.clear();
                     self.tree_scroll_to_focus = true;
                 }
             }
@@ -423,7 +417,7 @@ impl eframe::App for App {
         let mut close_batch_dialog = false;
 
         if self.confirm_batch_delete {
-            let selected_count = self.tree.as_ref().map(ui::count_selected).unwrap_or(0);
+            let selected_count = self.selected_paths.len();
             egui::Window::new("Confirm Batch Delete")
                 .collapsible(false)
                 .resizable(false)
@@ -612,7 +606,7 @@ impl eframe::App for App {
                 }
 
                 // Batch operation buttons (only shown when items are selected)
-                let selected_count = self.tree.as_ref().map(ui::count_selected).unwrap_or(0);
+                let selected_count = self.selected_paths.len();
                 if selected_count > 0 {
                     ui.separator();
                     if ui
@@ -952,6 +946,7 @@ impl eframe::App for App {
                             self.show_hidden,
                             self.icon_cache.as_ref(),
                             self.tree_scroll_to_focus,
+                            &self.selected_paths,
                         )
                     } else {
                         Vec::new()
@@ -960,6 +955,18 @@ impl eframe::App for App {
                     // Handle actions from tree rendering
                     for action in &actions {
                         match action {
+                            ui::TreeAction::Click { path, shift } => {
+                                if *shift {
+                                    // Toggle: add or remove from selection
+                                    if !self.selected_paths.remove(path) {
+                                        self.selected_paths.insert(path.clone());
+                                    }
+                                } else {
+                                    // Replace selection — O(1) via HashSet
+                                    self.selected_paths.clear();
+                                    self.selected_paths.insert(path.clone());
+                                }
+                            }
                             ui::TreeAction::Focus(path) => {
                                 self.focused_path = Some(path.clone());
                             }
@@ -986,13 +993,14 @@ impl eframe::App for App {
                             _ => {}
                         }
                     }
-                    // Apply selection/expand changes
+                    // Apply expand/collapse changes to tree
                     if let Some(ref mut tree) = self.tree {
-                        // Mark visible paths dirty if any expand/collapse actions occurred
-                        if actions.iter().any(|a| matches!(a, ui::TreeAction::ToggleExpand(_))) {
-                            self.visible_paths_dirty = true;
+                        for action in &actions {
+                            if let ui::TreeAction::ToggleExpand(path) = action {
+                                ui::toggle_expand(tree, path);
+                                self.visible_paths_dirty = true;
+                            }
                         }
-                        ui::apply_tree_actions(tree, &actions);
                     }
                 }
                 ViewMode::Treemap => {

@@ -320,7 +320,9 @@ pub fn render_tree(
 
             // Single row interaction — toggle vs click determined by pointer position
             let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
-            let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
+            let row_interact =
+                ui.interact(row_rect, row_id, egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {

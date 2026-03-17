@@ -313,7 +313,10 @@ pub fn render_tree(
             });
 
             let toggle_right = row_response.inner;
-            let row_rect = row_response.response.rect;
+            let row_rect = egui::Rect::from_x_y_ranges(
+                full_width.x_range(),
+                row_response.response.rect.y_range(),
+            );
 
             // Single row interaction — toggle vs click determined by pointer position
             let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));

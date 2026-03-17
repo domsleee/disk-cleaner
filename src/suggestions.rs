@@ -70,30 +70,20 @@ impl SuggestionCategory {
 
     pub fn icon(self) -> &'static str {
         match self {
-            Self::BuildArtifacts => "\u{1F3D7}",  // construction
-            Self::PackageCaches => "\u{1F4E6}",   // package
-            Self::SystemCaches => "\u{1F5C4}",    // file cabinet
-            Self::IdeArtifacts => "\u{1F4BB}",    // laptop
-            Self::TempFiles => "\u{1F5D1}",       // wastebasket
-            Self::OldInstallers => "\u{1F4BF}",   // disc
+            Self::BuildArtifacts => "\u{1F3D7}", // construction
+            Self::PackageCaches => "\u{1F4E6}",  // package
+            Self::SystemCaches => "\u{1F5C4}",   // file cabinet
+            Self::IdeArtifacts => "\u{1F4BB}",   // laptop
+            Self::TempFiles => "\u{1F5D1}",      // wastebasket
+            Self::OldInstallers => "\u{1F4BF}",  // disc
         }
     }
-
-    pub const ALL: [SuggestionCategory; 6] = [
-        Self::BuildArtifacts,
-        Self::PackageCaches,
-        Self::SystemCaches,
-        Self::IdeArtifacts,
-        Self::TempFiles,
-        Self::OldInstallers,
-    ];
 }
 
 /// A single detected item (directory or file) that can be cleaned.
 pub struct SuggestionItem {
     pub path: PathBuf,
     pub size: u64,
-    pub name: String,
 }
 
 /// A group of suggestions under one category.
@@ -156,9 +146,7 @@ fn matches_dir_pattern(name: &str, patterns: &[&str]) -> bool {
 
 fn has_extension(name: &str, extensions: &[&str]) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("");
-    extensions
-        .iter()
-        .any(|e| ext.eq_ignore_ascii_case(e))
+    extensions.iter().any(|e| ext.eq_ignore_ascii_case(e))
 }
 
 fn is_dsym(name: &str) -> bool {
@@ -237,7 +225,6 @@ fn walk_for_suggestions(
             build_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
             return;
         }
@@ -245,7 +232,6 @@ fn walk_for_suggestions(
             package_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
             return;
         }
@@ -253,7 +239,6 @@ fn walk_for_suggestions(
             cache_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
             return;
         }
@@ -261,7 +246,6 @@ fn walk_for_suggestions(
             ide_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
             return;
         }
@@ -269,7 +253,6 @@ fn walk_for_suggestions(
             ide_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
             return;
         }
@@ -295,13 +278,11 @@ fn walk_for_suggestions(
             temp_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
         } else if has_extension(name, INSTALLER_EXTENSIONS) && node.size() > 0 {
             installer_items.push(SuggestionItem {
                 path: current_path.clone(),
                 size: node.size(),
-                name: name.to_string(),
             });
         }
     }
@@ -323,7 +304,10 @@ mod tests {
         );
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].category, SuggestionCategory::BuildArtifacts);
+        assert_eq!(
+            report.groups[0].category,
+            SuggestionCategory::BuildArtifacts
+        );
         assert_eq!(report.groups[0].total_size, 1000);
         assert_eq!(report.total_reclaimable, 1000);
     }
@@ -347,7 +331,11 @@ mod tests {
     fn detect_temp_files() {
         let tree = dir(
             "/test",
-            vec![leaf("debug.log", 200), leaf("data.tmp", 100), leaf("main.rs", 50)],
+            vec![
+                leaf("debug.log", 200),
+                leaf("data.tmp", 100),
+                leaf("main.rs", 50),
+            ],
         );
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);

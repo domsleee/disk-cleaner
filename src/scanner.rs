@@ -127,9 +127,19 @@ fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
                 }
             }
             // Also skip other volume mounts that inflate size
-            for sub in &["Preboot", "Recovery", "VM", "Update", "BaseSystem",
-                         "FieldService", "FieldServiceDiagnostic", "FieldServiceRepair",
-                         "iSCPreboot", "xarts", "Hardware"] {
+            for sub in &[
+                "Preboot",
+                "Recovery",
+                "VM",
+                "Update",
+                "BaseSystem",
+                "FieldService",
+                "FieldServiceDiagnostic",
+                "FieldServiceRepair",
+                "iSCPreboot",
+                "xarts",
+                "Hardware",
+            ] {
                 let p = Path::new("/System/Volumes").join(sub);
                 if p.exists() && !root.starts_with(&p) {
                     skip.insert(p);
@@ -202,7 +212,11 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = entry.file_name().to_string_lossy().into_owned().into_boxed_str();
+                let name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_boxed_str();
                 Some(FileNode::File(FileLeaf { name, size: len }))
             } else {
                 None
@@ -210,7 +224,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         })
         .collect();
 
-    children.sort_by(|a, b| b.size().cmp(&a.size()));
+    children.sort_by_key(|b| std::cmp::Reverse(b.size()));
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(DirNode {

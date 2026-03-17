@@ -160,6 +160,8 @@ struct App {
     visible_paths_dirty: bool,
     /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
     selected_paths: HashSet<PathBuf>,
+    /// Anchor path for shift+click range selection.
+    selection_anchor: Option<PathBuf>,
     /// Smart cleanup suggestions computed after scan.
     suggestion_report: Option<suggestions::SuggestionReport>,
     /// Process start time for measuring startup latency.
@@ -206,6 +208,7 @@ impl Default for App {
             cached_visible_paths: Vec::new(),
             visible_paths_dirty: true,
             selected_paths: HashSet::new(),
+            selection_anchor: None,
             suggestion_report: None,
             process_start: None,
             scan_frame_times: Vec::new(),
@@ -1000,16 +1003,41 @@ impl eframe::App for App {
                     // Handle actions from tree rendering
                     for action in &actions {
                         match action {
-                            ui::TreeAction::Click { path, shift } => {
+                            ui::TreeAction::Click {
+                                path,
+                                shift,
+                                toggle,
+                            } => {
                                 if *shift {
-                                    // Toggle: add or remove from selection
+                                    // Range select: select all visible rows between anchor and clicked row
+                                    if let Some(ref anchor) = self.selection_anchor {
+                                        let visible = &self.cached_visible_paths;
+                                        let anchor_idx = visible.iter().position(|p| p == anchor);
+                                        let click_idx = visible.iter().position(|p| p == path);
+                                        if let (Some(a), Some(b)) = (anchor_idx, click_idx) {
+                                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                            self.selected_paths.clear();
+                                            for p in &visible[lo..=hi] {
+                                                self.selected_paths.insert(p.clone());
+                                            }
+                                        }
+                                    } else {
+                                        // No anchor yet — treat as plain click
+                                        self.selected_paths.clear();
+                                        self.selected_paths.insert(path.clone());
+                                        self.selection_anchor = Some(path.clone());
+                                    }
+                                } else if *toggle {
+                                    // Cmd/Ctrl+click: toggle individual item
                                     if !self.selected_paths.remove(path) {
                                         self.selected_paths.insert(path.clone());
                                     }
+                                    self.selection_anchor = Some(path.clone());
                                 } else {
-                                    // Replace selection — O(1) via HashSet
+                                    // Plain click: replace selection and set anchor
                                     self.selected_paths.clear();
                                     self.selected_paths.insert(path.clone());
+                                    self.selection_anchor = Some(path.clone());
                                 }
                             }
                             ui::TreeAction::Focus(path) => {

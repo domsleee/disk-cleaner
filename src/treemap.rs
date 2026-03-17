@@ -200,43 +200,58 @@ fn squarify_impl(
 
 /// Find a node by path in the file tree.
 pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    if node.path() == target {
+    let mut buf = PathBuf::from(node.name());
+    find_node_inner(node, target, &mut buf)
+}
+
+fn find_node_inner<'a>(node: &'a FileNode, target: &Path, buf: &mut PathBuf) -> Option<&'a FileNode> {
+    if buf.as_path() == target {
         return Some(node);
     }
     for child in node.children() {
-        if let Some(found) = find_node(child, target) {
+        buf.push(child.name());
+        if let Some(found) = find_node_inner(child, target, buf) {
+            buf.pop();
             return Some(found);
         }
+        buf.pop();
     }
     None
 }
 
 /// Build breadcrumb trail from root to `target`.
 pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
-    let mut trail = vec![(root.name().to_string(), root.path().to_path_buf())];
-    if root.path() == target {
+    let root_path = PathBuf::from(root.name());
+    let mut trail = vec![(root.name().to_string(), root_path.clone())];
+    if root_path.as_path() == target {
         return trail;
     }
-    if breadcrumbs_walk(root, target, &mut trail) {
+    let mut buf = root_path;
+    if breadcrumbs_walk(root, target, &mut buf, &mut trail) {
         trail
     } else {
-        vec![(root.name().to_string(), root.path().to_path_buf())]
+        vec![(root.name().to_string(), PathBuf::from(root.name()))]
     }
 }
 
-fn breadcrumbs_walk(node: &FileNode, target: &Path, trail: &mut Vec<(String, PathBuf)>) -> bool {
+fn breadcrumbs_walk(node: &FileNode, target: &Path, buf: &mut PathBuf, trail: &mut Vec<(String, PathBuf)>) -> bool {
     for child in node.children() {
-        if child.path() == target {
-            trail.push((child.name().to_string(), child.path().to_path_buf()));
+        buf.push(child.name());
+        let child_path = buf.clone();
+        if child_path.as_path() == target {
+            trail.push((child.name().to_string(), child_path));
+            buf.pop();
             return true;
         }
         if child.is_dir() {
-            trail.push((child.name().to_string(), child.path().to_path_buf()));
-            if breadcrumbs_walk(child, target, trail) {
+            trail.push((child.name().to_string(), child_path));
+            if breadcrumbs_walk(child, target, buf, trail) {
+                buf.pop();
                 return true;
             }
             trail.pop();
         }
+        buf.pop();
     }
     false
 }
@@ -265,18 +280,23 @@ pub fn render_treemap(
     show_hidden: bool,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
+    let root_path = PathBuf::from(root.name());
 
-    // Resolve the node we're viewing
-    let view_node = zoom_path
-        .as_ref()
-        .and_then(|p| find_node(root, p))
-        .unwrap_or(root);
+    // Resolve the node we're viewing and its full path
+    let (view_node, view_path) = if let Some(ref zp) = zoom_path {
+        match find_node(root, zp) {
+            Some(n) => (n, zp.clone()),
+            None => (root, root_path.clone()),
+        }
+    } else {
+        (root, root_path.clone())
+    };
 
     // ── Breadcrumb bar ──
     let crumbs = zoom_path
         .as_ref()
         .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root.path().to_path_buf())]);
+        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
 
     ui.horizontal(|ui| {
         for (i, (name, path)) in crumbs.iter().enumerate() {
@@ -342,6 +362,9 @@ pub fn render_treemap(
         return actions;
     }
 
+    // Pre-compute child paths
+    let child_paths: Vec<PathBuf> = children.iter().map(|c| view_path.join(c.name())).collect();
+
     let sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
     let rects = squarify(
         &sizes,
@@ -360,10 +383,10 @@ pub fn render_treemap(
             continue;
         }
 
-        let is_focused = focused_path.as_ref().is_some_and(|fp| fp.as_path() == child.path());
+        let is_focused = focused_path.as_ref().is_some_and(|fp| *fp == child_paths[i]);
 
         if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
-            paint_directory(&painter, child, r, is_focused, focused_path, alpha);
+            paint_directory(&painter, child, r, is_focused, focused_path, alpha, &child_paths[i]);
         } else {
             paint_leaf(&painter, child, r, is_focused, alpha);
         }
@@ -378,6 +401,7 @@ pub fn render_treemap(
     // Hover tooltip
     if let Some(idx) = hovered_idx {
         let child = children[idx];
+        let child_path = &child_paths[idx];
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -391,7 +415,7 @@ pub fn render_treemap(
             if child.is_dir() {
                 ui.label(format!("{} items", child.children().len()));
             }
-            ui.label(child.path().display().to_string());
+            ui.label(child_path.display().to_string());
         });
     }
 
@@ -402,9 +426,9 @@ pub fn render_treemap(
                 let r = rects[i].shrink(GAP);
                 if r.contains(pos) {
                     if child.is_dir() {
-                        actions.push(TreemapAction::ZoomTo(child.path().to_path_buf()));
+                        actions.push(TreemapAction::ZoomTo(child_paths[i].clone()));
                     }
-                    actions.push(TreemapAction::Focus(child.path().to_path_buf()));
+                    actions.push(TreemapAction::Focus(child_paths[i].clone()));
                     break;
                 }
             }
@@ -465,6 +489,7 @@ fn paint_directory(
     is_focused: bool,
     focused_path: &Option<PathBuf>,
     alpha: f32,
+    node_path: &Path,
 ) {
     let bg = apply_alpha(extension_color(node.name(), true), alpha);
     let header_bg = apply_alpha(darken(extension_color(node.name(), true), 15), alpha);
@@ -529,7 +554,8 @@ fn paint_directory(
             let color = apply_alpha(extension_color(child.name(), child.is_dir()), alpha);
             painter.rect_filled(cr, 1.0, color);
 
-            let child_focused = focused_path.as_ref().is_some_and(|fp| fp.as_path() == child.path());
+            let child_path = node_path.join(child.name());
+            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == child_path);
             if child_focused {
                 painter.rect_stroke(
                     cr,
@@ -641,7 +667,7 @@ mod tests {
     #[test]
     fn find_node_child() {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
-        assert!(find_node(&tree, Path::new("a.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/a.txt")).is_some());
     }
 
     #[test]
@@ -653,7 +679,7 @@ mod tests {
     #[test]
     fn find_node_nested() {
         let tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 5)])]);
-        assert!(find_node(&tree, Path::new("deep.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/sub/deep.txt")).is_some());
     }
 
     #[test]
@@ -667,7 +693,7 @@ mod tests {
     #[test]
     fn breadcrumbs_nested() {
         let tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 10)])]);
-        let bc = breadcrumbs(&tree, Path::new("sub"));
+        let bc = breadcrumbs(&tree, Path::new("root/sub"));
         assert_eq!(bc.len(), 2);
         assert_eq!(bc[0].0, "root");
         assert_eq!(bc[1].0, "sub");
@@ -679,7 +705,7 @@ mod tests {
             "root",
             vec![dir("a", vec![dir("b", vec![leaf("c.txt", 1)])])],
         );
-        let bc = breadcrumbs(&tree, Path::new("b"));
+        let bc = breadcrumbs(&tree, Path::new("root/a/b"));
         assert_eq!(bc.len(), 3);
         assert_eq!(bc[2].0, "b");
     }

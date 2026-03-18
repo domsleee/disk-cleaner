@@ -233,6 +233,8 @@ impl App {
         self.scanning = true;
         self.error = None;
         self.tree = None;
+        self.selected_paths.clear();
+        self.selection_anchor = None;
         self.scan_path = Some(path.clone());
         self.scan_disk_info = scanner::disk_space(&path);
 

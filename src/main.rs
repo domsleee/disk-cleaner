@@ -1095,6 +1095,12 @@ impl eframe::App for App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
                     ui.heading("Disk Cleaner");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Select a volume to scan and reclaim disk space")
+                            .weak()
+                            .size(13.0),
+                    );
                     ui.add_space(20.0);
 
                     // Volume list
@@ -1111,17 +1117,21 @@ impl eframe::App for App {
                                 0.0
                             };
 
-                            egui::Frame::group(ui.style())
+                            let card_response = egui::Frame::group(ui.style())
                                 .inner_margin(12.0)
                                 .show(ui, |ui| {
                                     ui.set_width(400.0);
                                     ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("\u{1F4BD}")
+                                                .size(16.0),
+                                        );
                                         ui.strong(&vol.name);
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(format!(
-                                                    "Disk: {} used of {}",
+                                                    "{} used of {}",
                                                     bytesize::ByteSize::b(used),
                                                     bytesize::ByteSize::b(vol.total_bytes),
                                                 ));
@@ -1156,22 +1166,23 @@ impl eframe::App for App {
                                     };
                                     painter.rect_filled(fill_rect, 3.0, fill_color);
 
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!(
-                                            "{:.0}% used — {} free",
-                                            fraction * 100.0,
-                                            bytesize::ByteSize::b(vol.available_bytes)
-                                        ));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.button("Scan").clicked() {
-                                                    scan_path = Some(vol.path.clone());
-                                                }
-                                            },
-                                        );
-                                    });
+                                    ui.label(format!(
+                                        "{:.0}% used \u{2014} {} free",
+                                        fraction * 100.0,
+                                        bytesize::ByteSize::b(vol.available_bytes)
+                                    ));
                                 });
+
+                            // Make entire card clickable
+                            let card_rect = card_response.response.rect;
+                            let card_id = egui::Id::new(("vol_card", &vol.path));
+                            let card_interact = ui
+                                .interact(card_rect, card_id, egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if card_interact.clicked() {
+                                scan_path = Some(vol.path.clone());
+                            }
+
                             ui.add_space(4.0);
                         }
 
@@ -1180,21 +1191,11 @@ impl eframe::App for App {
                         }
 
                         ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                    }
-
-                    // Folder pick alternative
-                    if ui.button("Open Directory...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
-                        }
                     }
 
                     // Resume last scan
                     if let Some(ref last) = self.last_scan_path.clone() {
-                        ui.add_space(8.0);
-                        let label = format!("Resume last scan: {}", last.display());
+                        let label = format!("Resume: {}", last.display());
                         if ui.button(label).clicked() {
                             self.start_scan(last.clone());
                         }

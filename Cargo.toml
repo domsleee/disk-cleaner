@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "disk-cleaner"
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
 bytesize = "2"
 trash = "5"
 rfd = "0.17"

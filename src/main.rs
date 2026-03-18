@@ -929,10 +929,40 @@ impl eframe::App for App {
                 });
         }
 
-        // Bottom status bar with scan info + disk stats + version
+        // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if let Some(ref path) = self.scan_path {
+                // Left: scan info or focused path + selection count
+                if self.tree.is_some() && !self.scanning {
+                    let selected_count = self.selected_paths.len();
+                    if let Some(ref focused) = self.focused_path {
+                        let display = focused
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| focused.display().to_string());
+                        let mut status = display;
+                        if selected_count > 1 {
+                            status = format!("{status} ({selected_count} selected)");
+                        } else if selected_count == 1 {
+                            status = format!("{status} (1 selected)");
+                        }
+                        ui.label(egui::RichText::new(status).small());
+                    } else if selected_count > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("{selected_count} selected")).small(),
+                        );
+                    } else if let Some(ref path) = self.scan_path {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} files \u{2014} {}",
+                                self.last_scan_file_count,
+                                bytesize::ByteSize::b(self.last_scan_total_size)
+                            ))
+                            .small(),
+                        );
+                        let _ = path; // used for context above
+                    }
+                } else if let Some(ref path) = self.scan_path {
                     if !self.scanning && self.last_scan_file_count > 0 {
                         ui.label(
                             egui::RichText::new(format!(
@@ -945,6 +975,8 @@ impl eframe::App for App {
                         );
                     }
                 }
+
+                // Right: keyboard hints + disk stats + version
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
@@ -967,6 +999,16 @@ impl eframe::App for App {
                             );
                             ui.separator();
                         }
+
+                        // Keyboard hints
+                        ui.label(
+                            egui::RichText::new(
+                                "\u{2190}\u{2191}\u{2193}\u{2192} navigate  Space expand  \u{232b} trash",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.separator();
                     }
                 });
             });

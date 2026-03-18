@@ -70,7 +70,8 @@ fn print_help() {
     eprintln!("  [PATH]  Directory to scan on launch");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  -h, --help  Print this help message");
+    eprintln!("  --screenshot <prefix>  Take screenshots and save as <prefix>_home.png, etc.");
+    eprintln!("  -h, --help             Print this help message");
 }
 
 fn main() -> eframe::Result {
@@ -78,12 +79,22 @@ fn main() -> eframe::Result {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_path: Option<PathBuf> = None;
+    let mut screenshot_prefix: Option<String> = None;
 
-    for arg in &args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
+            }
+            "--screenshot" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --screenshot requires a prefix argument");
+                    std::process::exit(1);
+                }
+                screenshot_prefix = Some(args[i].clone());
             }
             other => {
                 if other.starts_with('-') {
@@ -104,6 +115,7 @@ fn main() -> eframe::Result {
                 initial_path = Some(p);
             }
         }
+        i += 1;
     }
 
     let options = eframe::NativeOptions {
@@ -119,6 +131,12 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             let mut app = App {
                 process_start: Some(process_start),
+                screenshot_prefix: screenshot_prefix.clone(),
+                screenshot_state: if screenshot_prefix.is_some() {
+                    ScreenshotState::WaitingForView
+                } else {
+                    ScreenshotState::Idle
+                },
                 ..Default::default()
             };
             if let Some(path) = initial_path {
@@ -127,6 +145,20 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ScreenshotState {
+    Idle,
+    WaitingForView,
+    /// Wait N frames for rendering to stabilize before capturing.
+    WaitFrames(u8),
+    Capturing,
+    /// Wait for Event::Screenshot to arrive before proceeding.
+    WaitingForEvent,
+    /// Switch to next view, then capture again.
+    NextView(ViewMode),
+    Done,
 }
 
 struct App {
@@ -170,6 +202,12 @@ struct App {
     scan_frame_times: Vec<Duration>,
     /// Start of the current scan for total duration tracking.
     scan_start_time: Option<Instant>,
+    /// Screenshot mode: file prefix for output PNGs.
+    screenshot_prefix: Option<String>,
+    /// Screenshot state machine.
+    screenshot_state: ScreenshotState,
+    /// Number of screenshots saved (for tracking completion).
+    screenshots_saved: u8,
 }
 
 impl Default for App {
@@ -213,6 +251,9 @@ impl Default for App {
             process_start: None,
             scan_frame_times: Vec::new(),
             scan_start_time: None,
+            screenshot_prefix: None,
+            screenshot_state: ScreenshotState::Idle,
+            screenshots_saved: 0,
         }
     }
 }
@@ -311,6 +352,28 @@ impl App {
     }
 }
 
+fn save_screenshot_png(
+    color_image: &egui::ColorImage,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut rgba = Vec::with_capacity(color_image.pixels.len() * 4);
+    for pixel in &color_image.pixels {
+        rgba.push(pixel.r());
+        rgba.push(pixel.g());
+        rgba.push(pixel.b());
+        rgba.push(pixel.a());
+    }
+    image::save_buffer(
+        path,
+        &rgba,
+        color_image.width() as u32,
+        color_image.height() as u32,
+        image::ColorType::Rgba8,
+    )?;
+    eprintln!("[screenshot] saved: {path}");
+    Ok(())
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
@@ -367,6 +430,103 @@ impl eframe::App for App {
                     }
                     ft.clear();
                 }
+            }
+        }
+
+        // ── Screenshot state machine ──
+        if self.screenshot_prefix.is_some() {
+            // Handle incoming screenshot events
+            let got_screenshot = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Screenshot { .. }))
+            });
+
+            if got_screenshot {
+                ctx.input(|i| {
+                    for event in &i.events {
+                        if let egui::Event::Screenshot { image, .. } = event {
+                            let prefix = self.screenshot_prefix.as_ref().unwrap();
+                            let suffix = match self.view_mode {
+                                ViewMode::Tree => "tree",
+                                ViewMode::Treemap => "treemap",
+                                ViewMode::Suggestions => "suggestions",
+                            };
+                            let label = if self.tree.is_none() && !self.scanning {
+                                "home"
+                            } else {
+                                suffix
+                            };
+                            let path = format!("{prefix}_{label}.png");
+                            if let Err(e) = save_screenshot_png(image, &path) {
+                                eprintln!("[screenshot] error: {e}");
+                            }
+                            self.screenshots_saved += 1;
+                        }
+                    }
+                });
+            }
+
+            match self.screenshot_state {
+                ScreenshotState::WaitingForView => {
+                    if self.tree.is_none() && !self.scanning {
+                        self.screenshot_state = ScreenshotState::WaitFrames(5);
+                    } else if self.tree.is_some() && !self.scanning {
+                        self.screenshot_state = ScreenshotState::WaitFrames(5);
+                    }
+                }
+                ScreenshotState::WaitFrames(0) => {
+                    self.screenshot_state = ScreenshotState::Capturing;
+                    ctx.request_repaint();
+                }
+                ScreenshotState::WaitFrames(n) => {
+                    self.screenshot_state = ScreenshotState::WaitFrames(n - 1);
+                    ctx.request_repaint();
+                }
+                ScreenshotState::Capturing => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.screenshot_state = ScreenshotState::WaitingForEvent;
+                    ctx.request_repaint();
+                }
+                ScreenshotState::WaitingForEvent => {
+                    if got_screenshot {
+                        // Screenshot saved — determine what to do next
+                        if self.tree.is_none() {
+                            self.screenshot_state = ScreenshotState::Done;
+                        } else {
+                            match self.view_mode {
+                                ViewMode::Tree => {
+                                    self.screenshot_state =
+                                        ScreenshotState::NextView(ViewMode::Treemap);
+                                }
+                                ViewMode::Treemap => {
+                                    self.screenshot_state =
+                                        ScreenshotState::NextView(ViewMode::Suggestions);
+                                }
+                                ViewMode::Suggestions => {
+                                    self.screenshot_state = ScreenshotState::Done;
+                                }
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                ScreenshotState::NextView(next) => {
+                    self.view_mode = next;
+                    self.screenshot_state = ScreenshotState::WaitFrames(5);
+                    ctx.request_repaint();
+                }
+                ScreenshotState::Done => {
+                    eprintln!(
+                        "[screenshot] done — {} screenshots saved",
+                        self.screenshots_saved
+                    );
+                    self.screenshot_state = ScreenshotState::Idle;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                ScreenshotState::Idle => {}
             }
         }
 

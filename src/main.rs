@@ -179,6 +179,7 @@ struct App {
     volumes: Vec<scanner::VolumeInfo>,
     volumes_last_refresh: Option<std::time::Instant>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
+    scan_is_volume: bool,               // true when scanning a volume root
     category_filter: Option<categories::FileCategory>,
     category_stats: Option<categories::CategoryStats>,
     show_hidden: bool,
@@ -235,6 +236,7 @@ impl Default for App {
             volumes: scanner::list_volumes(),
             volumes_last_refresh: Some(std::time::Instant::now()),
             scan_disk_info: None,
+            scan_is_volume: false,
             category_filter: None,
             category_stats: None,
             show_hidden,
@@ -278,6 +280,7 @@ impl App {
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
         self.scan_disk_info = scanner::disk_space(&path);
+        self.scan_is_volume = self.volumes.iter().any(|v| v.path == path);
 
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
@@ -709,7 +712,9 @@ impl eframe::App for App {
             }
         }
 
-        // Top panel with toolbar
+        // Top panel with toolbar (hidden on home page where it only has "Open Directory")
+        let show_toolbar = self.tree.is_some() || self.scanning;
+        if show_toolbar {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open Directory...").clicked() {
@@ -781,7 +786,7 @@ impl eframe::App for App {
                         self.search_query = self.search_query.to_lowercase();
                         self.visible_paths_dirty = true;
                     }
-                    if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
+                    if !self.search_query.is_empty() && ui.small_button("×").clicked() {
                         self.search_query.clear();
                         self.visible_paths_dirty = true;
                     }
@@ -832,6 +837,7 @@ impl eframe::App for App {
                 }
             });
         });
+        } // show_toolbar
 
         // Category side panel (toggled via toolbar button)
         if self.tree.is_some() && !self.scanning && self.show_categories {
@@ -1040,16 +1046,18 @@ impl eframe::App for App {
                     let size_str = bytesize::ByteSize::b(size).to_string();
                     ui.label(format!("{files} files — {size_str}"));
 
-                    // Progress bar based on disk total size
-                    if let Some((total, _available)) = self.scan_disk_info {
-                        if total > 0 {
-                            ui.add_space(12.0);
-                            let fraction = (size as f32 / total as f32).clamp(0.0, 1.0);
-                            let total_str = bytesize::ByteSize::b(total).to_string();
-                            let bar = egui::ProgressBar::new(fraction)
-                                .text(format!("{size_str} / {total_str}"))
-                                .desired_width(300.0);
-                            ui.add(bar);
+                    // Progress bar: show fraction of disk only when scanning a volume root
+                    if self.scan_is_volume {
+                        if let Some((total, _available)) = self.scan_disk_info {
+                            if total > 0 {
+                                ui.add_space(12.0);
+                                let fraction = (size as f32 / total as f32).clamp(0.0, 1.0);
+                                let total_str = bytesize::ByteSize::b(total).to_string();
+                                let bar = egui::ProgressBar::new(fraction)
+                                    .text(format!("{size_str} / {total_str}"))
+                                    .desired_width(300.0);
+                                ui.add(bar);
+                            }
                         }
                     }
 
@@ -1199,6 +1207,19 @@ impl eframe::App for App {
                         if ui.button(label).clicked() {
                             self.start_scan(last.clone());
                         }
+                        ui.add_space(8.0);
+                    }
+
+                    // Open Directory — primary action on home page
+                    if ui.button("Open Directory...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.start_scan(path);
+                        }
+                    }
+
+                    if let Some(ref err) = self.error {
+                        ui.add_space(12.0);
+                        ui.colored_label(egui::Color32::RED, err);
                     }
                 });
                 return;
@@ -1414,7 +1435,7 @@ impl eframe::App for App {
                                     self.confirm_batch_delete = true;
                                 }
                                 ui.add_space(4.0);
-                                if ui.small_button("\u{2715}").on_hover_text("Clear selection").clicked() {
+                                if ui.small_button("×").on_hover_text("Clear selection").clicked() {
                                     self.selected_paths.clear();
                                 }
                             });

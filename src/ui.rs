@@ -66,7 +66,9 @@ pub enum TreeAction {
     },
     Focus(PathBuf),
     Trash(PathBuf),
+    TrashSelected,
     ConfirmDelete(PathBuf),
+    ConfirmDeleteSelected,
     RevealInFinder(PathBuf),
     CopyPath(PathBuf),
 }
@@ -314,37 +316,76 @@ pub fn render_tree(
             }
 
             // Right-click: select the row before showing context menu
+            // (preserve existing multi-selection if right-clicked row is already selected)
             if row_interact.secondary_clicked() {
-                actions.push(TreeAction::Click {
-                    path: row.path.clone(),
-                    shift: false,
-                    toggle: false,
-                });
+                let already_selected = selected_paths.contains(&row.path);
+                if !already_selected {
+                    actions.push(TreeAction::Click {
+                        path: row.path.clone(),
+                        shift: false,
+                        toggle: false,
+                    });
+                }
                 actions.push(TreeAction::Focus(row.path.clone()));
             }
 
             // Right-click context menu
             let ctx_path = row.path.clone();
+            let selection_count = if selected_paths.contains(&row.path) {
+                selected_paths.len()
+            } else {
+                1
+            };
             row_interact.context_menu(|ui| {
-                if ui.button("Open in Finder").clicked() {
-                    actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
-                    ui.close();
-                }
-                if ui.button("Copy Path").clicked() {
-                    actions.push(TreeAction::CopyPath(ctx_path.clone()));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Move to Trash").clicked() {
-                    actions.push(TreeAction::Trash(ctx_path.clone()));
-                    ui.close();
-                }
-                if ui
-                    .button(egui::RichText::new("Delete Permanently").color(egui::Color32::RED))
-                    .clicked()
-                {
-                    actions.push(TreeAction::ConfirmDelete(ctx_path.clone()));
-                    ui.close();
+                if selection_count > 1 {
+                    // Multi-select context menu
+                    ui.label(
+                        egui::RichText::new(format!("{selection_count} items selected"))
+                            .weak()
+                            .size(12.0),
+                    );
+                    ui.separator();
+                    if ui
+                        .button(format!("Move {selection_count} Items to Trash"))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::TrashSelected);
+                        ui.close();
+                    }
+                    if ui
+                        .button(
+                            egui::RichText::new(format!(
+                                "Delete {selection_count} Items Permanently"
+                            ))
+                            .color(egui::Color32::RED),
+                        )
+                        .clicked()
+                    {
+                        actions.push(TreeAction::ConfirmDeleteSelected);
+                        ui.close();
+                    }
+                } else {
+                    // Single-item context menu
+                    if ui.button("Open in Finder").clicked() {
+                        actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Copy Path").clicked() {
+                        actions.push(TreeAction::CopyPath(ctx_path.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Move to Trash").clicked() {
+                        actions.push(TreeAction::Trash(ctx_path.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(egui::RichText::new("Delete Permanently").color(egui::Color32::RED))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::ConfirmDelete(ctx_path.clone()));
+                        ui.close();
+                    }
                 }
             });
 

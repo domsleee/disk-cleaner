@@ -1009,7 +1009,7 @@ impl eframe::App for App {
                         // Keyboard hints
                         ui.label(
                             egui::RichText::new(
-                                "\u{2190}\u{2191}\u{2193}\u{2192} navigate  Space expand  \u{232b} trash",
+                                "Arrow keys navigate  Space expand  Del trash",
                             )
                             .small()
                             .weak(),

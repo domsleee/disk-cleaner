@@ -845,7 +845,7 @@ impl eframe::App for App {
                     if let Some((total, available)) = self.scan_disk_info {
                         ui.separator();
                         let used = total.saturating_sub(available);
-                        ui.monospace(format!(
+                        ui.label(format!(
                             "Disk: {} used / {} ({} free)",
                             bytesize::ByteSize::b(used),
                             bytesize::ByteSize::b(total),
@@ -1011,7 +1011,7 @@ impl eframe::App for App {
                     let files = self.scan_progress.file_count.load(Ordering::Relaxed);
                     let size = self.scan_progress.total_size.load(Ordering::Relaxed);
                     let size_str = bytesize::ByteSize::b(size).to_string();
-                    ui.monospace(format!("{files} files — {size_str}"));
+                    ui.label(format!("{files} files — {size_str}"));
 
                     ui.add_space(24.0);
                     if ui.button("Cancel").clicked() {
@@ -1059,7 +1059,7 @@ impl eframe::App for App {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                ui.monospace(format!(
+                                                ui.label(format!(
                                                     "Disk: {} used of {}",
                                                     bytesize::ByteSize::b(used),
                                                     bytesize::ByteSize::b(vol.total_bytes),

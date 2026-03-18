@@ -418,8 +418,12 @@ pub fn render_tree(
                 } else {
                     ui.visuals().selection.bg_fill.linear_multiply(0.4)
                 };
-                let highlight_rect =
-                    egui::Rect::from_x_y_ranges(full_width.x_range(), row_rect.y_range());
+                let spacing_half = ui.spacing().item_spacing.y / 2.0;
+                let y = row_rect.y_range();
+                let highlight_rect = egui::Rect::from_x_y_ranges(
+                    full_width.x_range(),
+                    (y.min - spacing_half)..=(y.max + spacing_half),
+                );
                 ui.painter().set(
                     bg_idx,
                     egui::Shape::rect_filled(highlight_rect, 0.0, bg_color),

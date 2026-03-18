@@ -717,6 +717,9 @@ impl eframe::App for App {
         if show_toolbar {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Standardize widget height so buttons and selectable labels align
+                ui.spacing_mut().interact_size.y = 24.0;
+
                 if ui.button("Open Directory...").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.start_scan(path);
@@ -1397,7 +1400,7 @@ impl eframe::App for App {
 
         // Floating batch actions bar (shown when items are selected)
         let selected_count = self.selected_paths.len();
-        if selected_count > 0 && self.tree.is_some() && !self.scanning {
+        if selected_count > 0 && self.tree.is_some() && !self.scanning && self.view_mode == ViewMode::Tree {
             egui::Area::new(egui::Id::new("batch_actions_float"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
                 .interactable(true)

@@ -204,7 +204,11 @@ pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> 
     find_node_inner(node, target, &mut buf)
 }
 
-fn find_node_inner<'a>(node: &'a FileNode, target: &Path, buf: &mut PathBuf) -> Option<&'a FileNode> {
+fn find_node_inner<'a>(
+    node: &'a FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+) -> Option<&'a FileNode> {
     if buf.as_path() == target {
         return Some(node);
     }
@@ -234,7 +238,12 @@ pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
     }
 }
 
-fn breadcrumbs_walk(node: &FileNode, target: &Path, buf: &mut PathBuf, trail: &mut Vec<(String, PathBuf)>) -> bool {
+fn breadcrumbs_walk(
+    node: &FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+    trail: &mut Vec<(String, PathBuf)>,
+) -> bool {
     for child in node.children() {
         buf.push(child.name());
         let child_path = buf.clone();
@@ -383,10 +392,20 @@ pub fn render_treemap(
             continue;
         }
 
-        let is_focused = focused_path.as_ref().is_some_and(|fp| *fp == child_paths[i]);
+        let is_focused = focused_path
+            .as_ref()
+            .is_some_and(|fp| *fp == child_paths[i]);
 
         if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
-            paint_directory(&painter, child, r, is_focused, focused_path, alpha, &child_paths[i]);
+            paint_directory(
+                &painter,
+                child,
+                r,
+                is_focused,
+                focused_path,
+                alpha,
+                &child_paths[i],
+            );
         } else {
             paint_leaf(&painter, child, r, is_focused, alpha);
         }
@@ -737,5 +756,306 @@ mod tests {
         // Light bg should give dark text
         let tc = text_color_for_bg(egui::Color32::from_rgb(220, 220, 220));
         assert!(tc.r() < 50);
+    }
+
+    // ── worst_ratio tests ──
+
+    #[test]
+    fn worst_ratio_single_square() {
+        // A single 100-area item on a 10-length side → strip is 10×10, ratio = 1
+        let r = worst_ratio(&[100.0], 10.0);
+        assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn worst_ratio_zero_side() {
+        assert_eq!(worst_ratio(&[100.0], 0.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_zero_area() {
+        assert_eq!(worst_ratio(&[0.0], 10.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_empty() {
+        assert_eq!(worst_ratio(&[], 10.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_equal_items() {
+        // Two 50-area items on a 10-length side → strip is 10×10, each 10×5, ratio = 2
+        let r = worst_ratio(&[50.0, 50.0], 10.0);
+        assert!((r - 2.0).abs() < 1e-9);
+    }
+
+    // ── squarify bounds and ordering tests ──
+
+    #[test]
+    fn squarify_rects_within_bounds() {
+        let sizes = vec![50.0, 30.0, 15.0, 5.0];
+        let (x, y, w, h) = (10.0, 20.0, 400.0, 300.0);
+        let rects = squarify(&sizes, x, y, w, h);
+        let bounds = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+        for (i, r) in rects.iter().enumerate() {
+            assert!(
+                r.min.x >= bounds.min.x - 0.1
+                    && r.min.y >= bounds.min.y - 0.1
+                    && r.max.x <= bounds.max.x + 0.1
+                    && r.max.y <= bounds.max.y + 0.1,
+                "rect {i} ({:?}) outside bounds ({:?})",
+                r,
+                bounds
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_with_offset_origin() {
+        let rects = squarify(&[100.0], 50.0, 75.0, 200.0, 100.0);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[0].min.x - 50.0).abs() < 0.1);
+        assert!((rects[0].min.y - 75.0).abs() < 0.1);
+        assert!((rects[0].width() - 200.0).abs() < 0.1);
+        assert!((rects[0].height() - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn squarify_zero_width() {
+        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 0.0, 100.0);
+        assert_eq!(rects.len(), 2);
+        // All should be NOTHING rects
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_zero_height() {
+        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 100.0, 0.0);
+        assert_eq!(rects.len(), 2);
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_all_zero_sizes() {
+        let rects = squarify(&[0.0, 0.0, 0.0], 0.0, 0.0, 100.0, 100.0);
+        assert_eq!(rects.len(), 3);
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_ordering_largest_gets_largest_rect() {
+        let sizes = vec![100.0, 50.0, 25.0, 10.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
+        let areas: Vec<f32> = rects.iter().map(|r| r.width() * r.height()).collect();
+        // Each rect's area should be >= the next (matching descending size order)
+        for i in 0..areas.len() - 1 {
+            assert!(
+                areas[i] >= areas[i + 1] - 1.0,
+                "area[{}] = {} < area[{}] = {}",
+                i,
+                areas[i],
+                i + 1,
+                areas[i + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_tall_narrow_rect() {
+        let sizes = vec![60.0, 30.0, 10.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 50.0, 600.0);
+        assert_eq!(rects.len(), 3);
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        assert!((total_area - 30000.0).abs() < 10.0);
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.width() > 0.0, "rect {i} has zero width");
+            assert!(r.height() > 0.0, "rect {i} has zero height");
+        }
+    }
+
+    #[test]
+    fn squarify_square_canvas() {
+        let sizes = vec![25.0, 25.0, 25.0, 25.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 100.0, 100.0);
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        assert!((total_area - 10000.0).abs() < 1.0);
+        // All rects should have equal area
+        let expected_each = 2500.0f32;
+        for (i, r) in rects.iter().enumerate() {
+            let a = r.width() * r.height();
+            assert!(
+                (a - expected_each).abs() < 1.0,
+                "rect {i} area = {a}, expected {expected_each}"
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_no_overlap_many_items() {
+        let sizes: Vec<f64> = (1..=50).rev().map(|i| i as f64).collect();
+        let rects = squarify(&sizes, 0.0, 0.0, 1000.0, 800.0);
+        assert_eq!(rects.len(), 50);
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let overlap = rects[i].intersect(rects[j]);
+                assert!(
+                    overlap.area() < 2.0,
+                    "rects {i} and {j} overlap by {}",
+                    overlap.area()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn squarify_extreme_skew() {
+        // One huge item and several tiny ones
+        let sizes = vec![10000.0, 1.0, 1.0, 1.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
+        assert_eq!(rects.len(), 4);
+        let a0 = rects[0].width() * rects[0].height();
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        // First rect should dominate
+        assert!(a0 / total_area > 0.99);
+    }
+
+    // ── darken / apply_alpha tests ──
+
+    #[test]
+    fn darken_reduces_rgb() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let d = darken(c, 30);
+        assert_eq!(d, egui::Color32::from_rgb(70, 120, 170));
+    }
+
+    #[test]
+    fn darken_saturates_at_zero() {
+        let c = egui::Color32::from_rgb(10, 20, 30);
+        let d = darken(c, 50);
+        assert_eq!(d, egui::Color32::from_rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn apply_alpha_full() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let result = apply_alpha(c, 1.0);
+        assert_eq!(result, c);
+    }
+
+    #[test]
+    fn apply_alpha_half() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let result = apply_alpha(c, 0.5);
+        // Alpha should be halved (255 * 0.5 ≈ 127)
+        assert!((result.a() as f32 - 127.0).abs() < 2.0);
+        // RGB premultiplied, so values are halved too
+        assert!((result.r() as f32 - 50.0).abs() < 2.0);
+    }
+
+    // ── extension_color category coverage ──
+
+    #[test]
+    fn extension_color_categories() {
+        // Audio
+        assert_eq!(
+            extension_color("song.mp3", false),
+            egui::Color32::from_rgb(142, 68, 173)
+        );
+        // Image
+        assert_eq!(
+            extension_color("photo.png", false),
+            egui::Color32::from_rgb(39, 174, 96)
+        );
+        // Archive
+        assert_eq!(
+            extension_color("backup.zip", false),
+            egui::Color32::from_rgb(211, 84, 0)
+        );
+        // Source code
+        assert_eq!(
+            extension_color("main.rs", false),
+            egui::Color32::from_rgb(22, 160, 133)
+        );
+        // Document
+        assert_eq!(
+            extension_color("report.pdf", false),
+            egui::Color32::from_rgb(41, 128, 185)
+        );
+        // Config
+        assert_eq!(
+            extension_color("config.json", false),
+            egui::Color32::from_rgb(44, 62, 80)
+        );
+        // Build artifact
+        assert_eq!(
+            extension_color("module.o", false),
+            egui::Color32::from_rgb(146, 43, 33)
+        );
+        // Unknown → default gray
+        assert_eq!(
+            extension_color("random.xyz", false),
+            egui::Color32::from_rgb(93, 109, 126)
+        );
+    }
+
+    // ── find_node / breadcrumbs with deeper trees ──
+
+    #[test]
+    fn find_node_deeply_nested() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("deep.txt", 1)])])],
+            )],
+        );
+        assert!(find_node(&tree, Path::new("root/a/b/c/deep.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c/nope")).is_none());
+    }
+
+    #[test]
+    fn find_node_among_siblings() {
+        let tree = dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                dir("sub", vec![leaf("c.txt", 5)]),
+            ],
+        );
+        assert!(find_node(&tree, Path::new("root/b.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/sub/c.txt")).is_some());
+    }
+
+    #[test]
+    fn breadcrumbs_deep_path() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("d.txt", 1)])])],
+            )],
+        );
+        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"));
+        assert_eq!(bc.len(), 4);
+        assert_eq!(bc[0].0, "root");
+        assert_eq!(bc[1].0, "a");
+        assert_eq!(bc[2].0, "b");
+        assert_eq!(bc[3].0, "c");
+    }
+
+    #[test]
+    fn breadcrumbs_to_file() {
+        let tree = dir("root", vec![dir("sub", vec![leaf("file.txt", 10)])]);
+        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
+        assert_eq!(bc.len(), 3);
+        assert_eq!(bc[2].0, "file.txt");
     }
 }

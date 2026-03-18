@@ -998,8 +998,42 @@ impl eframe::App for App {
                     let size_str = bytesize::ByteSize::b(size).to_string();
                     ui.label(format!("{files} files — {size_str}"));
 
+                    // Progress bar based on disk total size
+                    if let Some((total, _available)) = self.scan_disk_info {
+                        if total > 0 {
+                            ui.add_space(12.0);
+                            let fraction = (size as f32 / total as f32).clamp(0.0, 1.0);
+                            let total_str = bytesize::ByteSize::b(total).to_string();
+                            let bar = egui::ProgressBar::new(fraction)
+                                .text(format!("{size_str} / {total_str}"))
+                                .desired_width(300.0);
+                            ui.add(bar);
+                        }
+                    }
+
+                    // Elapsed time
+                    if let Some(start) = self.scan_start_time {
+                        ui.add_space(8.0);
+                        let elapsed = start.elapsed();
+                        let secs = elapsed.as_secs();
+                        let elapsed_str = if secs >= 60 {
+                            format!("{}m {:02}s", secs / 60, secs % 60)
+                        } else {
+                            format!("{secs}s")
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Elapsed: {elapsed_str}"))
+                                .weak()
+                                .size(13.0),
+                        );
+                    }
+
                     ui.add_space(24.0);
-                    if ui.button("Cancel").clicked() {
+                    let cancel_btn = egui::Button::new(
+                        egui::RichText::new("Cancel").size(15.0),
+                    )
+                    .min_size(egui::vec2(120.0, 36.0));
+                    if ui.add(cancel_btn).clicked() {
                         self.cancel_scan();
                     }
                 });

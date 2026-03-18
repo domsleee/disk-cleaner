@@ -822,38 +822,6 @@ impl eframe::App for App {
                     }
                 }
 
-                // Batch operation buttons (only shown when items are selected)
-                let selected_count = self.selected_paths.len();
-                if selected_count > 0 {
-                    ui.separator();
-                    if ui
-                        .button(format!("Trash Selected ({selected_count})"))
-                        .clicked()
-                    {
-                        self.batch_trash_selected();
-                    }
-                    if ui
-                        .button(format!("Delete Selected ({selected_count})"))
-                        .clicked()
-                    {
-                        self.confirm_batch_delete = true;
-                    }
-                }
-
-                // Disk space info (shown when scan is done)
-                if self.tree.is_some() && !self.scanning {
-                    if let Some((total, available)) = self.scan_disk_info {
-                        ui.separator();
-                        let used = total.saturating_sub(available);
-                        ui.label(format!(
-                            "Disk: {} used / {} ({} free)",
-                            bytesize::ByteSize::b(used),
-                            bytesize::ByteSize::b(total),
-                            bytesize::ByteSize::b(available),
-                        ));
-                    }
-                }
-
                 if self.scanning {
                     // Full-page scanning UI is in CentralPanel; just keep repainting
                     ctx.request_repaint();
@@ -961,7 +929,7 @@ impl eframe::App for App {
                 });
         }
 
-        // Bottom status bar with scan info + version
+        // Bottom status bar with scan info + disk stats + version
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(ref path) = self.scan_path {
@@ -983,6 +951,23 @@ impl eframe::App for App {
                             .small()
                             .weak(),
                     );
+
+                    // Disk space info
+                    if self.tree.is_some() && !self.scanning {
+                        if let Some((total, available)) = self.scan_disk_info {
+                            let used = total.saturating_sub(available);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Disk: {} used / {} ({} free)",
+                                    bytesize::ByteSize::b(used),
+                                    bytesize::ByteSize::b(total),
+                                    bytesize::ByteSize::b(available),
+                                ))
+                                .small(),
+                            );
+                            ui.separator();
+                        }
+                    }
                 });
             });
         });
@@ -1311,6 +1296,54 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Floating batch actions bar (shown when items are selected)
+        let selected_count = self.selected_paths.len();
+        if selected_count > 0 && self.tree.is_some() && !self.scanning {
+            egui::Area::new(egui::Id::new("batch_actions_float"))
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
+                .interactable(true)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .corner_radius(8.0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 2],
+                            blur: 8,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(60),
+                        })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{selected_count} item{} selected",
+                                        if selected_count == 1 { "" } else { "s" }
+                                    ))
+                                    .strong(),
+                                );
+                                ui.add_space(12.0);
+                                if ui.button("Move to Trash").clicked() {
+                                    self.batch_trash_selected();
+                                }
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Delete Permanently")
+                                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.confirm_batch_delete = true;
+                                }
+                                ui.add_space(4.0);
+                                if ui.small_button("\u{2715}").on_hover_text("Clear selection").clicked() {
+                                    self.selected_paths.clear();
+                                }
+                            });
+                        });
+                });
+        }
 
         // Record frame time while scanning
         if self.scanning {

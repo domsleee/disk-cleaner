@@ -13,10 +13,7 @@ pub enum SuggestionAction {
 }
 
 /// Render the Smart Cleanup suggestions panel.
-pub fn render_suggestions(
-    ui: &mut egui::Ui,
-    report: &SuggestionReport,
-) -> Vec<SuggestionAction> {
+pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<SuggestionAction> {
     let mut actions = Vec::new();
 
     if report.groups.is_empty() {
@@ -68,11 +65,10 @@ pub fn render_suggestions(
                 let safety = cat.safety();
 
                 // Center the card
+                let avail = ui.available_width();
+                let indent = ((avail - card_width) / 2.0).max(0.0);
                 ui.horizontal(|ui| {
-                    let avail = ui.available_width();
-                    if avail > card_width {
-                        ui.add_space((avail - card_width) / 2.0);
-                    }
+                    ui.add_space(indent);
 
                     egui::Frame::group(ui.style())
                         .inner_margin(16.0)
@@ -83,15 +79,8 @@ pub fn render_suggestions(
                             // Header row: icon + name + size + safety badge
                             ui.horizontal(|ui| {
                                 // Icon and category name
-                                ui.label(
-                                    egui::RichText::new(cat.icon())
-                                        .size(20.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(cat.label())
-                                        .strong()
-                                        .size(16.0),
-                                );
+                                ui.label(egui::RichText::new(cat.icon()).size(20.0));
+                                ui.label(egui::RichText::new(cat.label()).strong().size(16.0));
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -108,8 +97,7 @@ pub fn render_suggestions(
                                             .corner_radius(4.0),
                                         );
                                         if clean_btn.clicked() {
-                                            actions
-                                                .push(SuggestionAction::TrashGroup(group_idx));
+                                            actions.push(SuggestionAction::TrashGroup(group_idx));
                                         }
 
                                         // Safety badge
@@ -133,11 +121,7 @@ pub fn render_suggestions(
 
                             // Description
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(cat.description())
-                                    .weak()
-                                    .size(12.0),
-                            );
+                            ui.label(egui::RichText::new(cat.description()).weak().size(12.0));
 
                             // Size bar
                             ui.add_space(8.0);
@@ -147,11 +131,7 @@ pub fn render_suggestions(
                                 egui::Sense::hover(),
                             );
                             let painter = ui.painter();
-                            painter.rect_filled(
-                                bar_rect,
-                                3.0,
-                                ui.visuals().extreme_bg_color,
-                            );
+                            painter.rect_filled(bar_rect, 3.0, ui.visuals().extreme_bg_color);
 
                             // Fill proportional to this group vs total
                             let fraction = if report.total_reclaimable > 0 {
@@ -159,8 +139,7 @@ pub fn render_suggestions(
                             } else {
                                 0.0
                             };
-                            let fill_w =
-                                (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(2.0);
+                            let fill_w = (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(2.0);
                             let fill_rect = egui::Rect::from_min_size(
                                 bar_rect.min,
                                 egui::vec2(fill_w, bar_height),
@@ -194,9 +173,7 @@ pub fn render_suggestions(
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new(toggle_text)
-                                            .weak()
-                                            .size(12.0),
+                                        egui::RichText::new(toggle_text).weak().size(12.0),
                                     )
                                     .frame(false),
                                 )
@@ -219,8 +196,7 @@ pub fn render_suggestions(
                                         // Trash button
                                         let trash_btn = ui.add(
                                             egui::Button::new(
-                                                egui::RichText::new("\u{1F5D1}")
-                                                    .size(12.0),
+                                                egui::RichText::new("\u{1F5D1}").size(12.0),
                                             )
                                             .frame(false),
                                         );
@@ -233,14 +209,15 @@ pub fn render_suggestions(
                                         // Path (truncated)
                                         let display_path = item.path.display().to_string();
                                         let truncated = if display_path.len() > 60 {
-                                            format!("...{}", &display_path[display_path.len() - 57..])
+                                            format!(
+                                                "...{}",
+                                                &display_path[display_path.len() - 57..]
+                                            )
                                         } else {
                                             display_path
                                         };
                                         ui.label(
-                                            egui::RichText::new(truncated)
-                                                .monospace()
-                                                .size(12.0),
+                                            egui::RichText::new(truncated).monospace().size(12.0),
                                         );
 
                                         ui.with_layout(

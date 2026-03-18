@@ -193,6 +193,8 @@ pub fn render_tree(
     }
 
     scroll_area.show_rows(ui, row_height, total_rows, |ui, range| {
+        // Prevent shift+click from selecting label text (OS text highlight).
+        ui.style_mut().interaction.selectable_labels = false;
         let full_width = ui.max_rect();
         for i in range {
             let row = &rows[i];

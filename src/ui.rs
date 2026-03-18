@@ -292,9 +292,16 @@ pub fn render_tree(
 
             // Single row interaction — toggle vs click determined by pointer position
             let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
-            let row_interact = ui
-                .interact(row_rect, row_id, egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
+
+            // Use PointingHand only when hovering over the disclosure triangle area
+            if row_interact.hovered() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    if row.is_dir && pos.x <= toggle_right {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -389,6 +396,9 @@ pub fn render_tree(
                 }
             });
 
+            // Capture hover state before on_hover_ui consumes row_interact
+            let is_hovered = row_interact.hovered();
+
             // Tooltip (lazy via closure — avoids format! allocation unless hovered)
             if row.is_dir {
                 let children_count = row.children_count;
@@ -410,13 +420,19 @@ pub fn render_tree(
                 });
             }
 
-            // Focus/selection background — both use blue selection color
+            // Focus/selection/hover background
             let is_selected = selected_paths.contains(&row.path);
-            if is_selected || is_focused {
-                let bg_color = if is_selected {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.3)
+            if is_selected || is_focused || is_hovered {
+                let bg_color = if is_selected && is_focused {
+                    // Selected + focused: strongest highlight
+                    ui.visuals().selection.bg_fill.linear_multiply(0.5)
+                } else if is_selected {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.35)
+                } else if is_focused {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.2)
                 } else {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.4)
+                    // Hover only
+                    ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3)
                 };
                 let spacing_half = ui.spacing().item_spacing.y / 2.0;
                 let y = row_rect.y_range();

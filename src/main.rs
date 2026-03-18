@@ -1051,8 +1051,14 @@ impl eframe::App for App {
                                     self.visible_paths_dirty = true;
                                 }
                             }
+                            ui::TreeAction::TrashSelected => {
+                                self.batch_trash_selected();
+                            }
                             ui::TreeAction::ConfirmDelete(path) => {
                                 self.confirm_delete = Some(path.clone());
+                            }
+                            ui::TreeAction::ConfirmDeleteSelected => {
+                                self.confirm_batch_delete = true;
                             }
                             ui::TreeAction::RevealInFinder(path) => {
                                 let _ = std::process::Command::new("open")

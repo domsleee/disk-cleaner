@@ -158,6 +158,8 @@ enum ScreenshotState {
     WaitingForEvent,
     /// Switch to next view, then capture again.
     NextView(ViewMode),
+    /// Open the File Types sidebar, then capture tree_full.
+    ShowCategories,
     Done,
 }
 
@@ -509,6 +511,7 @@ impl eframe::App for App {
                         if let egui::Event::Screenshot { image, .. } = event {
                             let prefix = self.screenshot_prefix.as_ref().unwrap();
                             let suffix = match self.view_mode {
+                                ViewMode::Tree if self.show_categories => "tree_full",
                                 ViewMode::Tree => "tree",
                                 ViewMode::Treemap => "treemap",
                                 ViewMode::Suggestions => "suggestions",
@@ -558,7 +561,12 @@ impl eframe::App for App {
                             self.screenshot_state = ScreenshotState::Done;
                         } else {
                             match self.view_mode {
+                                ViewMode::Tree if !self.show_categories => {
+                                    self.screenshot_state = ScreenshotState::ShowCategories;
+                                }
                                 ViewMode::Tree => {
+                                    // tree_full captured; close sidebar and move on
+                                    self.show_categories = false;
                                     self.screenshot_state =
                                         ScreenshotState::NextView(ViewMode::Treemap);
                                 }
@@ -572,6 +580,11 @@ impl eframe::App for App {
                             }
                         }
                     }
+                    ctx.request_repaint();
+                }
+                ScreenshotState::ShowCategories => {
+                    self.show_categories = true;
+                    self.screenshot_state = ScreenshotState::WaitFrames(5);
                     ctx.request_repaint();
                 }
                 ScreenshotState::NextView(next) => {

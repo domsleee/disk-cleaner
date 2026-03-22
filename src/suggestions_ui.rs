@@ -53,6 +53,12 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                     .weak()
                     .size(14.0),
                 );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("All cleanup actions move files to Trash. You can restore them from Trash if needed.")
+                        .weak()
+                        .size(12.0),
+                );
             });
 
             ui.add_space(20.0);
@@ -85,14 +91,14 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        // Clean button
+                                        // Clean button — clearly labeled as Trash action
+                                        let btn_label = format!(
+                                            "Move to Trash ({})",
+                                            ByteSize::b(group.total_size)
+                                        );
                                         let clean_btn = ui.add(
                                             egui::Button::new(
-                                                egui::RichText::new(format!(
-                                                    "Clean {}",
-                                                    ByteSize::b(group.total_size)
-                                                ))
-                                                .size(13.0),
+                                                egui::RichText::new(btn_label).size(13.0),
                                             )
                                             .corner_radius(4.0),
                                         );
@@ -119,9 +125,28 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                                 );
                             });
 
-                            // Description
+                            // Description — explains what this category is and why it's safe/caution
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(cat.description()).weak().size(12.0));
+
+                            // Caution warning
+                            if safety == SafetyLevel::Caution {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("\u{26A0}")
+                                            .color(egui::Color32::from_rgb(220, 150, 50))
+                                            .size(13.0),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Review the files below before cleaning. Expand to see what will be removed.",
+                                        )
+                                        .color(egui::Color32::from_rgb(220, 150, 50))
+                                        .size(12.0),
+                                    );
+                                });
+                            }
 
                             // Size bar
                             ui.add_space(8.0);
@@ -153,11 +178,13 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                             // Item count + total size
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
+                                let item_word = if group.items.len() == 1 { "item" } else { "items" };
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} \u{2014} {} items",
+                                        "{} \u{2014} {} {} will be moved to Trash",
                                         ByteSize::b(group.total_size),
-                                        group.items.len()
+                                        group.items.len(),
+                                        item_word,
                                     ))
                                     .size(13.0),
                                 );

@@ -625,6 +625,7 @@ impl eframe::App for App {
                         ui::remove_node(tree, focused);
                         self.visible_paths_dirty = true;
                     }
+                    self.selected_paths.remove(focused);
                     self.focused_path = None;
                 }
             }
@@ -705,6 +706,7 @@ impl eframe::App for App {
                         ui::remove_node(tree, &path);
                         self.visible_paths_dirty = true;
                     }
+                    self.selected_paths.remove(&path);
                 }
                 Err(e) => {
                     self.error = Some(format!("Delete failed: {e}"));
@@ -1298,6 +1300,7 @@ impl eframe::App for App {
                                     ui::remove_node(tree, path);
                                     self.visible_paths_dirty = true;
                                 }
+                                self.selected_paths.remove(path);
                             }
                             ui::TreeAction::TrashSelected => {
                                 self.batch_trash_selected();

@@ -277,6 +277,12 @@ pub enum TreemapAction {
 const GAP: f32 = 1.5;
 const DIR_HEADER_H: f32 = 20.0;
 const MIN_LABEL_W: f32 = 32.0;
+/// Hard cap on visible top-level entries to prevent lag with huge directories.
+const MAX_VISIBLE_ENTRIES: usize = 200;
+/// Minimum rect area (px²) worth painting — below this we skip.
+const MIN_PAINT_AREA: f32 = 4.0;
+/// Maximum nested children to paint inside a directory tile.
+const MAX_NESTED_CHILDREN: usize = 100;
 
 /// Render the full treemap view (breadcrumbs + map). Returns user-triggered actions.
 pub fn render_treemap(
@@ -396,6 +402,17 @@ pub fn render_treemap(
         }
     }
 
+    // Hard cap: if we still have too many entries, keep only the largest
+    // and fold the rest into "Other". Children are already sorted descending
+    // by size from the scanner, but re-sort the tail to be safe.
+    if children.len() > MAX_VISIBLE_ENTRIES {
+        children.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        for c in children.drain(MAX_VISIBLE_ENTRIES..) {
+            other_size += c.size();
+            other_count += 1;
+        }
+    }
+
     // Build display entries: real children + optional "Other" bucket
     // We use an enum to track which entries are real nodes vs the bucket.
     let has_other = other_count > 0 && other_size > 0;
@@ -429,6 +446,10 @@ pub fn render_treemap(
     for i in 0..entry_count {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 {
+            continue;
+        }
+        // Skip sub-pixel rectangles — not worth painting
+        if r.area() < MIN_PAINT_AREA {
             continue;
         }
 
@@ -655,9 +676,14 @@ fn paint_directory(
     );
 
     if content_rect.width() > 4.0 && content_rect.height() > 4.0 && !node.children().is_empty() {
-        let nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
+        let mut nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
         if nested.is_empty() {
             return;
+        }
+        // Cap nested children to avoid painting thousands of sub-rects
+        if nested.len() > MAX_NESTED_CHILDREN {
+            nested.sort_by_key(|c| std::cmp::Reverse(c.size()));
+            nested.truncate(MAX_NESTED_CHILDREN);
         }
         let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
         let child_rects = squarify(
@@ -670,7 +696,7 @@ fn paint_directory(
 
         for (j, child) in nested.iter().enumerate() {
             let cr = child_rects[j].shrink(0.5);
-            if cr.width() <= 0.0 || cr.height() <= 0.0 {
+            if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
                 continue;
             }
             let color = apply_alpha(extension_color(child.name(), child.is_dir()), alpha);

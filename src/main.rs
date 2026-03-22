@@ -320,19 +320,27 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
+        let mut any_trashed = false;
         for path in paths {
             if let Err(e) = trash::delete(&path) {
                 self.error = Some(format!("Trash failed: {e}"));
                 break;
-            } else if let Some(ref mut tree) = self.tree {
-                ui::remove_node(tree, &path);
-                self.visible_paths_dirty = true;
+            } else {
+                any_trashed = true;
+                if let Some(ref mut tree) = self.tree {
+                    ui::remove_node(tree, &path);
+                    self.visible_paths_dirty = true;
+                }
             }
+        }
+        if any_trashed {
+            self.refresh_disk_info();
         }
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
+        let mut any_deleted = false;
         for path in paths {
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
@@ -341,6 +349,7 @@ impl App {
             };
             match result {
                 Ok(()) => {
+                    any_deleted = true;
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
                         self.visible_paths_dirty = true;
@@ -351,6 +360,16 @@ impl App {
                     break;
                 }
             }
+        }
+        if any_deleted {
+            self.refresh_disk_info();
+        }
+    }
+
+    /// Re-query disk space so the status bar reflects freed space after deletions.
+    fn refresh_disk_info(&mut self) {
+        if let Some(ref path) = self.scan_path {
+            self.scan_disk_info = scanner::disk_space(path);
         }
     }
 }
@@ -621,9 +640,12 @@ impl eframe::App for App {
                 } else if del {
                     if let Err(e) = trash::delete(focused) {
                         self.error = Some(format!("Trash failed: {e}"));
-                    } else if let Some(ref mut tree) = self.tree {
-                        ui::remove_node(tree, focused);
-                        self.visible_paths_dirty = true;
+                    } else {
+                        if let Some(ref mut tree) = self.tree {
+                            ui::remove_node(tree, focused);
+                            self.visible_paths_dirty = true;
+                        }
+                        self.refresh_disk_info();
                     }
                     self.selected_paths.remove(focused);
                     self.focused_path = None;
@@ -719,6 +741,7 @@ impl eframe::App for App {
                         self.visible_paths_dirty = true;
                     }
                     self.selected_paths.remove(&path);
+                    self.refresh_disk_info();
                 }
                 Err(e) => {
                     self.error = Some(format!("Delete failed: {e}"));
@@ -1309,9 +1332,12 @@ impl eframe::App for App {
                             ui::TreeAction::Trash(path) => {
                                 if let Err(e) = trash::delete(path) {
                                     self.error = Some(format!("Trash failed: {e}"));
-                                } else if let Some(ref mut tree) = self.tree {
-                                    ui::remove_node(tree, path);
-                                    self.visible_paths_dirty = true;
+                                } else {
+                                    if let Some(ref mut tree) = self.tree {
+                                        ui::remove_node(tree, path);
+                                        self.visible_paths_dirty = true;
+                                    }
+                                    self.refresh_disk_info();
                                 }
                                 self.selected_paths.remove(path);
                             }
@@ -1376,6 +1402,7 @@ impl eframe::App for App {
                     }
                 }
                 ViewMode::Suggestions => {
+                    let mut needs_disk_refresh = false;
                     if let Some(ref mut report) = self.suggestion_report {
                         let sg_actions = suggestions_ui::render_suggestions(ui, report);
                         for action in sg_actions {
@@ -1386,9 +1413,12 @@ impl eframe::App for App {
                                 suggestions_ui::SuggestionAction::TrashItem(path) => {
                                     if let Err(e) = trash::delete(&path) {
                                         self.error = Some(format!("Trash failed: {e}"));
-                                    } else if let Some(ref mut tree) = self.tree {
-                                        ui::remove_node(tree, &path);
-                                        self.visible_paths_dirty = true;
+                                    } else {
+                                        if let Some(ref mut tree) = self.tree {
+                                            ui::remove_node(tree, &path);
+                                            self.visible_paths_dirty = true;
+                                        }
+                                        needs_disk_refresh = true;
                                     }
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
@@ -1401,14 +1431,20 @@ impl eframe::App for App {
                                         if let Err(e) = trash::delete(&path) {
                                             self.error = Some(format!("Trash failed: {e}"));
                                             break;
-                                        } else if let Some(ref mut tree) = self.tree {
-                                            ui::remove_node(tree, &path);
-                                            self.visible_paths_dirty = true;
+                                        } else {
+                                            if let Some(ref mut tree) = self.tree {
+                                                ui::remove_node(tree, &path);
+                                                self.visible_paths_dirty = true;
+                                            }
+                                            needs_disk_refresh = true;
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                    if needs_disk_refresh {
+                        self.refresh_disk_info();
                     }
                 }
             }

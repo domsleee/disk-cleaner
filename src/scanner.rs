@@ -104,29 +104,21 @@ pub struct ScanProgress {
 /// On macOS APFS, `/System/Volumes/Data` contains the real user data but is also
 /// accessible via firmlinks (e.g. `/Users` → `/System/Volumes/Data/Users`).
 /// Scanning from `/` without skipping Data counts everything twice.
+/// Mount points under `/Volumes/` also cause inflation when scanning root.
 fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
     let mut skip = HashSet::new();
 
     #[cfg(target_os = "macos")]
     {
         let data_vol = Path::new("/System/Volumes/Data");
-        // Only skip Data volume when scanning from a path that isn't under it
+        // Only apply APFS dedup when scanning from a path that isn't under the Data volume
         if !root.starts_with(data_vol) {
-            // Read firmlinks list to find which paths are mirrored
-            if let Ok(content) = std::fs::read_to_string("/usr/share/firmlinks") {
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() == 2 {
-                        // Each firmlink: /Source\tDataRelative
-                        // Skip /System/Volumes/Data/<DataRelative> since /Source covers it
-                        let data_path = data_vol.join(parts[1]);
-                        if root.starts_with(&data_path) || !root.starts_with(data_vol) {
-                            skip.insert(data_path);
-                        }
-                    }
-                }
-            }
-            // Also skip other volume mounts that inflate size
+            // Skip the entire Data volume — all user-visible content is
+            // accessible via firmlinks from the root, so descending into
+            // /System/Volumes/Data would double-count everything.
+            skip.insert(data_vol.to_path_buf());
+
+            // Also skip other APFS sub-volume mounts that inflate size
             for sub in &[
                 "Preboot",
                 "Recovery",
@@ -143,6 +135,21 @@ fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
                 let p = Path::new("/System/Volumes").join(sub);
                 if p.exists() && !root.starts_with(&p) {
                     skip.insert(p);
+                }
+            }
+        }
+
+        // Skip mount points under /Volumes/ to avoid counting other drives.
+        // /Volumes/ contains mount points like "Macintosh HD" (root alias) and
+        // "Macintosh HD - Data" (Data volume alias) plus external drives.
+        // When scanning root, traversing these re-counts the same data.
+        if !root.starts_with("/Volumes/") && root != Path::new("/Volumes") {
+            if let Ok(entries) = std::fs::read_dir("/Volumes") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path != root {
+                        skip.insert(path);
+                    }
                 }
             }
         }

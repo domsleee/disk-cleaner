@@ -159,6 +159,48 @@ fn render_treemap(ui: &mut egui::Ui, node: &FileNode, rect: egui::Rect, depth: u
 | Regex filtering | None | Built-in filter/invert-filter |
 | Cross-filesystem | Not handled | `limit_filesystem` option |
 
+## Start page design
+
+The start page is the first screen users see. Current layout:
+
+```
+┌─ Toolbar ──────────────────────────────────────┐
+│ [Open Directory...]                            │
+├────────────────────────────────────────────────┤
+│              Disk Cleaner                      │
+│              Volumes                           │
+│  ┌──────────────────────────────────────────┐  │
+│  │ Macintosh HD               460.4 GiB     │  │
+│  │ ████████████████████░░░░░░               │  │
+│  │ 752.7 MiB free                    [Scan] │  │
+│  └──────────────────────────────────────────┘  │
+│          ─────────────────                     │
+│         [Open Directory...]                    │
+│         [Resume last scan: /]                  │
+└────────────────────────────────────────────────┘
+```
+
+### Problems
+
+1. "Open Directory..." appears twice (toolbar + content area)
+2. Volume cards have a small "Scan" button but aren't themselves clickable
+3. "Resume last scan" is a low-visibility button below a separator
+4. Toolbar is nearly empty on this screen
+
+### Target design
+
+- **Remove the duplicate "Open Directory..." from the content area.** Keep it in the toolbar only.
+- **Make volume cards fully clickable.** Hover highlight, click to scan. Remove the small "Scan" button.
+- **Integrate "Resume last scan"** as a subtle secondary card or link in the volumes area.
+- **On start page:** toolbar shows only "Open Directory..." (disk stats live on the cards).
+- **On results pages:** toolbar adds "Re-scan" + view mode tabs; disk stats move to status bar.
+
+### Implementation
+
+- Phase 1: Clickable cards + remove duplicate button (DIS-110)
+- Phase 2: Toolbar declutter + status bar migration (DIS-111)
+- Phase 3: Polish — recent scans list, drag-and-drop, keyboard hints
+
 ## Scope for initial integration
 
 Start with `~/git` as the default scan target for fast iteration:

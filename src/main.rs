@@ -11,7 +11,7 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -209,6 +209,11 @@ struct App {
     screenshot_state: ScreenshotState,
     /// Number of screenshots saved (for tracking completion).
     screenshots_saved: u8,
+    /// Background deletion state.
+    deleting: bool,
+    delete_progress: Arc<AtomicUsize>,
+    delete_total: usize,
+    delete_receiver: Option<mpsc::Receiver<Vec<(PathBuf, Option<String>)>>>,
 }
 
 impl Default for App {
@@ -256,6 +261,10 @@ impl Default for App {
             screenshot_prefix: None,
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
+            deleting: false,
+            delete_progress: Arc::new(AtomicUsize::new(0)),
+            delete_total: 0,
+            delete_receiver: None,
         }
     }
 }
@@ -320,49 +329,73 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let mut any_trashed = false;
-        for path in paths {
-            if let Err(e) = trash::delete(&path) {
-                self.error = Some(format!("Trash failed: {e}"));
-                break;
-            } else {
-                any_trashed = true;
-                if let Some(ref mut tree) = self.tree {
-                    ui::remove_node(tree, &path);
-                    self.visible_paths_dirty = true;
-                }
-            }
-        }
-        if any_trashed {
-            self.refresh_disk_info();
-        }
+        self.start_background_delete(paths, true);
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let mut any_deleted = false;
-        for path in paths {
-            let result = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            match result {
-                Ok(()) => {
-                    any_deleted = true;
-                    if let Some(ref mut tree) = self.tree {
-                        ui::remove_node(tree, &path);
-                        self.visible_paths_dirty = true;
+        self.start_background_delete(paths, false);
+    }
+
+    /// Spawn deletion on a background thread so the UI stays responsive.
+    fn start_background_delete(&mut self, paths: Vec<PathBuf>, use_trash: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        let total = paths.len();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress_clone = Arc::clone(&progress);
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            // Collect results: (path, error_or_none)
+            let mut results: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(total);
+            for path in paths {
+                let result = if use_trash {
+                    trash::delete(&path).map_err(|e| e.to_string())
+                } else if path.is_dir() {
+                    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+                } else {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())
+                };
+                let err = result.err();
+                results.push((path, err));
+                progress_clone.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = tx.send(results);
+        });
+
+        self.deleting = true;
+        self.delete_progress = progress;
+        self.delete_total = total;
+        self.delete_receiver = Some(rx);
+    }
+
+    /// Poll for background deletion completion and apply results to the tree.
+    fn poll_delete_completion(&mut self) {
+        if !self.deleting {
+            return;
+        }
+        if let Some(ref rx) = self.delete_receiver {
+            if let Ok(results) = rx.try_recv() {
+                let mut any_deleted = false;
+                for (path, err) in results {
+                    if let Some(msg) = err {
+                        self.error = Some(format!("Delete failed: {msg}"));
+                    } else {
+                        any_deleted = true;
+                        if let Some(ref mut tree) = self.tree {
+                            ui::remove_node(tree, &path);
+                            self.visible_paths_dirty = true;
+                        }
                     }
                 }
-                Err(e) => {
-                    self.error = Some(format!("Delete failed: {e}"));
-                    break;
+                if any_deleted {
+                    self.refresh_disk_info();
                 }
+                self.deleting = false;
+                self.delete_receiver = None;
             }
-        }
-        if any_deleted {
-            self.refresh_disk_info();
         }
     }
 
@@ -453,6 +486,12 @@ impl eframe::App for App {
                     ft.clear();
                 }
             }
+        }
+
+        // Check if background deletion completed
+        self.poll_delete_completion();
+        if self.deleting {
+            ctx.request_repaint();
         }
 
         // ── Screenshot state machine ──
@@ -1493,6 +1532,47 @@ impl eframe::App for App {
                                 if ui.small_button("×").on_hover_text("Clear selection").clicked() {
                                     self.selected_paths.clear();
                                 }
+                            });
+                        });
+                });
+        }
+
+        // Deletion progress overlay
+        if self.deleting {
+            let done = self.delete_progress.load(Ordering::Relaxed);
+            let total = self.delete_total;
+            let fraction = if total > 0 {
+                done as f32 / total as f32
+            } else {
+                0.0
+            };
+            egui::Area::new(egui::Id::new("delete_progress_float"))
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
+                .interactable(false)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .corner_radius(8.0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 2],
+                            blur: 8,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(60),
+                        })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Deleting {done}/{total}..."
+                                    ))
+                                    .strong(),
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(fraction)
+                                        .desired_width(200.0),
+                                );
                             });
                         });
                 });

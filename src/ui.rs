@@ -62,10 +62,13 @@ pub enum TreeAction {
     Click {
         path: PathBuf,
         shift: bool,
+        toggle: bool,
     },
     Focus(PathBuf),
     Trash(PathBuf),
+    TrashSelected,
     ConfirmDelete(PathBuf),
+    ConfirmDeleteSelected,
     RevealInFinder(PathBuf),
     CopyPath(PathBuf),
 }
@@ -173,10 +176,9 @@ pub fn render_tree(
     let row_height = 20.0_f32;
     let mut actions = Vec::new();
 
-    let focused_idx =
-        focused_path
-            .as_ref()
-            .and_then(|fp| rows.iter().position(|r| r.path == *fp));
+    let focused_idx = focused_path
+        .as_ref()
+        .and_then(|fp| rows.iter().position(|r| r.path == *fp));
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
@@ -187,13 +189,14 @@ pub fn render_tree(
         if let Some(idx) = focused_idx {
             let target_y = idx as f32 * row_total;
             let viewport_h = ui.available_height();
-            scroll_area = scroll_area.vertical_scroll_offset(
-                (target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0),
-            );
+            scroll_area = scroll_area
+                .vertical_scroll_offset((target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0));
         }
     }
 
     scroll_area.show_rows(ui, row_height, total_rows, |ui, range| {
+        // Prevent shift+click from selecting label text (OS text highlight).
+        ui.style_mut().interaction.selectable_labels = false;
         let full_width = ui.max_rect();
         for i in range {
             let row = &rows[i];
@@ -228,7 +231,11 @@ pub fn render_tree(
 
                 // Icon
                 if let Some(icons) = icon_cache {
-                    let tex = if row.is_dir { &icons.folder } else { &icons.file };
+                    let tex = if row.is_dir {
+                        &icons.folder
+                    } else {
+                        &icons.file
+                    };
                     ui.image(egui::load::SizedTexture::new(
                         tex.id(),
                         egui::vec2(16.0, 16.0),
@@ -249,18 +256,18 @@ pub fn render_tree(
                 let text_margin = 8.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
-                let font_id = egui::FontId::monospace(
-                    ui.style().text_styles[&egui::TextStyle::Body].size,
-                );
-                let text_galley = painter.layout_no_wrap(
-                    size_text,
-                    font_id,
-                    ui.visuals().text_color(),
-                );
+                let font_id =
+                    egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
+                let text_galley =
+                    painter.layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
                 let text_x = row_max.right() - text_margin - text_width;
                 let text_y = row_max.center().y - text_galley.size().y / 2.0;
-                painter.galley(egui::pos2(text_x, text_y), text_galley, ui.visuals().text_color());
+                painter.galley(
+                    egui::pos2(text_x, text_y),
+                    text_galley,
+                    ui.visuals().text_color(),
+                );
 
                 let bar_gap = 4.0_f32;
                 let bar_x = text_x - bar_gap - bar_width;
@@ -271,8 +278,7 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect =
-                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
@@ -286,9 +292,16 @@ pub fn render_tree(
 
             // Single row interaction — toggle vs click determined by pointer position
             let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
-            let row_interact =
-                ui.interact(row_rect, row_id, egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
+
+            // Use PointingHand only when hovering over the disclosure triangle area
+            if row_interact.hovered() {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    if row.is_dir && pos.x <= toggle_right {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
@@ -297,40 +310,94 @@ pub fn render_tree(
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
                     } else {
                         // Click on content area → select/focus
-                        let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+                        let (shift, toggle) =
+                            ui.input(|i| (i.modifiers.shift, i.modifiers.command));
                         actions.push(TreeAction::Click {
                             path: row.path.clone(),
                             shift,
+                            toggle,
                         });
                         actions.push(TreeAction::Focus(row.path.clone()));
                     }
                 }
             }
 
+            // Right-click: select the row before showing context menu
+            // (preserve existing multi-selection if right-clicked row is already selected)
+            if row_interact.secondary_clicked() {
+                let already_selected = selected_paths.contains(&row.path);
+                if !already_selected {
+                    actions.push(TreeAction::Click {
+                        path: row.path.clone(),
+                        shift: false,
+                        toggle: false,
+                    });
+                }
+                actions.push(TreeAction::Focus(row.path.clone()));
+            }
+
             // Right-click context menu
             let ctx_path = row.path.clone();
+            let selection_count = if selected_paths.contains(&row.path) {
+                selected_paths.len()
+            } else {
+                1
+            };
             row_interact.context_menu(|ui| {
-                if ui.button("Open in Finder").clicked() {
-                    actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
-                    ui.close();
-                }
-                if ui.button("Copy Path").clicked() {
-                    actions.push(TreeAction::CopyPath(ctx_path.clone()));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Move to Trash").clicked() {
-                    actions.push(TreeAction::Trash(ctx_path.clone()));
-                    ui.close();
-                }
-                if ui
-                    .button(egui::RichText::new("Delete Permanently").color(egui::Color32::RED))
-                    .clicked()
-                {
-                    actions.push(TreeAction::ConfirmDelete(ctx_path.clone()));
-                    ui.close();
+                if selection_count > 1 {
+                    // Multi-select context menu
+                    ui.label(
+                        egui::RichText::new(format!("{selection_count} items selected"))
+                            .weak()
+                            .size(12.0),
+                    );
+                    ui.separator();
+                    if ui
+                        .button(format!("Move {selection_count} Items to Trash"))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::TrashSelected);
+                        ui.close();
+                    }
+                    if ui
+                        .button(
+                            egui::RichText::new(format!(
+                                "Delete {selection_count} Items Permanently"
+                            ))
+                            .color(egui::Color32::RED),
+                        )
+                        .clicked()
+                    {
+                        actions.push(TreeAction::ConfirmDeleteSelected);
+                        ui.close();
+                    }
+                } else {
+                    // Single-item context menu
+                    if ui.button("Open in Finder").clicked() {
+                        actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Copy Path").clicked() {
+                        actions.push(TreeAction::CopyPath(ctx_path.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Move to Trash").clicked() {
+                        actions.push(TreeAction::Trash(ctx_path.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .button(egui::RichText::new("Delete Permanently").color(egui::Color32::RED))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::ConfirmDelete(ctx_path.clone()));
+                        ui.close();
+                    }
                 }
             });
+
+            // Capture hover state before on_hover_ui consumes row_interact
+            let is_hovered = row_interact.hovered();
 
             // Tooltip (lazy via closure — avoids format! allocation unless hovered)
             if row.is_dir {
@@ -353,17 +420,25 @@ pub fn render_tree(
                 });
             }
 
-            // Focus/selection background — both use blue selection color
+            // Focus/selection/hover background
             let is_selected = selected_paths.contains(&row.path);
-            if is_selected || is_focused {
-                let bg_color = if is_selected {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.3)
+            if is_selected || is_focused || is_hovered {
+                let bg_color = if is_selected && is_focused {
+                    // Selected + focused: strongest highlight
+                    ui.visuals().selection.bg_fill.linear_multiply(0.5)
+                } else if is_selected {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.35)
+                } else if is_focused {
+                    ui.visuals().selection.bg_fill.linear_multiply(0.2)
                 } else {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.4)
+                    // Hover only
+                    ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3)
                 };
+                let spacing_half = ui.spacing().item_spacing.y / 2.0;
+                let y = row_rect.y_range();
                 let highlight_rect = egui::Rect::from_x_y_ranges(
                     full_width.x_range(),
-                    row_rect.y_range(),
+                    (y.min - spacing_half)..=(y.max + spacing_half),
                 );
                 ui.painter().set(
                     bg_idx,
@@ -413,7 +488,11 @@ fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> O
     // Check direct children
     let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
         let child_path = buf.join(c.name());
-        if child_path == target { Some(i) } else { None }
+        if child_path == target {
+            Some(i)
+        } else {
+            None
+        }
     });
 
     if let Some(pos) = found_pos {
@@ -477,7 +556,14 @@ fn collect_visible_paths_inner(
     if show_children {
         for child in node.children() {
             current_path.push(child.name());
-            collect_visible_paths_inner(child, current_path, filter, category_filter, show_hidden, result);
+            collect_visible_paths_inner(
+                child,
+                current_path,
+                filter,
+                category_filter,
+                show_hidden,
+                result,
+            );
             current_path.pop();
         }
     }
@@ -513,7 +599,11 @@ pub fn find_node_info(node: &FileNode, target: &Path) -> Option<(bool, bool, boo
     find_node_info_inner(node, target, &mut buf)
 }
 
-fn find_node_info_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<(bool, bool, bool)> {
+fn find_node_info_inner(
+    node: &FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+) -> Option<(bool, bool, bool)> {
     if buf.as_path() == target {
         return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
     }
@@ -534,7 +624,12 @@ pub fn set_expanded(node: &mut FileNode, target: &Path, expanded: bool) -> bool 
     set_expanded_inner(node, target, expanded, &mut buf)
 }
 
-fn set_expanded_inner(node: &mut FileNode, target: &Path, expanded: bool, buf: &mut PathBuf) -> bool {
+fn set_expanded_inner(
+    node: &mut FileNode,
+    target: &Path,
+    expanded: bool,
+    buf: &mut PathBuf,
+) -> bool {
     if buf.as_path() == target {
         node.set_expanded(expanded);
         return true;

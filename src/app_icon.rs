@@ -7,11 +7,11 @@ const INNER_R: f64 = OUTER_R * 0.38;
 
 // Pie segments: (fraction of circle, r, g, b)
 const SEGMENTS: &[(f64, u8, u8, u8)] = &[
-    (0.35, 52, 152, 219),  // blue — large files
-    (0.25, 46, 204, 113),  // green — code
-    (0.18, 155, 89, 182),  // purple — media
-    (0.12, 241, 196, 15),  // yellow — documents
-    (0.10, 231, 76, 60),   // red — archives
+    (0.35, 52, 152, 219), // blue — large files
+    (0.25, 46, 204, 113), // green — code
+    (0.18, 155, 89, 182), // purple — media
+    (0.12, 241, 196, 15), // yellow — documents
+    (0.10, 231, 76, 60),  // red — archives
 ];
 
 pub fn generate() -> IconData {
@@ -33,7 +33,7 @@ pub fn generate() -> IconData {
 
             let idx = ((y * SIZE + x) * 4) as usize;
 
-            if dist <= OUTER_R && dist >= INNER_R {
+            if (INNER_R..=OUTER_R).contains(&dist) {
                 let angle = dy.atan2(dx);
 
                 // Find which segment this pixel belongs to

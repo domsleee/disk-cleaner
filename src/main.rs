@@ -339,7 +339,7 @@ impl App {
 
     /// Spawn deletion on a background thread so the UI stays responsive.
     fn start_background_delete(&mut self, paths: Vec<PathBuf>, use_trash: bool) {
-        if paths.is_empty() {
+        if paths.is_empty() || self.deleting {
             return;
         }
         let total = paths.len();

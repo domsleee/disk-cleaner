@@ -233,13 +233,12 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                                             ));
                                         }
 
-                                        // Path (truncated)
+                                        // Path (truncated at char boundary)
                                         let display_path = item.path.display().to_string();
-                                        let truncated = if display_path.len() > 60 {
-                                            format!(
-                                                "...{}",
-                                                &display_path[display_path.len() - 57..]
-                                            )
+                                        let truncated = if display_path.chars().count() > 60 {
+                                            let tail: String =
+                                                display_path.chars().rev().take(57).collect::<Vec<_>>().into_iter().rev().collect();
+                                            format!("...{tail}")
                                         } else {
                                             display_path
                                         };

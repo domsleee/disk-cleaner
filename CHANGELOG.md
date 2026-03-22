@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0.0] - 2026-03-23
+## [0.1.1.0] - 2026-03-23
 
 ### Added
 - Smart Cleanup Suggestions view with 6 categories: build artifacts, package caches, system caches, IDE artifacts, temp/log files, and old installers
@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - Auto-expand of large directories after scan
 - Hidden files toggle (persisted in config)
 - Performance benchmarks (tree operations, startup time, frame-time profiling)
+- CLAUDE.md project guide and TODOS.md for deferred cross-platform work
 
 ### Fixed
 - APFS double-counting when scanning root volume on macOS
@@ -29,3 +30,5 @@ All notable changes to this project will be documented in this file.
 - Consistent toolbar widget height and proportional fonts
 - Unicode rendering issues in keyboard hints and close buttons
 - Multi-select row gap elimination
+- UTF-8 path truncation panic in suggestions view on non-ASCII directory names
+- Concurrent background deletion guard preventing orphaned threads on double-click

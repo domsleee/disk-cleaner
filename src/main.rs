@@ -637,6 +637,7 @@ impl eframe::App for App {
 
         if self.confirm_batch_delete {
             let selected_count = self.selected_paths.len();
+            let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
             egui::Window::new("Confirm Batch Delete")
                 .collapsible(false)
                 .resizable(false)
@@ -647,7 +648,12 @@ impl eframe::App for App {
                         selected_count
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button("Yes, delete all").clicked() {
+                        let delete_btn = egui::Button::new(
+                            egui::RichText::new("Yes, delete all")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(220, 50, 50));
+                        if ui.add(delete_btn).clicked() || enter_pressed {
                             do_batch_delete = true;
                             close_batch_dialog = true;
                         }
@@ -671,6 +677,7 @@ impl eframe::App for App {
         let mut close_dialog = false;
 
         if let Some(ref path) = self.confirm_delete {
+            let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
                 .resizable(false)
@@ -678,7 +685,12 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label(format!("Permanently delete?\n{}", path.display()));
                     ui.horizontal(|ui| {
-                        if ui.button("Yes, delete").clicked() {
+                        let delete_btn = egui::Button::new(
+                            egui::RichText::new("Yes, delete")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(220, 50, 50));
+                        if ui.add(delete_btn).clicked() || enter_pressed {
                             do_delete = Some(path.clone());
                             close_dialog = true;
                         }

@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Disk Cleaner — Fast Native Disk Usage Analyzer</title>
+<meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --bg-card: #16213e;
+    --bg-hero: #0f3460;
+    --accent: #e94560;
+    --accent-light: #ff6b81;
+    --text: #eaeaea;
+    --text-muted: #a0a0b0;
+    --border: #2a2a4a;
+    --radius: 12px;
+    --max-width: 1100px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent-light); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Hero */
+  .hero {
+    text-align: center;
+    padding: 80px 24px 60px;
+    background: linear-gradient(180deg, var(--bg-hero) 0%, var(--bg) 100%);
+  }
+  .hero h1 {
+    font-size: 3rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 12px;
+  }
+  .hero .tagline {
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    max-width: 600px;
+    margin: 0 auto 32px;
+  }
+  .hero .badges {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 40px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    background: rgba(233, 69, 96, 0.15);
+    color: var(--accent-light);
+    border: 1px solid rgba(233, 69, 96, 0.3);
+  }
+  .hero-screenshot {
+    max-width: min(900px, 90vw);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    margin: 0 auto;
+    display: block;
+  }
+
+  /* Sections */
+  section {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 80px 24px;
+  }
+  section h2 {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+  section .subtitle {
+    text-align: center;
+    color: var(--text-muted);
+    margin-bottom: 48px;
+    font-size: 1.1rem;
+  }
+
+  /* Features */
+  .features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 24px;
+  }
+  .feature-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+  }
+  .feature-card .icon {
+    font-size: 1.6rem;
+    margin-bottom: 12px;
+    display: block;
+  }
+  .feature-card h3 {
+    font-size: 1.1rem;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .feature-card p {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+  }
+
+  /* Screenshots */
+  .screenshots-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    gap: 32px;
+  }
+  .screenshot-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .screenshot-card img {
+    width: 100%;
+    display: block;
+  }
+  .screenshot-card .caption {
+    padding: 16px 20px;
+    font-size: 0.95rem;
+    color: var(--text-muted);
+  }
+  .screenshot-card .caption strong {
+    color: var(--text);
+  }
+
+  /* Install */
+  .install-section {
+    text-align: center;
+  }
+  .install-section pre {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 28px;
+    font-size: 0.95rem;
+    text-align: left;
+    max-width: 500px;
+    margin: 0 auto;
+    overflow-x: auto;
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  }
+  .install-section pre .comment { color: #6a6a8a; }
+  .install-section pre .cmd { color: var(--accent-light); }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 40px 24px;
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+  footer a { color: var(--text-muted); }
+  footer a:hover { color: var(--text); }
+
+  /* Responsive */
+  @media (max-width: 600px) {
+    .hero h1 { font-size: 2rem; }
+    .hero .tagline { font-size: 1rem; }
+    .screenshots-grid { grid-template-columns: 1fr; }
+    section { padding: 48px 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Disk Cleaner</h1>
+  <p class="tagline">A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.</p>
+  <div class="badges">
+    <span class="badge">Rust</span>
+    <span class="badge">Native GUI</span>
+    <span class="badge">Parallel Scanning</span>
+    <span class="badge">MIT License</span>
+  </div>
+  <img src="screenshot_scan.png" alt="Disk Cleaner scan results showing file tree sorted by size" class="hero-screenshot">
+</div>
+
+<section>
+  <h2>Features</h2>
+  <p class="subtitle">Everything you need to find and reclaim wasted disk space.</p>
+  <div class="features-grid">
+    <div class="feature-card">
+      <span class="icon">&#9889;</span>
+      <h3>Parallel Scanning</h3>
+      <p>Multi-threaded directory traversal powered by rayon. Scans hundreds of thousands of files in seconds.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128202;</span>
+      <h3>Tree View</h3>
+      <p>Browse your file system sorted by size with proportional bars. Instantly see what's eating your disk.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#127912;</span>
+      <h3>Treemap Visualization</h3>
+      <p>Interactive squarified treemap shows disk usage at a glance. Click to drill into any directory.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128161;</span>
+      <h3>Smart Suggestions</h3>
+      <p>Automatically identifies build artifacts, caches, and other safely deletable files with one-click cleanup.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128465;</span>
+      <h3>Safe Deletion</h3>
+      <p>Move files to Trash or delete permanently. Batch operations for cleaning up multiple items at once.</p>
+    </div>
+    <div class="feature-card">
+      <span class="icon">&#128270;</span>
+      <h3>Filter &amp; Search</h3>
+      <p>Filter by file name or type. Category sidebar breaks down space by archives, images, documents, and more.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Screenshots</h2>
+  <p class="subtitle">See Disk Cleaner in action.</p>
+  <div class="screenshots-grid">
+    <div class="screenshot-card">
+      <img src="screenshot.png" alt="Home screen showing volume selection" loading="lazy">
+      <div class="caption"><strong>Home Screen</strong> &mdash; Pick a volume or open a directory to scan. See disk usage at a glance.</div>
+    </div>
+    <div class="screenshot-card">
+      <img src="screenshot_scan.png" alt="Scan results with file tree" loading="lazy">
+      <div class="caption"><strong>Scan Results</strong> &mdash; File tree sorted by size with colored bars showing relative usage.</div>
+    </div>
+    <div class="screenshot-card">
+      <img src="screenshot_tree_full.png" alt="Full tree view with file type sidebar" loading="lazy">
+      <div class="caption"><strong>Full Tree View</strong> &mdash; Expanded tree with file type categories and treemap visualization.</div>
+    </div>
+    <div class="screenshot-card">
+      <img src="screenshot_suggestions.png" alt="Smart cleanup suggestions" loading="lazy">
+      <div class="caption"><strong>Smart Suggestions</strong> &mdash; Automatically finds build artifacts and caches you can safely remove.</div>
+    </div>
+  </div>
+</section>
+
+<section class="install-section">
+  <h2>Install</h2>
+  <p class="subtitle">Requires Rust 1.70+. Clone and build from source.</p>
+  <pre><span class="comment"># Clone the repository</span>
+<span class="cmd">git clone</span> https://github.com/domsleee/disk-cleaner.git
+<span class="cmd">cd</span> disk-cleaner
+
+<span class="comment"># Build and run</span>
+<span class="cmd">cargo run</span> --release</pre>
+</section>
+
+<footer>
+  <p>Disk Cleaner is open source under the <strong>MIT License</strong>.</p>
+  <p style="margin-top: 8px;">
+    <a href="https://github.com/domsleee/disk-cleaner">GitHub</a>
+  </p>
+</footer>
+
+</body>
+</html>

@@ -37,6 +37,10 @@ harness = false
 name = "tree_ops"
 harness = false
 
+[[bench]]
+name = "view_bench"
+harness = false
+
 [profile.release]
 lto = true
 strip = true

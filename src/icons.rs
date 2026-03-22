@@ -116,13 +116,14 @@ mod macos {
 
         let folder_image =
             egui::ColorImage::from_rgba_unmultiplied([ICON_PX, ICON_PX], &folder_pixels);
-        let file_image =
-            egui::ColorImage::from_rgba_unmultiplied([ICON_PX, ICON_PX], &file_pixels);
+        let file_image = egui::ColorImage::from_rgba_unmultiplied([ICON_PX, ICON_PX], &file_pixels);
 
-        let folder_tex =
-            ctx.load_texture("sys_folder_icon", folder_image, egui::TextureOptions::LINEAR);
-        let file_tex =
-            ctx.load_texture("sys_file_icon", file_image, egui::TextureOptions::LINEAR);
+        let folder_tex = ctx.load_texture(
+            "sys_folder_icon",
+            folder_image,
+            egui::TextureOptions::LINEAR,
+        );
+        let file_tex = ctx.load_texture("sys_file_icon", file_image, egui::TextureOptions::LINEAR);
 
         Some(IconCache {
             folder: folder_tex,

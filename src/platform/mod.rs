@@ -13,6 +13,8 @@ use std::path::PathBuf;
 pub struct VolumeInfo {
     pub name: String,
     pub path: PathBuf,
+    /// Cached canonical path for fast comparison (avoids repeated realpath syscalls).
+    pub canonical_path: Option<PathBuf>,
     pub total_bytes: u64,
     pub available_bytes: u64,
 }

@@ -8,6 +8,7 @@ fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        cancelled: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -100,6 +101,20 @@ fn bench_scan_home_git(c: &mut Criterion) {
     }
 }
 
+/// Benchmark list_volumes (platform I/O)
+fn bench_list_volumes(c: &mut Criterion) {
+    c.bench_function("list_volumes", |b| {
+        b.iter(|| scanner::list_volumes())
+    });
+}
+
+/// Benchmark build_skip_set from root
+fn bench_build_skip_set(c: &mut Criterion) {
+    c.bench_function("build_skip_set_root", |b| {
+        b.iter(|| disk_cleaner::platform::build_skip_set(std::path::Path::new("/")))
+    });
+}
+
 criterion_group!(
     benches,
     bench_scan_synthetic,
@@ -107,5 +122,7 @@ criterion_group!(
     bench_scan_large_synthetic,
     bench_scan_self,
     bench_scan_home_git,
+    bench_list_volumes,
+    bench_build_skip_set,
 );
 criterion_main!(benches);

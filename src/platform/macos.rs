@@ -27,9 +27,11 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
 
     // Root filesystem
-    if let Some((total, available)) = disk_space(Path::new("/")) {
+    let root = Path::new("/");
+    if let Some((total, available)) = disk_space(root) {
         volumes.push(VolumeInfo {
             name: "Macintosh HD".to_string(),
+            canonical_path: root.canonicalize().ok(),
             path: PathBuf::from("/"),
             total_bytes: total,
             available_bytes: available,
@@ -41,14 +43,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
         for entry in entries.flatten() {
             let path = entry.path();
 
-            // Skip the root volume alias (symlink to /)
-            if let Ok(target) = std::fs::read_link(&path) {
-                if target == Path::new("/") {
-                    continue;
-                }
-            }
-
-            // Skip if it resolves to root
+            // Skip if it resolves to root (covers both symlinks and firmlinks)
             if let Ok(canonical) = std::fs::canonicalize(&path) {
                 if canonical == Path::new("/") {
                     continue;
@@ -62,8 +57,10 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
                     .unwrap_or_else(|| path.display().to_string());
 
                 if let Some((total, available)) = disk_space(&path) {
+                    let canonical_path = path.canonicalize().ok();
                     volumes.push(VolumeInfo {
                         name,
+                        canonical_path,
                         path,
                         total_bytes: total,
                         available_bytes: available,
@@ -93,6 +90,8 @@ pub fn build_skip_set(root: &Path) -> HashSet<PathBuf> {
         skip.insert(data_vol.to_path_buf());
 
         // Also skip other APFS sub-volume mounts that inflate size
+        // Insert unconditionally — non-existent paths in the skip set
+        // cost nothing (no directory entry will ever match them).
         for sub in &[
             "Preboot",
             "Recovery",
@@ -107,7 +106,7 @@ pub fn build_skip_set(root: &Path) -> HashSet<PathBuf> {
             "Hardware",
         ] {
             let p = Path::new("/System/Volumes").join(sub);
-            if p.exists() && !root.starts_with(&p) {
+            if !root.starts_with(&p) {
                 skip.insert(p);
             }
         }

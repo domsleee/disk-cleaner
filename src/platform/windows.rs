@@ -95,8 +95,10 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             format!("Local Disk ({}:)", letter)
         };
 
+        let canonical_path = path.canonicalize().ok();
         volumes.push(VolumeInfo {
             name: label,
+            canonical_path,
             path,
             total_bytes: total,
             available_bytes: available,

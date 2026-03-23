@@ -69,21 +69,12 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
             let path = entry.path();
 
             if ft.is_dir() {
+                // Note: on Windows, ft.is_dir() already returns false for
+                // NTFS junctions and symlink directories (Rust checks
+                // !is_symlink && is_directory using cached WIN32_FIND_DATA).
+                // No extra metadata() syscall needed.
                 if skip.contains(&path) {
                     return None;
-                }
-                // On Windows, skip NTFS reparse points (junctions, symlinks)
-                // to avoid double-counting or infinite loops — same class of
-                // issue as APFS firmlink dedup on macOS.
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    if let Ok(meta) = entry.metadata() {
-                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                            return None;
-                        }
-                    }
                 }
                 Some(walk_dir(&path, progress, skip))
             } else if ft.is_file() {

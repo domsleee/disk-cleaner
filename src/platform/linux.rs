@@ -94,8 +94,10 @@ pub(crate) fn parse_mounts(content: &str) -> Vec<VolumeInfo> {
                     }
                 });
 
+            let canonical_path = path.canonicalize().ok();
             volumes.push(VolumeInfo {
                 name,
+                canonical_path,
                 path,
                 total_bytes: total,
                 available_bytes: available,
@@ -128,13 +130,11 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 pub fn build_skip_set(root: &Path) -> HashSet<PathBuf> {
     let mut skip = HashSet::new();
 
-    // When scanning from root, skip well-known virtual/system directories
+    // When scanning from root, skip well-known virtual/system directories.
+    // Insert unconditionally — non-existent paths in the skip set cost nothing.
     if root == Path::new("/") {
         for dir in &["/proc", "/sys", "/dev", "/run", "/snap"] {
-            let p = PathBuf::from(dir);
-            if p.exists() {
-                skip.insert(p);
-            }
+            skip.insert(PathBuf::from(dir));
         }
     }
 

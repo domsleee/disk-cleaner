@@ -181,6 +181,8 @@ struct App {
     treemap_zoom_anim: Option<f64>,
     volumes: Vec<scanner::VolumeInfo>,
     volumes_last_refresh: Option<std::time::Instant>,
+    /// Receiver for background volume refresh (avoids blocking UI thread).
+    volumes_receiver: Option<mpsc::Receiver<Vec<scanner::VolumeInfo>>>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
     scan_is_volume: bool,               // true when scanning a volume root
     category_filter: Option<categories::FileCategory>,
@@ -241,8 +243,9 @@ impl Default for App {
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
-            volumes: scanner::list_volumes(),
-            volumes_last_refresh: Some(std::time::Instant::now()),
+            volumes: Vec::new(),
+            volumes_last_refresh: None,
+            volumes_receiver: None,
             scan_disk_info: None,
             scan_is_volume: false,
             category_filter: None,
@@ -294,10 +297,9 @@ impl App {
         self.scan_disk_info = scanner::disk_space(&path);
         self.scan_is_volume = path.canonicalize().ok().map_or(false, |canon_path| {
             self.volumes.iter().any(|v| {
-                v.path
-                    .canonicalize()
-                    .ok()
-                    .map_or(false, |canon_vol| canon_vol == canon_path)
+                v.canonical_path
+                    .as_ref()
+                    .map_or(false, |canon_vol| *canon_vol == canon_path)
             })
         });
 
@@ -1192,13 +1194,25 @@ impl eframe::App for App {
             }
 
             if self.tree.is_none() {
-                // Refresh volume list every 5 seconds
+                // Check for completed background volume refresh
+                if let Some(ref rx) = self.volumes_receiver {
+                    if let Ok(vols) = rx.try_recv() {
+                        self.volumes = vols;
+                        self.volumes_receiver = None;
+                    }
+                }
+
+                // Kick off background volume refresh every 5 seconds
                 let should_refresh = self
                     .volumes_last_refresh
                     .is_none_or(|t| t.elapsed().as_secs() >= 5);
-                if should_refresh {
-                    self.volumes = scanner::list_volumes();
+                if should_refresh && self.volumes_receiver.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    self.volumes_receiver = Some(rx);
                     self.volumes_last_refresh = Some(std::time::Instant::now());
+                    thread::spawn(move || {
+                        let _ = tx.send(scanner::list_volumes());
+                    });
                 }
 
                 ui.vertical_centered(|ui| {

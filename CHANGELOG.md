@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2.0] - 2026-03-23
+
+### Added
+- Cross-platform support: macOS, Linux, and Windows from a single codebase
+- Platform module (`src/platform/`) with `macos.rs`, `linux.rs`, `windows.rs` implementations
+- Linux volume detection via `/proc/mounts` parsing with virtual filesystem denylist
+- Windows volume enumeration via `GetLogicalDrives` and `GetVolumeInformationW`
+- Windows disk space via `GetDiskFreeSpaceExW`
+- NTFS reparse point (junction/symlink) skipping to prevent double-counting on Windows
+- Linux skip set for `/proc`, `/sys`, `/dev`, `/run`, `/snap` when scanning from root
+- Windows skip set for `$Recycle.Bin` and `System Volume Information` on drive roots
+- Fallback stub for unsupported platforms (FreeBSD, Android, etc.) — graceful compile
+- 3-platform CI workflow (macOS, Linux with apt deps, Windows)
+- 11 new platform-specific unit tests
+
+### Changed
+- Extracted platform code from `scanner.rs` and `icons.rs` into `src/platform/` modules
+- `libc` dependency moved to `cfg(unix)` (no longer pulled on Windows)
+- Added `windows-sys` conditional dependency for Windows builds
+- `scan_is_volume` now uses `canonicalize()` for correct path comparison across symlinks/firmlinks
+
+### Fixed
+- Operator precedence bug in Windows `is_drive_root` check (would incorrectly treat paths ending in `:` as drive roots)
+
 ## [0.1.1.0] - 2026-03-23
 
 ### Added

@@ -1,6 +1,7 @@
 pub mod app_icon;
 pub mod categories;
 pub mod icons;
+pub mod platform;
 pub mod scanner;
 pub mod suggestions;
 pub mod suggestions_ui;

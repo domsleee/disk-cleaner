@@ -11,14 +11,19 @@ trash = "5"
 rfd = "0.17"
 dirs = "6"
 serde_json = "1"
-libc = "0.2"
 rayon = "1.11.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSData"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

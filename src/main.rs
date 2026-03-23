@@ -1,6 +1,7 @@
 mod app_icon;
 mod categories;
 mod icons;
+mod platform;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -291,7 +292,14 @@ impl App {
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
         self.scan_disk_info = scanner::disk_space(&path);
-        self.scan_is_volume = self.volumes.iter().any(|v| v.path == path);
+        self.scan_is_volume = path.canonicalize().ok().map_or(false, |canon_path| {
+            self.volumes.iter().any(|v| {
+                v.path
+                    .canonicalize()
+                    .ok()
+                    .map_or(false, |canon_vol| canon_vol == canon_path)
+            })
+        });
 
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),

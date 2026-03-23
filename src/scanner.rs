@@ -8,91 +8,9 @@ use rayon::prelude::ParallelIterator;
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
 
-/// Information about a mounted volume.
-pub struct VolumeInfo {
-    pub name: String,
-    pub path: PathBuf,
-    pub total_bytes: u64,
-    pub available_bytes: u64,
-}
-
-/// Get total and available bytes for the filesystem containing `path`.
-#[cfg(unix)]
-pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::mem::MaybeUninit;
-
-    let c_path = CString::new(path.to_str()?).ok()?;
-    let mut stat = MaybeUninit::<libc::statvfs>::uninit();
-    let result = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-    if result != 0 {
-        return None;
-    }
-    let stat = unsafe { stat.assume_init() };
-    let block_size = stat.f_frsize;
-    let total = stat.f_blocks as u64 * block_size;
-    let available = stat.f_bavail as u64 * block_size;
-    Some((total, available))
-}
-
-#[cfg(not(unix))]
-pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
-    None
-}
-
-/// List mounted volumes. On macOS, reads `/Volumes/` and includes root `/`.
-pub fn list_volumes() -> Vec<VolumeInfo> {
-    let mut volumes = Vec::new();
-
-    // Root filesystem
-    if let Some((total, available)) = disk_space(Path::new("/")) {
-        volumes.push(VolumeInfo {
-            name: "Macintosh HD".to_string(),
-            path: PathBuf::from("/"),
-            total_bytes: total,
-            available_bytes: available,
-        });
-    }
-
-    // /Volumes entries (excludes self-referencing "Macintosh HD" symlink if present)
-    if let Ok(entries) = std::fs::read_dir("/Volumes") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-
-            // Skip the root volume alias (symlink to /)
-            if let Ok(target) = std::fs::read_link(&path) {
-                if target == Path::new("/") {
-                    continue;
-                }
-            }
-
-            // Skip if it resolves to root
-            if let Ok(canonical) = std::fs::canonicalize(&path) {
-                if canonical == Path::new("/") {
-                    continue;
-                }
-            }
-
-            if path.is_dir() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
-
-                if let Some((total, available)) = disk_space(&path) {
-                    volumes.push(VolumeInfo {
-                        name,
-                        path,
-                        total_bytes: total,
-                        available_bytes: available,
-                    });
-                }
-            }
-        }
-    }
-
-    volumes
-}
+// Re-export platform types and functions so existing callers (main.rs, bins)
+// continue to work via `scanner::list_volumes()`, `scanner::disk_space()`, etc.
+pub use crate::platform::{disk_space, list_volumes, VolumeInfo};
 
 pub struct ScanProgress {
     pub file_count: AtomicU64,
@@ -100,67 +18,8 @@ pub struct ScanProgress {
     pub cancelled: AtomicBool,
 }
 
-/// Build a set of paths to skip during scanning to avoid double-counting.
-/// On macOS APFS, `/System/Volumes/Data` contains the real user data but is also
-/// accessible via firmlinks (e.g. `/Users` → `/System/Volumes/Data/Users`).
-/// Scanning from `/` without skipping Data counts everything twice.
-/// Mount points under `/Volumes/` also cause inflation when scanning root.
-fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
-    let mut skip = HashSet::new();
-
-    #[cfg(target_os = "macos")]
-    {
-        let data_vol = Path::new("/System/Volumes/Data");
-        // Only apply APFS dedup when scanning from a path that isn't under the Data volume
-        if !root.starts_with(data_vol) {
-            // Skip the entire Data volume — all user-visible content is
-            // accessible via firmlinks from the root, so descending into
-            // /System/Volumes/Data would double-count everything.
-            skip.insert(data_vol.to_path_buf());
-
-            // Also skip other APFS sub-volume mounts that inflate size
-            for sub in &[
-                "Preboot",
-                "Recovery",
-                "VM",
-                "Update",
-                "BaseSystem",
-                "FieldService",
-                "FieldServiceDiagnostic",
-                "FieldServiceRepair",
-                "iSCPreboot",
-                "xarts",
-                "Hardware",
-            ] {
-                let p = Path::new("/System/Volumes").join(sub);
-                if p.exists() && !root.starts_with(&p) {
-                    skip.insert(p);
-                }
-            }
-        }
-
-        // Skip mount points under /Volumes/ to avoid counting other drives.
-        // /Volumes/ contains mount points like "Macintosh HD" (root alias) and
-        // "Macintosh HD - Data" (Data volume alias) plus external drives.
-        // When scanning root, traversing these re-counts the same data.
-        if !root.starts_with("/Volumes/") && root != Path::new("/Volumes") {
-            if let Ok(entries) = std::fs::read_dir("/Volumes") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path != root {
-                        skip.insert(path);
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = root; // suppress unused warning on non-macOS
-    Arc::new(skip)
-}
-
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
-    let skip = build_skip_set(root);
+    let skip = Arc::new(crate::platform::build_skip_set(root));
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
@@ -212,6 +71,19 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
             if ft.is_dir() {
                 if skip.contains(&path) {
                     return None;
+                }
+                // On Windows, skip NTFS reparse points (junctions, symlinks)
+                // to avoid double-counting or infinite loops — same class of
+                // issue as APFS firmlink dedup on macOS.
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if let Ok(meta) = entry.metadata() {
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                            return None;
+                        }
+                    }
                 }
                 Some(walk_dir(&path, progress, skip))
             } else if ft.is_file() {

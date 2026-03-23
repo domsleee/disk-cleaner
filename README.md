@@ -1,6 +1,6 @@
 # Disk Cleaner
 
-A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and [egui](https://github.com/emilk/egui).
+A fast, cross-platform desktop app to visualize disk usage and clean up large files. Built with Rust and [egui](https://github.com/emilk/egui). Runs on macOS, Linux, and Windows.
 
 ![Scan results](docs/screenshot_scan.png)
 
@@ -13,7 +13,8 @@ A fast, native desktop app to visualize disk usage and clean up large files. Bui
 - Treemap visualization
 - Trash or delete files directly from the UI
 - Resume previous scans
-- macOS native file icons
+- Cross-platform: macOS, Linux, and Windows
+- macOS native file icons (emoji fallback on Linux/Windows)
 
 ## Screenshots
 

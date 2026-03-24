@@ -315,21 +315,21 @@ fn toggle_expand_reveals_children_in_visible_paths() {
     // Root is already expanded by scanner
 
     // Before expanding folder, inner.txt should not be visible
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", None, true);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
     let inner_path = root.join("folder").join("inner.txt");
     assert!(
-        !paths.contains(&inner_path),
+        !paths.contains(&&inner_path),
         "inner.txt should not be visible when folder is collapsed"
     );
 
     // Expand the folder
     ui::toggle_expand(&mut tree, &root.join("folder"));
 
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", None, true);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
     assert!(
-        paths.contains(&inner_path),
+        paths.contains(&&inner_path),
         "inner.txt should be visible after expanding folder"
     );
 }
@@ -351,16 +351,16 @@ fn category_filter_shows_only_matching_files() {
     // Root is already expanded by scanner
 
     // Filter to videos only
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", Some(FileCategory::Video), true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
 
     let video_path = root.join("video.mp4");
     let code_path = root.join("code.rs");
     let photo_path = root.join("photo.jpg");
 
-    assert!(paths.contains(&video_path));
-    assert!(!paths.contains(&code_path));
-    assert!(!paths.contains(&photo_path));
+    assert!(paths.contains(&&video_path));
+    assert!(!paths.contains(&&code_path));
+    assert!(!paths.contains(&&photo_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -379,16 +379,16 @@ fn hidden_files_excluded_by_default() {
     // Root is already expanded by scanner
 
     // Without show_hidden, .hidden should be excluded
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, false, &mut paths);
-    assert!(!paths.contains(&root.join(".hidden")));
-    assert!(paths.contains(&root.join("visible.txt")));
+    let rows = ui::collect_cached_rows(&tree, "", None, false);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    assert!(!paths.contains(&&root.join(".hidden")));
+    assert!(paths.contains(&&root.join("visible.txt")));
 
     // With show_hidden, both should be visible
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
-    assert!(paths.contains(&root.join(".hidden")));
-    assert!(paths.contains(&root.join("visible.txt")));
+    let rows = ui::collect_cached_rows(&tree, "", None, true);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    assert!(paths.contains(&&root.join(".hidden")));
+    assert!(paths.contains(&&root.join("visible.txt")));
 }
 
 // ---------------------------------------------------------------------------

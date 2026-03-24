@@ -73,30 +73,54 @@ pub enum TreeAction {
     CopyPath(PathBuf),
 }
 
-/// Flattened row data for virtualized rendering.
-/// Path is reconstructed during traversal (owned); name borrows from the tree.
-struct VisibleRow<'a> {
-    path: PathBuf,
-    name: &'a str,
-    size: u64,
-    is_dir: bool,
-    expanded: bool,
-    depth: usize,
-    parent_size: u64,
-    children_count: usize,
-    category: crate::categories::FileCategory,
+/// Cached row data for the visible tree. Rebuilt only when the tree state changes.
+/// Owns all data so it can outlive a single frame.
+pub struct CachedRow {
+    pub path: PathBuf,
+    pub name: Box<str>,
+    pub size: u64,
+    pub is_dir: bool,
+    pub expanded: bool,
+    pub depth: usize,
+    pub parent_size: u64,
+    pub children_count: usize,
+    pub category: crate::categories::FileCategory,
+}
+
+/// Collect all visible rows into owned `CachedRow` structs. This replaces both
+/// `collect_visible_rows` (rendering data) and `collect_visible_paths` (keyboard
+/// nav), producing a single flat list that can be cached across frames.
+pub fn collect_cached_rows(
+    node: &FileNode,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+) -> Vec<CachedRow> {
+    let mut result = Vec::new();
+    let mut path_buf = PathBuf::from(node.name());
+    collect_cached_rows_inner(
+        node,
+        0,
+        node.size(),
+        &mut path_buf,
+        filter,
+        category_filter,
+        show_hidden,
+        &mut result,
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_visible_rows<'a>(
-    node: &'a FileNode,
+fn collect_cached_rows_inner(
+    node: &FileNode,
     depth: usize,
     parent_size: u64,
     current_path: &mut PathBuf,
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    result: &mut Vec<VisibleRow<'a>>,
+    result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.name().starts_with('.') {
         return;
@@ -110,9 +134,9 @@ fn collect_visible_rows<'a>(
         }
     }
 
-    result.push(VisibleRow {
+    result.push(CachedRow {
         path: current_path.clone(),
-        name: node.name(),
+        name: node.name().into(),
         size: node.size(),
         is_dir: node.is_dir(),
         expanded: node.expanded(),
@@ -130,7 +154,7 @@ fn collect_visible_rows<'a>(
     if show_children {
         for child in node.children() {
             current_path.push(child.name());
-            collect_visible_rows(
+            collect_cached_rows_inner(
                 child,
                 depth + 1,
                 node.size(),
@@ -146,32 +170,15 @@ fn collect_visible_rows<'a>(
 }
 
 /// Render the tree view with virtualized scrolling. Returns actions to apply.
-#[allow(clippy::too_many_arguments)]
+/// Accepts pre-built `CachedRow` data so the caller can cache and reuse it.
 pub fn render_tree(
     ui: &mut egui::Ui,
-    tree: &FileNode,
-    root_size: u64,
-    filter: &str,
+    rows: &[CachedRow],
     focused_path: &Option<PathBuf>,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
     icon_cache: Option<&IconCache>,
     scroll_to_focus: bool,
     selected_paths: &HashSet<PathBuf>,
 ) -> Vec<TreeAction> {
-    let mut rows = Vec::new();
-    let mut path_buf = PathBuf::from(tree.name());
-    collect_visible_rows(
-        tree,
-        0,
-        root_size,
-        &mut path_buf,
-        filter,
-        category_filter,
-        show_hidden,
-        &mut rows,
-    );
-
     let total_rows = rows.len();
     let row_height = 20.0_f32;
     let mut actions = Vec::new();
@@ -246,7 +253,7 @@ pub fn render_tree(
                 }
 
                 // Name
-                ui.label(egui::RichText::new(row.name).monospace());
+                ui.label(egui::RichText::new(&*row.name).monospace());
 
                 // Size bar + label (painted at fixed right-edge positions for alignment)
                 let row_max = ui.max_rect();
@@ -518,56 +525,6 @@ fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> O
     None
 }
 
-/// Collect paths of all visible nodes in render order (for keyboard navigation).
-pub fn collect_visible_paths(
-    node: &FileNode,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    result: &mut Vec<PathBuf>,
-) {
-    let mut buf = PathBuf::from(node.name());
-    collect_visible_paths_inner(node, &mut buf, filter, category_filter, show_hidden, result);
-}
-
-fn collect_visible_paths_inner(
-    node: &FileNode,
-    current_path: &mut PathBuf,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    result: &mut Vec<PathBuf>,
-) {
-    if !show_hidden && node.name().starts_with('.') {
-        return;
-    }
-    if !filter.is_empty() && !node_matches(node, filter) {
-        return;
-    }
-    if let Some(cat) = category_filter {
-        if !crate::categories::node_matches_category(node, cat) {
-            return;
-        }
-    }
-
-    result.push(current_path.clone());
-
-    let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
-    if show_children {
-        for child in node.children() {
-            current_path.push(child.name());
-            collect_visible_paths_inner(
-                child,
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                result,
-            );
-            current_path.pop();
-        }
-    }
-}
 
 /// Find the parent path of a node in the tree.
 pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
@@ -715,5 +672,51 @@ mod tests {
         let mut tree = dir("root", vec![leaf("a.txt", 10)]);
         assert_eq!(remove_node(&mut tree, Path::new("nope")), None);
         assert_eq!(tree.size(), 10); // unchanged
+    }
+
+    #[test]
+    fn collect_cached_rows_is_deterministic() {
+        let mut tree = dir(
+            "root",
+            vec![
+                dir("src", vec![leaf("main.rs", 50), leaf("lib.rs", 30)]),
+                leaf("Cargo.toml", 10),
+            ],
+        );
+        // Expand "src" so its children are visible
+        tree.as_dir_mut().unwrap().children[0].set_expanded(true);
+
+        let rows_a = collect_cached_rows(&tree, "", None, true);
+        let rows_b = collect_cached_rows(&tree, "", None, true);
+
+        assert_eq!(rows_a.len(), rows_b.len());
+        for (a, b) in rows_a.iter().zip(rows_b.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(&*a.name, &*b.name);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.is_dir, b.is_dir);
+            assert_eq!(a.expanded, b.expanded);
+            assert_eq!(a.depth, b.depth);
+            assert_eq!(a.parent_size, b.parent_size);
+            assert_eq!(a.children_count, b.children_count);
+        }
+    }
+
+    #[test]
+    fn collect_cached_rows_filters_hidden() {
+        let mut tree = dir(
+            "root",
+            vec![leaf(".hidden", 5), leaf("visible.txt", 10)],
+        );
+        tree.set_expanded(true);
+
+        let rows = collect_cached_rows(&tree, "", None, false);
+        // Root + visible.txt (hidden file excluded)
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&*rows[1].name, "visible.txt");
+
+        let rows_all = collect_cached_rows(&tree, "", None, true);
+        // Root + .hidden + visible.txt
+        assert_eq!(rows_all.len(), 3);
     }
 }

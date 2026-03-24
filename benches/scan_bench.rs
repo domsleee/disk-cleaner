@@ -1,13 +1,14 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use disk_cleaner::scanner::{self, ScanProgress};
 use std::fs;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        cancelled: AtomicBool::new(false),
     })
 }
 

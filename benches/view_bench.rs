@@ -26,16 +26,15 @@ fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
 
 /// Wide tree with realistic file extensions for category benchmarks.
 fn build_categorized_tree(n_dirs: usize, files_per_dir: usize) -> FileNode {
-    let exts = ["rs", "mp4", "jpg", "mp3", "pdf", "zip", "dat", "log", "toml", "py"];
+    let exts = [
+        "rs", "mp4", "jpg", "mp3", "pdf", "zip", "dat", "log", "toml", "py",
+    ];
     let dirs: Vec<FileNode> = (0..n_dirs)
         .map(|i| {
             let files: Vec<FileNode> = (0..files_per_dir)
                 .map(|j| {
                     let ext = exts[j % exts.len()];
-                    make_leaf(
-                        &format!("file_{j}.{ext}"),
-                        (j as u64 + 1) * 1024,
-                    )
+                    make_leaf(&format!("file_{j}.{ext}"), (j as u64 + 1) * 1024)
                 })
                 .collect();
             make_dir(&format!("dir_{i:05}"), files)
@@ -79,17 +78,13 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let tree = build_expanded_tree(n_dirs, files_per_dir);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(
-            BenchmarkId::new("all_expanded", n),
-            &tree,
-            |b, t| {
-                b.iter(|| {
-                    let mut result = Vec::new();
-                    ui::collect_visible_paths(t, "", None, true, &mut result);
-                    result
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
+            b.iter(|| {
+                let mut result = Vec::new();
+                ui::collect_visible_paths(t, "", None, true, &mut result);
+                result
+            })
+        });
     }
 
     // Root only expanded (default after scan) — best case
@@ -98,17 +93,13 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         tree.set_expanded(true);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(
-            BenchmarkId::new("root_only", n),
-            &tree,
-            |b, t| {
-                b.iter(|| {
-                    let mut result = Vec::new();
-                    ui::collect_visible_paths(t, "", None, true, &mut result);
-                    result
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
+            b.iter(|| {
+                let mut result = Vec::new();
+                ui::collect_visible_paths(t, "", None, true, &mut result);
+                result
+            })
+        });
     }
 
     // With text filter active — forces node_matches on every subtree
@@ -116,29 +107,21 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(
-            BenchmarkId::new("filter_hit", n),
-            &tree,
-            |b, t| {
-                b.iter(|| {
-                    let mut result = Vec::new();
-                    ui::collect_visible_paths(t, "file_5", None, true, &mut result);
-                    result
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("filter_hit", n), &tree, |b, t| {
+            b.iter(|| {
+                let mut result = Vec::new();
+                ui::collect_visible_paths(t, "file_5", None, true, &mut result);
+                result
+            })
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("filter_miss", n),
-            &tree,
-            |b, t| {
-                b.iter(|| {
-                    let mut result = Vec::new();
-                    ui::collect_visible_paths(t, "nonexistent_zzz", None, true, &mut result);
-                    result
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("filter_miss", n), &tree, |b, t| {
+            b.iter(|| {
+                let mut result = Vec::new();
+                ui::collect_visible_paths(t, "nonexistent_zzz", None, true, &mut result);
+                result
+            })
+        });
     }
 
     // With category filter
@@ -146,23 +129,19 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(
-            BenchmarkId::new("category_video", n),
-            &tree,
-            |b, t| {
-                b.iter(|| {
-                    let mut result = Vec::new();
-                    ui::collect_visible_paths(
-                        t,
-                        "",
-                        Some(categories::FileCategory::Video),
-                        true,
-                        &mut result,
-                    );
-                    result
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("category_video", n), &tree, |b, t| {
+            b.iter(|| {
+                let mut result = Vec::new();
+                ui::collect_visible_paths(
+                    t,
+                    "",
+                    Some(categories::FileCategory::Video),
+                    true,
+                    &mut result,
+                );
+                result
+            })
+        });
     }
 
     group.finish();
@@ -241,11 +220,9 @@ fn bench_compute_stats(c: &mut Criterion) {
         let tree = build_categorized_tree(n_dirs, files_per_dir);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(
-            BenchmarkId::new("nodes", n),
-            &tree,
-            |b, t| b.iter(|| categories::compute_stats(t)),
-        );
+        group.bench_with_input(BenchmarkId::new("nodes", n), &tree, |b, t| {
+            b.iter(|| categories::compute_stats(t))
+        });
     }
 
     group.finish();
@@ -264,21 +241,17 @@ fn bench_node_matches_category(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         // Hit case: Video files exist in every directory
-        group.bench_with_input(
-            BenchmarkId::new("hit_video", n),
-            &tree,
-            |b, t| b.iter(|| categories::node_matches_category(t, categories::FileCategory::Video)),
-        );
+        group.bench_with_input(BenchmarkId::new("hit_video", n), &tree, |b, t| {
+            b.iter(|| categories::node_matches_category(t, categories::FileCategory::Video))
+        });
 
         // Miss case: no Archive files if we filter them out
         // (Actually archives exist — use a category that doesn't exist)
         // All exts in our tree: rs, mp4, jpg, mp3, pdf, zip, dat, log, toml, py
         // Image category includes jpg so that's a hit. Let's just bench both common cases.
-        group.bench_with_input(
-            BenchmarkId::new("hit_code", n),
-            &tree,
-            |b, t| b.iter(|| categories::node_matches_category(t, categories::FileCategory::Code)),
-        );
+        group.bench_with_input(BenchmarkId::new("hit_code", n), &tree, |b, t| {
+            b.iter(|| categories::node_matches_category(t, categories::FileCategory::Code))
+        });
     }
 
     group.finish();

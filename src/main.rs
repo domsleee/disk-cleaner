@@ -21,6 +21,9 @@ use scanner::ScanProgress;
 use tree::FileNode;
 use treemap::TreemapAction;
 
+/// Result of background deletion: list of (path, optional error message).
+type DeleteResults = Vec<(PathBuf, Option<String>)>;
+
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
     Tree,
@@ -215,7 +218,7 @@ struct App {
     deleting: bool,
     delete_progress: Arc<AtomicUsize>,
     delete_total: usize,
-    delete_receiver: Option<mpsc::Receiver<Vec<(PathBuf, Option<String>)>>>,
+    delete_receiver: Option<mpsc::Receiver<DeleteResults>>,
 }
 
 impl Default for App {
@@ -533,9 +536,7 @@ impl eframe::App for App {
 
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
-                    if self.tree.is_none() && !self.scanning {
-                        self.screenshot_state = ScreenshotState::WaitFrames(5);
-                    } else if self.tree.is_some() && !self.scanning {
+                    if !self.scanning {
                         self.screenshot_state = ScreenshotState::WaitFrames(5);
                     }
                 }
@@ -723,8 +724,7 @@ impl eframe::App for App {
                     ));
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete all")
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new("Yes, delete all").color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(220, 50, 50));
                         if ui.add(delete_btn).clicked() || enter_pressed {
@@ -760,8 +760,7 @@ impl eframe::App for App {
                     ui.label(format!("Permanently delete?\n{}", path.display()));
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete")
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(220, 50, 50));
                         if ui.add(delete_btn).clicked() || enter_pressed {
@@ -804,131 +803,131 @@ impl eframe::App for App {
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
         let show_toolbar = self.tree.is_some() || self.scanning;
         if show_toolbar {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Standardize widget height so buttons and selectable labels align
-                ui.spacing_mut().interact_size.y = 24.0;
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Standardize widget height so buttons and selectable labels align
+                    ui.spacing_mut().interact_size.y = 24.0;
 
-                if ui.button("Open Directory...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.start_scan(path);
-                    }
-                }
-
-                if self.tree.is_some() && ui.button("Re-scan").clicked() {
-                    if let Some(path) = self.scan_path.clone() {
-                        self.start_scan(path);
-                    }
-                }
-
-                // View mode toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    for (label, mode) in [
-                        ("Tree", ViewMode::Tree),
-                        ("Treemap", ViewMode::Treemap),
-                        ("Suggestions", ViewMode::Suggestions),
-                    ] {
-                        let is_active = self.view_mode == mode;
-                        let text = if is_active {
-                            egui::RichText::new(label).strong().size(14.0)
-                        } else {
-                            egui::RichText::new(label)
-                                .size(14.0)
-                                .color(ui.visuals().weak_text_color())
-                        };
-
-                        let btn = egui::Button::new(text)
-                            .frame(false)
-                            .min_size(egui::vec2(0.0, 24.0));
-                        let response = ui.add(btn);
-
-                        // Draw underline for active tab
-                        if is_active {
-                            let rect = response.rect;
-                            let painter = ui.painter();
-                            let accent = egui::Color32::from_rgb(100, 180, 255);
-                            painter.rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                    egui::vec2(rect.width(), 2.0),
-                                ),
-                                0.0,
-                                accent,
-                            );
-                        }
-
-                        if response.clicked() {
-                            self.view_mode = mode;
+                    if ui.button("Open Directory...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.start_scan(path);
                         }
                     }
-                }
 
-                // Search/filter bar
-                if self.tree.is_some() {
-                    ui.separator();
-                    ui.label("Filter:");
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("file name...")
-                            .desired_width(200.0),
-                    );
-                    if response.changed() {
-                        // Convert to lowercase once; node_matches uses lowercase comparison
-                        self.search_query = self.search_query.to_lowercase();
-                        self.visible_paths_dirty = true;
-                    }
-                    if !self.search_query.is_empty() && ui.small_button("×").clicked() {
-                        self.search_query.clear();
-                        self.visible_paths_dirty = true;
-                    }
-                }
-
-                // Hidden files toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.show_hidden, "Show hidden")
-                        .clicked()
-                    {
-                        self.show_hidden = !self.show_hidden;
-                        self.visible_paths_dirty = true;
-                        // Persist preference
-                        if let Some(ref path) = self.last_scan_path {
-                            save_config(path, self.show_hidden);
-                        }
-                        // Recompute stats
-                        if let Some(ref tree) = self.tree {
-                            self.category_stats = Some(categories::compute_stats(tree));
+                    if self.tree.is_some() && ui.button("Re-scan").clicked() {
+                        if let Some(path) = self.scan_path.clone() {
+                            self.start_scan(path);
                         }
                     }
-                }
 
-                // File types panel toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.show_categories, "File Types")
-                        .clicked()
-                    {
-                        self.show_categories = !self.show_categories;
-                        if !self.show_categories {
-                            self.category_filter = None;
+                    // View mode toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        for (label, mode) in [
+                            ("Tree", ViewMode::Tree),
+                            ("Treemap", ViewMode::Treemap),
+                            ("Suggestions", ViewMode::Suggestions),
+                        ] {
+                            let is_active = self.view_mode == mode;
+                            let text = if is_active {
+                                egui::RichText::new(label).strong().size(14.0)
+                            } else {
+                                egui::RichText::new(label)
+                                    .size(14.0)
+                                    .color(ui.visuals().weak_text_color())
+                            };
+
+                            let btn = egui::Button::new(text)
+                                .frame(false)
+                                .min_size(egui::vec2(0.0, 24.0));
+                            let response = ui.add(btn);
+
+                            // Draw underline for active tab
+                            if is_active {
+                                let rect = response.rect;
+                                let painter = ui.painter();
+                                let accent = egui::Color32::from_rgb(100, 180, 255);
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                        egui::vec2(rect.width(), 2.0),
+                                    ),
+                                    0.0,
+                                    accent,
+                                );
+                            }
+
+                            if response.clicked() {
+                                self.view_mode = mode;
+                            }
+                        }
+                    }
+
+                    // Search/filter bar
+                    if self.tree.is_some() {
+                        ui.separator();
+                        ui.label("Filter:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("file name...")
+                                .desired_width(200.0),
+                        );
+                        if response.changed() {
+                            // Convert to lowercase once; node_matches uses lowercase comparison
+                            self.search_query = self.search_query.to_lowercase();
+                            self.visible_paths_dirty = true;
+                        }
+                        if !self.search_query.is_empty() && ui.small_button("×").clicked() {
+                            self.search_query.clear();
                             self.visible_paths_dirty = true;
                         }
                     }
-                }
 
-                if self.scanning {
-                    // Full-page scanning UI is in CentralPanel; just keep repainting
-                    ctx.request_repaint();
-                }
+                    // Hidden files toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_hidden, "Show hidden")
+                            .clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.visible_paths_dirty = true;
+                            // Persist preference
+                            if let Some(ref path) = self.last_scan_path {
+                                save_config(path, self.show_hidden);
+                            }
+                            // Recompute stats
+                            if let Some(ref tree) = self.tree {
+                                self.category_stats = Some(categories::compute_stats(tree));
+                            }
+                        }
+                    }
 
-                if let Some(ref err) = self.error {
-                    ui.colored_label(egui::Color32::RED, err);
-                }
+                    // File types panel toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_categories, "File Types")
+                            .clicked()
+                        {
+                            self.show_categories = !self.show_categories;
+                            if !self.show_categories {
+                                self.category_filter = None;
+                                self.visible_paths_dirty = true;
+                            }
+                        }
+                    }
+
+                    if self.scanning {
+                        // Full-page scanning UI is in CentralPanel; just keep repainting
+                        ctx.request_repaint();
+                    }
+
+                    if let Some(ref err) = self.error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
             });
-        });
         } // show_toolbar
 
         // Category side panel (toggled via toolbar button)
@@ -1046,9 +1045,7 @@ impl eframe::App for App {
                         }
                         ui.label(egui::RichText::new(status).small());
                     } else if selected_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{selected_count} selected")).small(),
-                        );
+                        ui.label(egui::RichText::new(format!("{selected_count} selected")).small());
                     } else if let Some(ref path) = self.scan_path {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1100,11 +1097,9 @@ impl eframe::App for App {
 
                         // Keyboard hints
                         ui.label(
-                            egui::RichText::new(
-                                "Arrow keys navigate  Space expand  Del trash",
-                            )
-                            .small()
-                            .weak(),
+                            egui::RichText::new("Arrow keys navigate  Space expand  Del trash")
+                                .small()
+                                .weak(),
                         );
                         ui.separator();
                     }
@@ -1138,16 +1133,15 @@ impl eframe::App for App {
                     let size_str = bytesize::ByteSize::b(size).to_string();
                     ui.label(format!("{files} files — {size_str}"));
 
-                    // Progress bar: show fraction of used disk space when scanning a volume root
+                    // Progress bar: show fraction of total disk capacity when scanning a volume root
                     if self.scan_is_volume {
-                        if let Some((total, available)) = self.scan_disk_info {
-                            let used = total.saturating_sub(available);
-                            if used > 0 {
+                        if let Some((total, _available)) = self.scan_disk_info {
+                            if total > 0 {
                                 ui.add_space(12.0);
-                                let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                                let used_str = bytesize::ByteSize::b(used).to_string();
+                                let fraction = (size as f32 / total as f32).clamp(0.0, 1.0);
+                                let total_str = bytesize::ByteSize::b(total).to_string();
                                 let bar = egui::ProgressBar::new(fraction)
-                                    .text(format!("{size_str} / {used_str} used"))
+                                    .text(format!("{size_str} / {total_str} total"))
                                     .desired_width(300.0);
                                 ui.add(bar);
                             }
@@ -1172,10 +1166,8 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(24.0);
-                    let cancel_btn = egui::Button::new(
-                        egui::RichText::new("Cancel").size(15.0),
-                    )
-                    .min_size(egui::vec2(120.0, 36.0));
+                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0))
+                        .min_size(egui::vec2(120.0, 36.0));
                     if ui.add(cancel_btn).clicked() {
                         self.cancel_scan();
                     }
@@ -1223,10 +1215,7 @@ impl eframe::App for App {
                                 .show(ui, |ui| {
                                     ui.set_width(400.0);
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("\u{1F4BD}")
-                                                .size(16.0),
-                                        );
+                                        ui.label(egui::RichText::new("\u{1F4BD}").size(16.0));
                                         ui.strong(&vol.name);
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1504,7 +1493,11 @@ impl eframe::App for App {
 
         // Floating batch actions bar (shown when items are selected)
         let selected_count = self.selected_paths.len();
-        if selected_count > 0 && self.tree.is_some() && !self.scanning && self.view_mode == ViewMode::Tree {
+        if selected_count > 0
+            && self.tree.is_some()
+            && !self.scanning
+            && self.view_mode == ViewMode::Tree
+        {
             egui::Area::new(egui::Id::new("batch_actions_float"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
                 .interactable(true)
@@ -1542,7 +1535,11 @@ impl eframe::App for App {
                                     self.confirm_batch_delete = true;
                                 }
                                 ui.add_space(4.0);
-                                if ui.small_button("×").on_hover_text("Clear selection").clicked() {
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Clear selection")
+                                    .clicked()
+                                {
                                     self.selected_paths.clear();
                                 }
                             });
@@ -1577,15 +1574,10 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "Deleting {done}/{total}..."
-                                    ))
-                                    .strong(),
+                                    egui::RichText::new(format!("Deleting {done}/{total}..."))
+                                        .strong(),
                                 );
-                                ui.add(
-                                    egui::ProgressBar::new(fraction)
-                                        .desired_width(200.0),
-                                );
+                                ui.add(egui::ProgressBar::new(fraction).desired_width(200.0));
                             });
                         });
                 });

@@ -515,9 +515,7 @@ pub fn render_treemap(
             )
             .gap(12.0)
             .show(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Other ({} files)", other_count)).strong(),
-                );
+                ui.label(egui::RichText::new(format!("Other ({} files)", other_count)).strong());
                 ui.label(ByteSize::b(other_size).to_string());
                 ui.label("Small files collapsed into one block");
             });
@@ -532,9 +530,7 @@ pub fn render_treemap(
                 if r.contains(pos) {
                     if i < children.len() {
                         if children[i].is_dir() {
-                            actions.push(TreemapAction::ZoomTo(
-                                child_paths[i].clone().unwrap(),
-                            ));
+                            actions.push(TreemapAction::ZoomTo(child_paths[i].clone().unwrap()));
                         }
                         actions.push(TreemapAction::Focus(child_paths[i].clone().unwrap()));
                     }
@@ -605,7 +601,10 @@ fn paint_other_bucket(
     painter.rect_stroke(
         rect,
         2.0,
-        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha)),
+        egui::Stroke::new(
+            1.0,
+            apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -613,11 +612,7 @@ fn paint_other_bucket(
         let tc = apply_alpha(egui::Color32::from_rgb(200, 200, 200), alpha);
         let font = egui::FontId::proportional(11.0);
         let text = if rect.height() > 30.0 {
-            format!(
-                "Other ({} files)\n{}",
-                count,
-                ByteSize::b(total_size)
-            )
+            format!("Other ({} files)\n{}", count, ByteSize::b(total_size))
         } else {
             format!("Other ({})", count)
         };

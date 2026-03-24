@@ -100,7 +100,9 @@ pub fn node_matches_category(node: &FileNode, cat: FileCategory) -> bool {
     if !node.is_dir() {
         return categorize(node.name()) == cat;
     }
-    node.children().iter().any(|c| node_matches_category(c, cat))
+    node.children()
+        .iter()
+        .any(|c| node_matches_category(c, cat))
 }
 
 #[cfg(test)]

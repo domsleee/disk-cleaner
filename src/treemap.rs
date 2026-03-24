@@ -204,7 +204,11 @@ pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> 
     find_node_inner(node, target, &mut buf)
 }
 
-fn find_node_inner<'a>(node: &'a FileNode, target: &Path, buf: &mut PathBuf) -> Option<&'a FileNode> {
+fn find_node_inner<'a>(
+    node: &'a FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+) -> Option<&'a FileNode> {
     if buf.as_path() == target {
         return Some(node);
     }
@@ -234,7 +238,12 @@ pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
     }
 }
 
-fn breadcrumbs_walk(node: &FileNode, target: &Path, buf: &mut PathBuf, trail: &mut Vec<(String, PathBuf)>) -> bool {
+fn breadcrumbs_walk(
+    node: &FileNode,
+    target: &Path,
+    buf: &mut PathBuf,
+    trail: &mut Vec<(String, PathBuf)>,
+) -> bool {
     for child in node.children() {
         buf.push(child.name());
         let child_path = buf.clone();
@@ -266,8 +275,14 @@ pub enum TreemapAction {
 // ─── Rendering ──────────────────────────────────────────────────
 
 const GAP: f32 = 1.5;
-const DIR_HEADER_H: f32 = 16.0;
+const DIR_HEADER_H: f32 = 20.0;
 const MIN_LABEL_W: f32 = 32.0;
+/// Hard cap on visible top-level entries to prevent lag with huge directories.
+const MAX_VISIBLE_ENTRIES: usize = 200;
+/// Minimum rect area (px²) worth painting — below this we skip.
+const MIN_PAINT_AREA: f32 = 4.0;
+/// Maximum nested children to paint inside a directory tile.
+const MAX_NESTED_CHILDREN: usize = 100;
 
 /// Render the full treemap view (breadcrumbs + map). Returns user-triggered actions.
 pub fn render_treemap(
@@ -299,6 +314,15 @@ pub fn render_treemap(
         .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
 
     ui.horizontal(|ui| {
+        // Back button — only shown when zoomed into a subdirectory
+        if crumbs.len() > 1 {
+            let parent_path = crumbs[crumbs.len() - 2].1.clone();
+            if ui.button("< Back").clicked() {
+                actions.push(TreemapAction::ZoomTo(parent_path));
+            }
+            ui.separator();
+        }
+
         for (i, (name, path)) in crumbs.iter().enumerate() {
             if i > 0 {
                 ui.label(">");
@@ -349,7 +373,7 @@ pub fn render_treemap(
     }
 
     // Filter children by size, hidden status, and optional category
-    let children: Vec<&FileNode> = view_node
+    let all_children: Vec<&FileNode> = view_node
         .children()
         .iter()
         .filter(|c| c.size() > 0)
@@ -358,14 +382,56 @@ pub fn render_treemap(
             category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
         })
         .collect();
-    if children.is_empty() {
+    if all_children.is_empty() {
         return actions;
     }
 
-    // Pre-compute child paths
-    let child_paths: Vec<PathBuf> = children.iter().map(|c| view_path.join(c.name())).collect();
+    // Collapse tiny files into an "Other" bucket to reduce visual noise.
+    // Files below 0.5% of total size are grouped together.
+    let total_size: u64 = all_children.iter().map(|c| c.size()).sum();
+    let threshold = (total_size as f64 * 0.005) as u64; // 0.5%
+    let mut children: Vec<&FileNode> = Vec::new();
+    let mut other_size: u64 = 0;
+    let mut other_count: usize = 0;
+    for c in &all_children {
+        if c.size() < threshold && !c.is_dir() {
+            other_size += c.size();
+            other_count += 1;
+        } else {
+            children.push(c);
+        }
+    }
 
-    let sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
+    // Hard cap: if we still have too many entries, keep only the largest
+    // and fold the rest into "Other". Children are already sorted descending
+    // by size from the scanner, but re-sort the tail to be safe.
+    if children.len() > MAX_VISIBLE_ENTRIES {
+        children.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        for c in children.drain(MAX_VISIBLE_ENTRIES..) {
+            other_size += c.size();
+            other_count += 1;
+        }
+    }
+
+    // Build display entries: real children + optional "Other" bucket
+    // We use an enum to track which entries are real nodes vs the bucket.
+    let has_other = other_count > 0 && other_size > 0;
+    let entry_count = children.len() + if has_other { 1 } else { 0 };
+    if entry_count == 0 {
+        return actions;
+    }
+
+    // Pre-compute child paths (None for the "Other" bucket)
+    let child_paths: Vec<Option<PathBuf>> = children
+        .iter()
+        .map(|c| Some(view_path.join(c.name())))
+        .chain(if has_other { vec![None] } else { vec![] })
+        .collect();
+
+    let mut sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
+    if has_other {
+        sizes.push(other_size as f64);
+    }
     let rects = squarify(
         &sizes,
         full_rect.min.x,
@@ -377,18 +443,39 @@ pub fn render_treemap(
     let hover_pos = response.hover_pos();
     let mut hovered_idx: Option<usize> = None;
 
-    for (i, child) in children.iter().enumerate() {
+    for i in 0..entry_count {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 {
             continue;
         }
+        // Skip sub-pixel rectangles — not worth painting
+        if r.area() < MIN_PAINT_AREA {
+            continue;
+        }
 
-        let is_focused = focused_path.as_ref().is_some_and(|fp| *fp == child_paths[i]);
+        if i < children.len() {
+            // Real child
+            let child = children[i];
+            let is_focused = focused_path
+                .as_ref()
+                .is_some_and(|fp| child_paths[i].as_ref().is_some_and(|cp| *fp == *cp));
 
-        if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
-            paint_directory(&painter, child, r, is_focused, focused_path, alpha, &child_paths[i]);
+            if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
+                paint_directory(
+                    &painter,
+                    child,
+                    r,
+                    is_focused,
+                    focused_path,
+                    alpha,
+                    child_paths[i].as_ref().unwrap(),
+                );
+            } else {
+                paint_leaf(&painter, child, r, is_focused, alpha);
+            }
         } else {
-            paint_leaf(&painter, child, r, is_focused, alpha);
+            // "Other" bucket
+            paint_other_bucket(&painter, other_count, other_size, r, alpha);
         }
 
         if let Some(pos) = hover_pos {
@@ -400,35 +487,57 @@ pub fn render_treemap(
 
     // Hover tooltip
     if let Some(idx) = hovered_idx {
-        let child = children[idx];
-        let child_path = &child_paths[idx];
-        egui::Tooltip::always_open(
-            ui.ctx().clone(),
-            ui.layer_id(),
-            ui.id().with("treemap_tip"),
-            egui::PopupAnchor::Pointer,
-        )
-        .gap(12.0)
-        .show(|ui| {
-            ui.label(egui::RichText::new(child.name()).strong());
-            ui.label(ByteSize::b(child.size()).to_string());
-            if child.is_dir() {
-                ui.label(format!("{} items", child.children().len()));
-            }
-            ui.label(child_path.display().to_string());
-        });
+        if idx < children.len() {
+            let child = children[idx];
+            let child_path = child_paths[idx].as_ref().unwrap();
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                ui.id().with("treemap_tip"),
+                egui::PopupAnchor::Pointer,
+            )
+            .gap(12.0)
+            .show(|ui| {
+                ui.label(egui::RichText::new(child.name()).strong());
+                ui.label(ByteSize::b(child.size()).to_string());
+                if child.is_dir() {
+                    ui.label(format!("{} items", child.children().len()));
+                }
+                ui.label(child_path.display().to_string());
+            });
+        } else {
+            // Tooltip for the "Other" bucket
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                ui.id().with("treemap_tip"),
+                egui::PopupAnchor::Pointer,
+            )
+            .gap(12.0)
+            .show(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Other ({} files)", other_count)).strong(),
+                );
+                ui.label(ByteSize::b(other_size).to_string());
+                ui.label("Small files collapsed into one block");
+            });
+        }
     }
 
     // Handle click
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            for (i, child) in children.iter().enumerate() {
+            for i in 0..entry_count {
                 let r = rects[i].shrink(GAP);
                 if r.contains(pos) {
-                    if child.is_dir() {
-                        actions.push(TreemapAction::ZoomTo(child_paths[i].clone()));
+                    if i < children.len() {
+                        if children[i].is_dir() {
+                            actions.push(TreemapAction::ZoomTo(
+                                child_paths[i].clone().unwrap(),
+                            ));
+                        }
+                        actions.push(TreemapAction::Focus(child_paths[i].clone().unwrap()));
                     }
-                    actions.push(TreemapAction::Focus(child_paths[i].clone()));
                     break;
                 }
             }
@@ -482,6 +591,40 @@ fn paint_leaf(
     }
 }
 
+fn paint_other_bucket(
+    painter: &egui::Painter,
+    count: usize,
+    total_size: u64,
+    rect: egui::Rect,
+    alpha: f32,
+) {
+    let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
+    painter.rect_filled(rect, 2.0, bg);
+
+    // Dashed-style border to distinguish from real blocks
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha)),
+        egui::StrokeKind::Inside,
+    );
+
+    if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
+        let tc = apply_alpha(egui::Color32::from_rgb(200, 200, 200), alpha);
+        let font = egui::FontId::proportional(11.0);
+        let text = if rect.height() > 30.0 {
+            format!(
+                "Other ({} files)\n{}",
+                count,
+                ByteSize::b(total_size)
+            )
+        } else {
+            format!("Other ({})", count)
+        };
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, tc);
+    }
+}
+
 fn paint_directory(
     painter: &egui::Painter,
     node: &FileNode,
@@ -521,7 +664,7 @@ fn paint_directory(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
             &label,
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(13.0),
             tc,
         );
     }
@@ -533,9 +676,14 @@ fn paint_directory(
     );
 
     if content_rect.width() > 4.0 && content_rect.height() > 4.0 && !node.children().is_empty() {
-        let nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
+        let mut nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
         if nested.is_empty() {
             return;
+        }
+        // Cap nested children to avoid painting thousands of sub-rects
+        if nested.len() > MAX_NESTED_CHILDREN {
+            nested.sort_by_key(|c| std::cmp::Reverse(c.size()));
+            nested.truncate(MAX_NESTED_CHILDREN);
         }
         let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
         let child_rects = squarify(
@@ -548,7 +696,7 @@ fn paint_directory(
 
         for (j, child) in nested.iter().enumerate() {
             let cr = child_rects[j].shrink(0.5);
-            if cr.width() <= 0.0 || cr.height() <= 0.0 {
+            if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
                 continue;
             }
             let color = apply_alpha(extension_color(child.name(), child.is_dir()), alpha);
@@ -737,5 +885,306 @@ mod tests {
         // Light bg should give dark text
         let tc = text_color_for_bg(egui::Color32::from_rgb(220, 220, 220));
         assert!(tc.r() < 50);
+    }
+
+    // ── worst_ratio tests ──
+
+    #[test]
+    fn worst_ratio_single_square() {
+        // A single 100-area item on a 10-length side → strip is 10×10, ratio = 1
+        let r = worst_ratio(&[100.0], 10.0);
+        assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn worst_ratio_zero_side() {
+        assert_eq!(worst_ratio(&[100.0], 0.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_zero_area() {
+        assert_eq!(worst_ratio(&[0.0], 10.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_empty() {
+        assert_eq!(worst_ratio(&[], 10.0), f64::MAX);
+    }
+
+    #[test]
+    fn worst_ratio_equal_items() {
+        // Two 50-area items on a 10-length side → strip is 10×10, each 10×5, ratio = 2
+        let r = worst_ratio(&[50.0, 50.0], 10.0);
+        assert!((r - 2.0).abs() < 1e-9);
+    }
+
+    // ── squarify bounds and ordering tests ──
+
+    #[test]
+    fn squarify_rects_within_bounds() {
+        let sizes = vec![50.0, 30.0, 15.0, 5.0];
+        let (x, y, w, h) = (10.0, 20.0, 400.0, 300.0);
+        let rects = squarify(&sizes, x, y, w, h);
+        let bounds = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+        for (i, r) in rects.iter().enumerate() {
+            assert!(
+                r.min.x >= bounds.min.x - 0.1
+                    && r.min.y >= bounds.min.y - 0.1
+                    && r.max.x <= bounds.max.x + 0.1
+                    && r.max.y <= bounds.max.y + 0.1,
+                "rect {i} ({:?}) outside bounds ({:?})",
+                r,
+                bounds
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_with_offset_origin() {
+        let rects = squarify(&[100.0], 50.0, 75.0, 200.0, 100.0);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[0].min.x - 50.0).abs() < 0.1);
+        assert!((rects[0].min.y - 75.0).abs() < 0.1);
+        assert!((rects[0].width() - 200.0).abs() < 0.1);
+        assert!((rects[0].height() - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn squarify_zero_width() {
+        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 0.0, 100.0);
+        assert_eq!(rects.len(), 2);
+        // All should be NOTHING rects
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_zero_height() {
+        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 100.0, 0.0);
+        assert_eq!(rects.len(), 2);
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_all_zero_sizes() {
+        let rects = squarify(&[0.0, 0.0, 0.0], 0.0, 0.0, 100.0, 100.0);
+        assert_eq!(rects.len(), 3);
+        for r in &rects {
+            assert_eq!(*r, egui::Rect::NOTHING);
+        }
+    }
+
+    #[test]
+    fn squarify_ordering_largest_gets_largest_rect() {
+        let sizes = vec![100.0, 50.0, 25.0, 10.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
+        let areas: Vec<f32> = rects.iter().map(|r| r.width() * r.height()).collect();
+        // Each rect's area should be >= the next (matching descending size order)
+        for i in 0..areas.len() - 1 {
+            assert!(
+                areas[i] >= areas[i + 1] - 1.0,
+                "area[{}] = {} < area[{}] = {}",
+                i,
+                areas[i],
+                i + 1,
+                areas[i + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_tall_narrow_rect() {
+        let sizes = vec![60.0, 30.0, 10.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 50.0, 600.0);
+        assert_eq!(rects.len(), 3);
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        assert!((total_area - 30000.0).abs() < 10.0);
+        for (i, r) in rects.iter().enumerate() {
+            assert!(r.width() > 0.0, "rect {i} has zero width");
+            assert!(r.height() > 0.0, "rect {i} has zero height");
+        }
+    }
+
+    #[test]
+    fn squarify_square_canvas() {
+        let sizes = vec![25.0, 25.0, 25.0, 25.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 100.0, 100.0);
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        assert!((total_area - 10000.0).abs() < 1.0);
+        // All rects should have equal area
+        let expected_each = 2500.0f32;
+        for (i, r) in rects.iter().enumerate() {
+            let a = r.width() * r.height();
+            assert!(
+                (a - expected_each).abs() < 1.0,
+                "rect {i} area = {a}, expected {expected_each}"
+            );
+        }
+    }
+
+    #[test]
+    fn squarify_no_overlap_many_items() {
+        let sizes: Vec<f64> = (1..=50).rev().map(|i| i as f64).collect();
+        let rects = squarify(&sizes, 0.0, 0.0, 1000.0, 800.0);
+        assert_eq!(rects.len(), 50);
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let overlap = rects[i].intersect(rects[j]);
+                assert!(
+                    overlap.area() < 2.0,
+                    "rects {i} and {j} overlap by {}",
+                    overlap.area()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn squarify_extreme_skew() {
+        // One huge item and several tiny ones
+        let sizes = vec![10000.0, 1.0, 1.0, 1.0];
+        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
+        assert_eq!(rects.len(), 4);
+        let a0 = rects[0].width() * rects[0].height();
+        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
+        // First rect should dominate
+        assert!(a0 / total_area > 0.99);
+    }
+
+    // ── darken / apply_alpha tests ──
+
+    #[test]
+    fn darken_reduces_rgb() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let d = darken(c, 30);
+        assert_eq!(d, egui::Color32::from_rgb(70, 120, 170));
+    }
+
+    #[test]
+    fn darken_saturates_at_zero() {
+        let c = egui::Color32::from_rgb(10, 20, 30);
+        let d = darken(c, 50);
+        assert_eq!(d, egui::Color32::from_rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn apply_alpha_full() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let result = apply_alpha(c, 1.0);
+        assert_eq!(result, c);
+    }
+
+    #[test]
+    fn apply_alpha_half() {
+        let c = egui::Color32::from_rgb(100, 150, 200);
+        let result = apply_alpha(c, 0.5);
+        // Alpha should be halved (255 * 0.5 ≈ 127)
+        assert!((result.a() as f32 - 127.0).abs() < 2.0);
+        // RGB premultiplied, so values are halved too
+        assert!((result.r() as f32 - 50.0).abs() < 2.0);
+    }
+
+    // ── extension_color category coverage ──
+
+    #[test]
+    fn extension_color_categories() {
+        // Audio
+        assert_eq!(
+            extension_color("song.mp3", false),
+            egui::Color32::from_rgb(142, 68, 173)
+        );
+        // Image
+        assert_eq!(
+            extension_color("photo.png", false),
+            egui::Color32::from_rgb(39, 174, 96)
+        );
+        // Archive
+        assert_eq!(
+            extension_color("backup.zip", false),
+            egui::Color32::from_rgb(211, 84, 0)
+        );
+        // Source code
+        assert_eq!(
+            extension_color("main.rs", false),
+            egui::Color32::from_rgb(22, 160, 133)
+        );
+        // Document
+        assert_eq!(
+            extension_color("report.pdf", false),
+            egui::Color32::from_rgb(41, 128, 185)
+        );
+        // Config
+        assert_eq!(
+            extension_color("config.json", false),
+            egui::Color32::from_rgb(44, 62, 80)
+        );
+        // Build artifact
+        assert_eq!(
+            extension_color("module.o", false),
+            egui::Color32::from_rgb(146, 43, 33)
+        );
+        // Unknown → default gray
+        assert_eq!(
+            extension_color("random.xyz", false),
+            egui::Color32::from_rgb(93, 109, 126)
+        );
+    }
+
+    // ── find_node / breadcrumbs with deeper trees ──
+
+    #[test]
+    fn find_node_deeply_nested() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("deep.txt", 1)])])],
+            )],
+        );
+        assert!(find_node(&tree, Path::new("root/a/b/c/deep.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c/nope")).is_none());
+    }
+
+    #[test]
+    fn find_node_among_siblings() {
+        let tree = dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                dir("sub", vec![leaf("c.txt", 5)]),
+            ],
+        );
+        assert!(find_node(&tree, Path::new("root/b.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/sub/c.txt")).is_some());
+    }
+
+    #[test]
+    fn breadcrumbs_deep_path() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("d.txt", 1)])])],
+            )],
+        );
+        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"));
+        assert_eq!(bc.len(), 4);
+        assert_eq!(bc[0].0, "root");
+        assert_eq!(bc[1].0, "a");
+        assert_eq!(bc[2].0, "b");
+        assert_eq!(bc[3].0, "c");
+    }
+
+    #[test]
+    fn breadcrumbs_to_file() {
+        let tree = dir("root", vec![dir("sub", vec![leaf("file.txt", 10)])]);
+        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
+        assert_eq!(bc.len(), 3);
+        assert_eq!(bc[2].0, "file.txt");
     }
 }

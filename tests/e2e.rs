@@ -15,10 +15,7 @@ use std::sync::Arc;
 /// Helper: create a temp directory with a non-hidden name (avoids `.tmp` prefix
 /// which gets filtered by `show_hidden = false`).
 fn tmpdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("test_")
-        .tempdir()
-        .unwrap()
+    tempfile::Builder::new().prefix("test_").tempdir().unwrap()
 }
 
 /// Helper: create a file with specific size (writes that many zero bytes).
@@ -126,17 +123,33 @@ fn scan_categorizes_files_correctly() {
     let tree = scan(root);
     let stats = compute_stats(&tree);
 
-    let video = stats.entries.iter().find(|s| s.0 == FileCategory::Video).unwrap();
+    let video = stats
+        .entries
+        .iter()
+        .find(|s| s.0 == FileCategory::Video)
+        .unwrap();
     assert!(video.1 >= 1000);
     assert_eq!(video.2, 1);
 
-    let image = stats.entries.iter().find(|s| s.0 == FileCategory::Image).unwrap();
+    let image = stats
+        .entries
+        .iter()
+        .find(|s| s.0 == FileCategory::Image)
+        .unwrap();
     assert!(image.1 >= 500);
 
-    let audio = stats.entries.iter().find(|s| s.0 == FileCategory::Audio).unwrap();
+    let audio = stats
+        .entries
+        .iter()
+        .find(|s| s.0 == FileCategory::Audio)
+        .unwrap();
     assert!(audio.1 >= 300);
 
-    let code = stats.entries.iter().find(|s| s.0 == FileCategory::Code).unwrap();
+    let code = stats
+        .entries
+        .iter()
+        .find(|s| s.0 == FileCategory::Code)
+        .unwrap();
     assert!(code.1 >= 150);
 }
 
@@ -218,10 +231,18 @@ fn search_filter_matches_correct_nodes() {
 
     assert!(ui::node_matches(&tree, "md"));
 
-    let readme = tree.children().iter().find(|c| c.name() == "readme.md").unwrap();
+    let readme = tree
+        .children()
+        .iter()
+        .find(|c| c.name() == "readme.md")
+        .unwrap();
     assert!(ui::node_matches(readme, "md"));
 
-    let main_rs = tree.children().iter().find(|c| c.name() == "main.rs").unwrap();
+    let main_rs = tree
+        .children()
+        .iter()
+        .find(|c| c.name() == "main.rs")
+        .unwrap();
     assert!(!ui::node_matches(main_rs, "md"));
 
     let docs = tree.children().iter().find(|c| c.name() == "docs").unwrap();
@@ -386,13 +407,12 @@ fn scan_progress_tracks_file_count() {
     let prog = progress();
     let _tree = scan_directory(root, Arc::clone(&prog));
 
-    let files = prog
-        .file_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let bytes = prog
-        .total_size
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(files >= 10, "Should have scanned at least 10 files, got {files}");
+    let files = prog.file_count.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = prog.total_size.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        files >= 10,
+        "Should have scanned at least 10 files, got {files}"
+    );
     assert!(bytes >= 1000);
 }
 

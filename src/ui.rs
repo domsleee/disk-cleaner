@@ -52,8 +52,19 @@ fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
 
 /// Returns true if this node's name matches the query or any descendant does.
 pub fn node_matches(node: &FileNode, query: &str) -> bool {
-    node.name().to_lowercase().contains(query)
+    contains_case_insensitive(node.name(), query)
         || node.children().iter().any(|c| node_matches(c, query))
+}
+
+/// Case-insensitive substring search without allocating.
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Actions produced by tree rendering, applied after the frame.

@@ -267,7 +267,6 @@ fn breadcrumbs_walk(
 
 // ─── Cached treemap layout ─────────────────────────────────────
 
-#[allow(dead_code)]
 pub struct TreemapCache {
     pub tiles: Vec<TreemapTile>,
     pub other: Option<OtherBucket>,
@@ -276,7 +275,6 @@ pub struct TreemapCache {
     pub layout_size: (f32, f32),
 }
 
-#[allow(dead_code)]
 pub struct TreemapTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
@@ -288,7 +286,6 @@ pub struct TreemapTile {
     pub nested: Vec<NestedTile>,
 }
 
-#[allow(dead_code)]
 pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
@@ -297,7 +294,6 @@ pub struct NestedTile {
     pub color: egui::Color32,
 }
 
-#[allow(dead_code)]
 pub struct OtherBucket {
     pub rect: egui::Rect,
     pub count: usize,
@@ -308,7 +304,6 @@ pub struct OtherBucket {
 ///
 /// This extracts all filtering + squarifying logic from `render_treemap` into a
 /// pure function whose result can be stored and reused across frames.
-#[allow(dead_code)]
 pub fn build_treemap_cache(
     root: &FileNode,
     zoom_path: &Option<PathBuf>,
@@ -543,35 +538,18 @@ const MIN_PAINT_AREA: f32 = 4.0;
 /// Maximum nested children to paint inside a directory tile.
 const MAX_NESTED_CHILDREN: usize = 100;
 
-/// Render the full treemap view (breadcrumbs + map). Returns user-triggered actions.
+/// Render the full treemap view (breadcrumbs + map) from a cached layout.
+/// Returns user-triggered actions.
 pub fn render_treemap(
     ui: &mut egui::Ui,
-    root: &FileNode,
-    zoom_path: &Option<PathBuf>,
+    cache: &TreemapCache,
     focused_path: &Option<PathBuf>,
     zoom_anim_start: Option<f64>,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
-    let root_path = PathBuf::from(root.name());
-
-    // Resolve the node we're viewing and its full path
-    let (view_node, view_path) = if let Some(ref zp) = zoom_path {
-        match find_node(root, zp) {
-            Some(n) => (n, zp.clone()),
-            None => (root, root_path.clone()),
-        }
-    } else {
-        (root, root_path.clone())
-    };
+    let crumbs = &cache.breadcrumbs;
 
     // ── Breadcrumb bar ──
-    let crumbs = zoom_path
-        .as_ref()
-        .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
-
     ui.horizontal(|ui| {
         // Back button — only shown when zoomed into a subdirectory
         if crumbs.len() > 1 {
@@ -595,7 +573,7 @@ pub fn render_treemap(
                 actions.push(TreemapAction::ZoomTo(path.clone()));
             }
         }
-        ui.label(format!("  ({})", ByteSize::b(view_node.size())));
+        ui.label(format!("  ({})", ByteSize::b(cache.view_size)));
     });
 
     ui.add_space(4.0);
@@ -620,7 +598,7 @@ pub fn render_treemap(
     // Background
     painter.rect_filled(full_rect, 0.0, ui.visuals().extreme_bg_color);
 
-    if view_node.children().is_empty() {
+    if cache.tiles.is_empty() && cache.other.is_none() {
         painter.text(
             full_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -631,124 +609,59 @@ pub fn render_treemap(
         return actions;
     }
 
-    // Filter children by size, hidden status, and optional category
-    let all_children: Vec<&FileNode> = view_node
-        .children()
-        .iter()
-        .filter(|c| c.size() > 0)
-        .filter(|c| show_hidden || !c.name().starts_with('.'))
-        .filter(|c| {
-            category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
-        })
-        .collect();
-    if all_children.is_empty() {
-        return actions;
-    }
-
-    // Collapse tiny files into an "Other" bucket to reduce visual noise.
-    // Files below 0.5% of total size are grouped together.
-    let total_size: u64 = all_children.iter().map(|c| c.size()).sum();
-    let threshold = (total_size as f64 * 0.005) as u64; // 0.5%
-    let mut children: Vec<&FileNode> = Vec::new();
-    let mut other_size: u64 = 0;
-    let mut other_count: usize = 0;
-    for c in &all_children {
-        if c.size() < threshold && !c.is_dir() {
-            other_size += c.size();
-            other_count += 1;
-        } else {
-            children.push(c);
-        }
-    }
-
-    // Hard cap: if we still have too many entries, keep only the largest
-    // and fold the rest into "Other". Children are already sorted descending
-    // by size from the scanner, but re-sort the tail to be safe.
-    if children.len() > MAX_VISIBLE_ENTRIES {
-        children.sort_by_key(|c| std::cmp::Reverse(c.size()));
-        for c in children.drain(MAX_VISIBLE_ENTRIES..) {
-            other_size += c.size();
-            other_count += 1;
-        }
-    }
-
-    // Build display entries: real children + optional "Other" bucket
-    // We use an enum to track which entries are real nodes vs the bucket.
-    let has_other = other_count > 0 && other_size > 0;
-    let entry_count = children.len() + if has_other { 1 } else { 0 };
-    if entry_count == 0 {
-        return actions;
-    }
-
-    // Pre-compute child paths (None for the "Other" bucket)
-    let child_paths: Vec<Option<PathBuf>> = children
-        .iter()
-        .map(|c| Some(view_path.join(c.name())))
-        .chain(if has_other { vec![None] } else { vec![] })
-        .collect();
-
-    let mut sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
-    if has_other {
-        sizes.push(other_size as f64);
-    }
-    let rects = squarify(
-        &sizes,
-        full_rect.min.x,
-        full_rect.min.y,
-        full_rect.width(),
-        full_rect.height(),
-    );
-
     let hover_pos = response.hover_pos();
-    let mut hovered_idx: Option<usize> = None;
+    let mut hovered_tile: Option<usize> = None;
+    let mut hovered_other = false;
 
-    for i in 0..entry_count {
-        let r = rects[i].shrink(GAP);
-        if r.width() <= 0.0 || r.height() <= 0.0 {
-            continue;
-        }
-        // Skip sub-pixel rectangles — not worth painting
-        if r.area() < MIN_PAINT_AREA {
-            continue;
-        }
+    // Paint tiles
+    for (idx, tile) in cache.tiles.iter().enumerate() {
+        let is_focused = focused_path
+            .as_ref()
+            .is_some_and(|fp| *fp == tile.path);
 
-        if i < children.len() {
-            // Real child
-            let child = children[i];
-            let is_focused = focused_path
-                .as_ref()
-                .is_some_and(|fp| child_paths[i].as_ref().is_some_and(|cp| *fp == *cp));
-
-            if child.is_dir() && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
-                paint_directory(
-                    &painter,
-                    child,
-                    r,
-                    is_focused,
-                    focused_path,
-                    alpha,
-                    child_paths[i].as_ref().unwrap(),
-                );
-            } else {
-                paint_leaf(&painter, child, r, is_focused, alpha);
-            }
+        if tile.is_dir {
+            paint_cached_directory(&painter, tile, is_focused, focused_path, alpha);
         } else {
-            // "Other" bucket
-            paint_other_bucket(&painter, other_count, other_size, r, alpha);
+            paint_cached_leaf(&painter, tile, is_focused, alpha);
         }
 
         if let Some(pos) = hover_pos {
-            if r.contains(pos) {
-                hovered_idx = Some(i);
+            if tile.rect.contains(pos) {
+                hovered_tile = Some(idx);
+            }
+        }
+    }
+
+    // Paint Other bucket
+    if let Some(ref other) = cache.other {
+        paint_other_bucket(&painter, other.count, other.size, other.rect, alpha);
+        if let Some(pos) = hover_pos {
+            if other.rect.contains(pos) {
+                hovered_other = true;
             }
         }
     }
 
     // Hover tooltip
-    if let Some(idx) = hovered_idx {
-        if idx < children.len() {
-            let child = children[idx];
-            let child_path = child_paths[idx].as_ref().unwrap();
+    if let Some(idx) = hovered_tile {
+        let tile = &cache.tiles[idx];
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with("treemap_tip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label(egui::RichText::new(tile.name.as_ref()).strong());
+            ui.label(ByteSize::b(tile.size).to_string());
+            if let Some(count) = tile.child_count {
+                ui.label(format!("{} items", count));
+            }
+            ui.label(tile.path.display().to_string());
+        });
+    } else if hovered_other {
+        if let Some(ref other) = cache.other {
             egui::Tooltip::always_open(
                 ui.ctx().clone(),
                 ui.layer_id(),
@@ -757,25 +670,10 @@ pub fn render_treemap(
             )
             .gap(12.0)
             .show(|ui| {
-                ui.label(egui::RichText::new(child.name()).strong());
-                ui.label(ByteSize::b(child.size()).to_string());
-                if child.is_dir() {
-                    ui.label(format!("{} items", child.children().len()));
-                }
-                ui.label(child_path.display().to_string());
-            });
-        } else {
-            // Tooltip for the "Other" bucket
-            egui::Tooltip::always_open(
-                ui.ctx().clone(),
-                ui.layer_id(),
-                ui.id().with("treemap_tip"),
-                egui::PopupAnchor::Pointer,
-            )
-            .gap(12.0)
-            .show(|ui| {
-                ui.label(egui::RichText::new(format!("Other ({} files)", other_count)).strong());
-                ui.label(ByteSize::b(other_size).to_string());
+                ui.label(
+                    egui::RichText::new(format!("Other ({} files)", other.count)).strong(),
+                );
+                ui.label(ByteSize::b(other.size).to_string());
                 ui.label("Small files collapsed into one block");
             });
         }
@@ -784,15 +682,12 @@ pub fn render_treemap(
     // Handle click
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            for i in 0..entry_count {
-                let r = rects[i].shrink(GAP);
-                if r.contains(pos) {
-                    if i < children.len() {
-                        if children[i].is_dir() {
-                            actions.push(TreemapAction::ZoomTo(child_paths[i].clone().unwrap()));
-                        }
-                        actions.push(TreemapAction::Focus(child_paths[i].clone().unwrap()));
+            for tile in &cache.tiles {
+                if tile.rect.contains(pos) {
+                    if tile.is_dir {
+                        actions.push(TreemapAction::ZoomTo(tile.path.clone()));
                     }
+                    actions.push(TreemapAction::Focus(tile.path.clone()));
                     break;
                 }
             }
@@ -811,19 +706,18 @@ fn apply_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * alpha) as u8)
 }
 
-fn paint_leaf(
+fn paint_cached_leaf(
     painter: &egui::Painter,
-    node: &FileNode,
-    rect: egui::Rect,
+    tile: &TreemapTile,
     is_focused: bool,
     alpha: f32,
 ) {
-    let color = apply_alpha(extension_color(node.name(), node.is_dir()), alpha);
-    painter.rect_filled(rect, 2.0, color);
+    let color = apply_alpha(tile.color, alpha);
+    painter.rect_filled(tile.rect, 2.0, color);
 
     if is_focused {
         painter.rect_stroke(
-            rect,
+            tile.rect,
             2.0,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
@@ -831,18 +725,21 @@ fn paint_leaf(
     }
 
     // Label if large enough
-    if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
-        let tc = apply_alpha(
-            text_color_for_bg(extension_color(node.name(), node.is_dir())),
-            alpha,
-        );
+    if tile.rect.width() > MIN_LABEL_W && tile.rect.height() > 14.0 {
+        let tc = apply_alpha(text_color_for_bg(tile.color), alpha);
         let font = egui::FontId::proportional(11.0);
-        let text = if rect.height() > 30.0 {
-            format!("{}\n{}", node.name(), ByteSize::b(node.size()))
+        let text = if tile.rect.height() > 30.0 {
+            format!("{}\n{}", tile.name, ByteSize::b(tile.size))
         } else {
-            node.name().to_string()
+            tile.name.to_string()
         };
-        painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, font, tc);
+        painter.text(
+            tile.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            tc,
+        );
     }
 }
 
@@ -879,17 +776,16 @@ fn paint_other_bucket(
     }
 }
 
-fn paint_directory(
+fn paint_cached_directory(
     painter: &egui::Painter,
-    node: &FileNode,
-    rect: egui::Rect,
+    tile: &TreemapTile,
     is_focused: bool,
     focused_path: &Option<PathBuf>,
     alpha: f32,
-    node_path: &Path,
 ) {
-    let bg = apply_alpha(extension_color(node.name(), true), alpha);
-    let header_bg = apply_alpha(darken(extension_color(node.name(), true), 15), alpha);
+    let rect = tile.rect;
+    let bg = apply_alpha(tile.color, alpha);
+    let header_bg = apply_alpha(darken(tile.color, 15), alpha);
 
     // Background
     painter.rect_filled(rect, 2.0, bg);
@@ -908,12 +804,9 @@ fn paint_directory(
     painter.rect_filled(header_rect, 2.0, header_bg);
 
     // Header text
-    let tc = apply_alpha(
-        text_color_for_bg(darken(extension_color(node.name(), true), 15)),
-        alpha,
-    );
+    let tc = apply_alpha(text_color_for_bg(darken(tile.color, 15)), alpha);
     if rect.width() > MIN_LABEL_W {
-        let label = format!("{} ({})", node.name(), ByteSize::b(node.size()));
+        let label = format!("{} ({})", tile.name, ByteSize::b(tile.size));
         painter.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -923,64 +816,34 @@ fn paint_directory(
         );
     }
 
-    // Nested children
-    let content_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + 1.0, rect.min.y + DIR_HEADER_H),
-        egui::pos2(rect.max.x - 1.0, rect.max.y - 1.0),
-    );
+    // Nested children (pre-computed in cache)
+    for nested in &tile.nested {
+        let cr = nested.rect;
+        let color = apply_alpha(nested.color, alpha);
+        painter.rect_filled(cr, 1.0, color);
 
-    if content_rect.width() > 4.0 && content_rect.height() > 4.0 && !node.children().is_empty() {
-        let mut nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
-        if nested.is_empty() {
-            return;
+        let child_focused = focused_path
+            .as_ref()
+            .is_some_and(|fp| *fp == nested.path);
+        if child_focused {
+            painter.rect_stroke(
+                cr,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
         }
-        // Cap nested children to avoid painting thousands of sub-rects
-        if nested.len() > MAX_NESTED_CHILDREN {
-            nested.sort_by_key(|c| std::cmp::Reverse(c.size()));
-            nested.truncate(MAX_NESTED_CHILDREN);
-        }
-        let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
-        let child_rects = squarify(
-            &child_sizes,
-            content_rect.min.x,
-            content_rect.min.y,
-            content_rect.width(),
-            content_rect.height(),
-        );
 
-        for (j, child) in nested.iter().enumerate() {
-            let cr = child_rects[j].shrink(0.5);
-            if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
-                continue;
-            }
-            let color = apply_alpha(extension_color(child.name(), child.is_dir()), alpha);
-            painter.rect_filled(cr, 1.0, color);
-
-            let child_path = node_path.join(child.name());
-            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == child_path);
-            if child_focused {
-                painter.rect_stroke(
-                    cr,
-                    1.0,
-                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    egui::StrokeKind::Inside,
-                );
-            }
-
-            // Label if large enough
-            if cr.width() > MIN_LABEL_W && cr.height() > 12.0 {
-                let tc = apply_alpha(
-                    text_color_for_bg(extension_color(child.name(), child.is_dir())),
-                    alpha,
-                );
-                painter.text(
-                    cr.center(),
-                    egui::Align2::CENTER_CENTER,
-                    child.name(),
-                    egui::FontId::proportional(10.0),
-                    tc,
-                );
-            }
+        // Label if large enough
+        if cr.width() > MIN_LABEL_W && cr.height() > 12.0 {
+            let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
+            painter.text(
+                cr.center(),
+                egui::Align2::CENTER_CENTER,
+                nested.name.as_ref(),
+                egui::FontId::proportional(10.0),
+                tc,
+            );
         }
     }
 }

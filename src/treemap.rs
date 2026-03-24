@@ -267,6 +267,7 @@ fn breadcrumbs_walk(
 
 // ─── Cached treemap layout ─────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct TreemapCache {
     pub tiles: Vec<TreemapTile>,
     pub other: Option<OtherBucket>,
@@ -275,6 +276,7 @@ pub struct TreemapCache {
     pub layout_size: (f32, f32),
 }
 
+#[allow(dead_code)]
 pub struct TreemapTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
@@ -286,6 +288,7 @@ pub struct TreemapTile {
     pub nested: Vec<NestedTile>,
 }
 
+#[allow(dead_code)]
 pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
@@ -294,6 +297,7 @@ pub struct NestedTile {
     pub color: egui::Color32,
 }
 
+#[allow(dead_code)]
 pub struct OtherBucket {
     pub rect: egui::Rect,
     pub count: usize,
@@ -304,6 +308,7 @@ pub struct OtherBucket {
 ///
 /// This extracts all filtering + squarifying logic from `render_treemap` into a
 /// pure function whose result can be stored and reused across frames.
+#[allow(dead_code)]
 pub fn build_treemap_cache(
     root: &FileNode,
     zoom_path: &Option<PathBuf>,

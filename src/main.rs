@@ -1133,16 +1133,14 @@ impl eframe::App for App {
                     let size_str = bytesize::ByteSize::b(size).to_string();
                     ui.label(format!("{files} files — {size_str}"));
 
-                    // Progress bar: show fraction of total disk capacity when scanning a volume root
+                    // Progress bar: estimated scan progress based on used disk space
                     if self.scan_is_volume {
-                        if let Some((total, _available)) = self.scan_disk_info {
-                            if total > 0 {
+                        if let Some((total, available)) = self.scan_disk_info {
+                            let used = total.saturating_sub(available);
+                            if used > 0 {
                                 ui.add_space(12.0);
-                                let fraction = (size as f32 / total as f32).clamp(0.0, 1.0);
-                                let total_str = bytesize::ByteSize::b(total).to_string();
-                                let bar = egui::ProgressBar::new(fraction)
-                                    .text(format!("{size_str} / {total_str} total"))
-                                    .desired_width(300.0);
+                                let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
+                                let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
                                 ui.add(bar);
                             }
                         }

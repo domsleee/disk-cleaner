@@ -103,45 +103,71 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         );
     }
 
-    // With text filter active — forces node_matches on every subtree
+    // With text filter — uncached (O(N^2)) vs cached (O(N))
     {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
         group.bench_with_input(
-            BenchmarkId::new("filter_hit", n),
+            BenchmarkId::new("filter_hit_uncached", n),
             &tree,
             |b, t| {
                 b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None))
             },
         );
 
+        let text_cache = ui::build_text_match_cache(&tree, "file_5");
         group.bench_with_input(
-            BenchmarkId::new("filter_miss", n),
+            BenchmarkId::new("filter_hit_cached", n),
+            &tree,
+            |b, t| {
+                b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None))
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("filter_miss_uncached", n),
             &tree,
             |b, t| {
                 b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None))
             },
         );
+
+        let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz");
+        group.bench_with_input(
+            BenchmarkId::new("filter_miss_cached", n),
+            &tree,
+            |b, t| {
+                b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None))
+            },
+        );
     }
 
-    // With category filter
+    // With category filter — uncached vs cached
     {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
         group.bench_with_input(
-            BenchmarkId::new("category_video", n),
+            BenchmarkId::new("category_video_uncached", n),
             &tree,
             |b, t| {
                 b.iter(|| {
                     ui::collect_cached_rows(
-                        t,
-                        "",
-                        Some(categories::FileCategory::Video),
-                        true,
-                        None,
-                        None,
+                        t, "", Some(categories::FileCategory::Video), true, None, None,
+                    )
+                })
+            },
+        );
+
+        let cat_cache = ui::build_category_match_cache(&tree, categories::FileCategory::Video);
+        group.bench_with_input(
+            BenchmarkId::new("category_video_cached", n),
+            &tree,
+            |b, t| {
+                b.iter(|| {
+                    ui::collect_cached_rows(
+                        t, "", Some(categories::FileCategory::Video), true, None, Some(&cat_cache),
                     )
                 })
             },

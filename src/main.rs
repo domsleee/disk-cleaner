@@ -1326,6 +1326,8 @@ impl eframe::App for App {
 
             match self.view_mode {
                 ViewMode::Tree => {
+                    let render_start = std::time::Instant::now();
+                    let rebuild_needed = self.rows_dirty;
                     self.rebuild_rows_if_dirty();
                     let actions = ui::render_tree(
                         ui,
@@ -1336,6 +1338,15 @@ impl eframe::App for App {
                         &self.selected_paths,
                     );
                     self.tree_scroll_to_focus = false;
+                    let render_elapsed = render_start.elapsed();
+                    if render_elapsed > std::time::Duration::from_millis(16) {
+                        eprintln!(
+                            "[perf] tree frame: {:?} ({} rows, rebuild={})",
+                            render_elapsed,
+                            self.cached_rows.len(),
+                            rebuild_needed,
+                        );
+                    }
                     // Handle actions from tree rendering
                     for action in &actions {
                         match action {

@@ -35,6 +35,8 @@ pub struct TreemapTile {
     pub size: u64,
     pub is_dir: bool,
     pub color: egui::Color32,
+    /// Number of children (for directory tooltip). None for files.
+    pub child_count: Option<usize>,
     /// Pre-computed nested child rects for directory tiles.
     /// Empty for file tiles or directories too small to show children.
     pub nested: Vec<NestedTile>,
@@ -73,7 +75,11 @@ Set `treemap_dirty = true` at every mutation site that already sets `rows_dirty 
 - Tree mutation (delete, scan complete)
 - Search filter change (affects category sidebar which can affect treemap)
 
+To avoid missing sites, introduce a helper: `fn mark_dirty(&mut self) { self.rows_dirty = true; self.treemap_dirty = true; }` and replace all `self.rows_dirty = true` calls with `self.mark_dirty()`.
+
 Additionally, detect **resize** by comparing `treemap_cache.layout_size` against the current frame's available rect. If different, rebuild.
+
+**Note:** `zoom_anim_start` changes do NOT dirty the cache — the alpha fade is applied at paint time and does not affect layout.
 
 ### Render split
 

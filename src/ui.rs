@@ -72,11 +72,12 @@ fn build_text_match_inner(
     cache: &mut HashSet<PathBuf>,
 ) -> bool {
     let self_matches = contains_case_insensitive(node.name(), query);
-    let child_matches = node.children().iter().any(|c| {
+    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
+    let child_matches = node.children().iter().fold(false, |acc, c| {
         buf.push(c.name());
         let m = build_text_match_inner(c, query, buf, cache);
         buf.pop();
-        m
+        acc || m
     });
     if self_matches || child_matches {
         cache.insert(buf.clone());
@@ -109,11 +110,12 @@ fn build_cat_match_inner(
     } else {
         crate::categories::categorize(node.name()) == cat
     };
-    let child_matches = node.children().iter().any(|c| {
+    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
+    let child_matches = node.children().iter().fold(false, |acc, c| {
         buf.push(c.name());
         let m = build_cat_match_inner(c, cat, buf, cache);
         buf.pop();
-        m
+        acc || m
     });
     if self_matches || child_matches {
         cache.insert(buf.clone());
@@ -834,6 +836,40 @@ mod tests {
         assert!(cache.contains(&PathBuf::from("root/src/main.rs"))); // direct match
         assert!(!cache.contains(&PathBuf::from("root/docs"))); // no matching descendant
         assert!(!cache.contains(&PathBuf::from("root/docs/readme.md"))); // no match
+    }
+
+    #[test]
+    fn build_text_match_cache_visits_all_siblings() {
+        // Regression: any() short-circuits, so second matching sibling could be missed.
+        let tree = dir(
+            "root",
+            vec![
+                dir("a", vec![leaf("main.rs", 50)]),
+                dir("b", vec![leaf("main.py", 30)]),
+            ],
+        );
+        let cache = build_text_match_cache(&tree, "main");
+        assert!(cache.contains(&PathBuf::from("root/a")));
+        assert!(cache.contains(&PathBuf::from("root/a/main.rs")));
+        assert!(cache.contains(&PathBuf::from("root/b")));
+        assert!(cache.contains(&PathBuf::from("root/b/main.py")));
+    }
+
+    #[test]
+    fn build_category_match_cache_visits_all_siblings() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("a", vec![leaf("clip1.mp4", 100)]),
+                dir("b", vec![leaf("clip2.mp4", 200)]),
+            ],
+        );
+        let cache =
+            build_category_match_cache(&tree, crate::categories::FileCategory::Video);
+        assert!(cache.contains(&PathBuf::from("root/a")));
+        assert!(cache.contains(&PathBuf::from("root/a/clip1.mp4")));
+        assert!(cache.contains(&PathBuf::from("root/b")));
+        assert!(cache.contains(&PathBuf::from("root/b/clip2.mp4")));
     }
 
     #[test]

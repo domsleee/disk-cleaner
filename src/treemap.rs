@@ -265,6 +265,260 @@ fn breadcrumbs_walk(
     false
 }
 
+// ─── Cached treemap layout ─────────────────────────────────────
+
+pub struct TreemapCache {
+    pub tiles: Vec<TreemapTile>,
+    pub other: Option<OtherBucket>,
+    pub breadcrumbs: Vec<(String, PathBuf)>,
+    pub view_size: u64,
+    pub layout_size: (f32, f32),
+}
+
+pub struct TreemapTile {
+    pub rect: egui::Rect,
+    pub path: PathBuf,
+    pub name: Box<str>,
+    pub size: u64,
+    pub is_dir: bool,
+    pub color: egui::Color32,
+    pub child_count: Option<usize>,
+    pub nested: Vec<NestedTile>,
+}
+
+pub struct NestedTile {
+    pub rect: egui::Rect,
+    pub path: PathBuf,
+    pub name: Box<str>,
+    pub is_dir: bool,
+    pub color: egui::Color32,
+}
+
+pub struct OtherBucket {
+    pub rect: egui::Rect,
+    pub count: usize,
+    pub size: u64,
+}
+
+/// Build a cached treemap layout from the given tree and parameters.
+///
+/// This extracts all filtering + squarifying logic from `render_treemap` into a
+/// pure function whose result can be stored and reused across frames.
+pub fn build_treemap_cache(
+    root: &FileNode,
+    zoom_path: &Option<PathBuf>,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    full_rect: egui::Rect,
+) -> TreemapCache {
+    let root_path = PathBuf::from(root.name());
+
+    // Resolve the node we're viewing and its full path
+    let (view_node, view_path) = if let Some(ref zp) = zoom_path {
+        match find_node(root, zp) {
+            Some(n) => (n, zp.clone()),
+            None => (root, root_path.clone()),
+        }
+    } else {
+        (root, root_path.clone())
+    };
+
+    // Build breadcrumb trail
+    let crumbs = zoom_path
+        .as_ref()
+        .map(|p| breadcrumbs(root, p))
+        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
+
+    let view_size = view_node.size();
+
+    // Empty directory — return empty cache
+    if view_node.children().is_empty() {
+        return TreemapCache {
+            tiles: vec![],
+            other: None,
+            breadcrumbs: crumbs,
+            view_size,
+            layout_size: (full_rect.width(), full_rect.height()),
+        };
+    }
+
+    // Filter children by size, hidden status, and optional category
+    let all_children: Vec<&FileNode> = view_node
+        .children()
+        .iter()
+        .filter(|c| c.size() > 0)
+        .filter(|c| show_hidden || !c.name().starts_with('.'))
+        .filter(|c| {
+            category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
+        })
+        .collect();
+
+    if all_children.is_empty() {
+        return TreemapCache {
+            tiles: vec![],
+            other: None,
+            breadcrumbs: crumbs,
+            view_size,
+            layout_size: (full_rect.width(), full_rect.height()),
+        };
+    }
+
+    // Collapse tiny files into an "Other" bucket to reduce visual noise.
+    // Files below 0.5% of total size are grouped together.
+    let total_size: u64 = all_children.iter().map(|c| c.size()).sum();
+    let threshold = (total_size as f64 * 0.005) as u64; // 0.5%
+    let mut children: Vec<&FileNode> = Vec::new();
+    let mut other_size: u64 = 0;
+    let mut other_count: usize = 0;
+    for c in &all_children {
+        if c.size() < threshold && !c.is_dir() {
+            other_size += c.size();
+            other_count += 1;
+        } else {
+            children.push(c);
+        }
+    }
+
+    // Hard cap: if we still have too many entries, keep only the largest
+    // and fold the rest into "Other".
+    if children.len() > MAX_VISIBLE_ENTRIES {
+        children.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        for c in children.drain(MAX_VISIBLE_ENTRIES..) {
+            other_size += c.size();
+            other_count += 1;
+        }
+    }
+
+    let has_other = other_count > 0 && other_size > 0;
+    let entry_count = children.len() + if has_other { 1 } else { 0 };
+
+    if entry_count == 0 {
+        return TreemapCache {
+            tiles: vec![],
+            other: None,
+            breadcrumbs: crumbs,
+            view_size,
+            layout_size: (full_rect.width(), full_rect.height()),
+        };
+    }
+
+    // Compute squarified layout
+    let mut sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
+    if has_other {
+        sizes.push(other_size as f64);
+    }
+    let rects = squarify(
+        &sizes,
+        full_rect.min.x,
+        full_rect.min.y,
+        full_rect.width(),
+        full_rect.height(),
+    );
+
+    // Build tiles for real children
+    let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
+    for (i, child) in children.iter().enumerate() {
+        let r = rects[i].shrink(GAP);
+        if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
+            continue;
+        }
+        let child_path = view_path.join(child.name());
+        let is_dir = child.is_dir();
+        let color = extension_color(child.name(), is_dir);
+        let child_count = if is_dir { Some(child.children().len()) } else { None };
+
+        // Build nested sub-tiles for directory tiles large enough
+        let nested = if is_dir && r.width() > 24.0 && r.height() > DIR_HEADER_H + 12.0 {
+            build_nested_tiles(child, &child_path, r)
+        } else {
+            vec![]
+        };
+
+        tiles.push(TreemapTile {
+            rect: r,
+            path: child_path,
+            name: child.name().into(),
+            size: child.size(),
+            is_dir,
+            color,
+            child_count,
+            nested,
+        });
+    }
+
+    // Build Other bucket if needed
+    let other = if has_other {
+        let other_idx = children.len();
+        let r = rects[other_idx].shrink(GAP);
+        Some(OtherBucket {
+            rect: r,
+            count: other_count,
+            size: other_size,
+        })
+    } else {
+        None
+    };
+
+    TreemapCache {
+        tiles,
+        other,
+        breadcrumbs: crumbs,
+        view_size,
+        layout_size: (full_rect.width(), full_rect.height()),
+    }
+}
+
+/// Build nested sub-tiles for the children of a directory tile.
+///
+/// Extracts the nested layout logic from `paint_directory`.
+fn build_nested_tiles(node: &FileNode, node_path: &Path, rect: egui::Rect) -> Vec<NestedTile> {
+    let content_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 1.0, rect.min.y + DIR_HEADER_H),
+        egui::pos2(rect.max.x - 1.0, rect.max.y - 1.0),
+    );
+
+    if content_rect.width() <= 4.0 || content_rect.height() <= 4.0 || node.children().is_empty() {
+        return vec![];
+    }
+
+    let mut nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
+    if nested.is_empty() {
+        return vec![];
+    }
+    if nested.len() > MAX_NESTED_CHILDREN {
+        nested.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        nested.truncate(MAX_NESTED_CHILDREN);
+    }
+
+    let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
+    let child_rects = squarify(
+        &child_sizes,
+        content_rect.min.x,
+        content_rect.min.y,
+        content_rect.width(),
+        content_rect.height(),
+    );
+
+    let mut result = Vec::with_capacity(nested.len());
+    for (j, child) in nested.iter().enumerate() {
+        let cr = child_rects[j].shrink(0.5);
+        if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
+            continue;
+        }
+        let child_path = node_path.join(child.name());
+        let is_dir = child.is_dir();
+        let color = extension_color(child.name(), is_dir);
+        result.push(NestedTile {
+            rect: cr,
+            path: child_path,
+            name: child.name().into(),
+            is_dir,
+            color,
+        });
+    }
+    result
+}
+
 // ─── Treemap actions ────────────────────────────────────────────
 
 pub enum TreemapAction {
@@ -1181,5 +1435,103 @@ mod tests {
         let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
         assert_eq!(bc.len(), 3);
         assert_eq!(bc[2].0, "file.txt");
+    }
+
+    // ── build_treemap_cache tests ──
+
+    #[test]
+    fn build_cache_basic() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("big", vec![leaf("a.mp4", 500), leaf("b.rs", 200)]),
+                leaf("c.txt", 300),
+            ],
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 2);
+        assert!(cache.other.is_none());
+        assert_eq!(cache.view_size, 1000);
+        assert_eq!(cache.layout_size, (800.0, 600.0));
+        assert_eq!(cache.breadcrumbs.len(), 1);
+        assert_eq!(cache.breadcrumbs[0].0, "root");
+    }
+
+    #[test]
+    fn build_cache_with_zoom() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("sub", vec![leaf("a.txt", 100), leaf("b.txt", 200)]),
+                leaf("c.txt", 50),
+            ],
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let zoom = Some(std::path::PathBuf::from("root/sub"));
+        let cache = build_treemap_cache(&tree, &zoom, None, true, rect);
+        assert_eq!(cache.tiles.len(), 2);
+        assert_eq!(cache.view_size, 300);
+        assert_eq!(cache.breadcrumbs.len(), 2);
+        assert_eq!(cache.breadcrumbs[1].0, "sub");
+    }
+
+    #[test]
+    fn build_cache_other_bucket() {
+        let mut children: Vec<FileNode> = vec![leaf("big.mp4", 10000)];
+        for i in 0..20 {
+            children.push(leaf(&format!("tiny_{i}.txt"), 1));
+        }
+        let tree = dir("root", children);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert!(cache.other.is_some());
+        let other = cache.other.as_ref().unwrap();
+        assert_eq!(other.count, 20);
+        assert_eq!(other.size, 20);
+    }
+
+    #[test]
+    fn build_cache_dir_tile_has_nested() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "sub",
+                vec![leaf("a.mp4", 500), leaf("b.rs", 300), leaf("c.txt", 200)],
+            )],
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        let tile = &cache.tiles[0];
+        assert!(tile.is_dir);
+        assert_eq!(tile.child_count, Some(3));
+        assert_eq!(tile.nested.len(), 3);
+    }
+
+    #[test]
+    fn build_cache_hidden_filtered() {
+        let tree = dir(
+            "root",
+            vec![leaf(".hidden", 500), leaf("visible.txt", 500)],
+        );
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, false, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert_eq!(&*cache.tiles[0].name, "visible.txt");
+    }
+
+    #[test]
+    fn build_cache_tile_colors_and_paths() {
+        let tree = dir("root", vec![leaf("movie.mp4", 100)]);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let tile = &cache.tiles[0];
+        assert_eq!(&*tile.name, "movie.mp4");
+        assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
+        assert_eq!(tile.color, extension_color("movie.mp4", false));
+        assert!(!tile.is_dir);
+        assert_eq!(tile.child_count, None);
     }
 }

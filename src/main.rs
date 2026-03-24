@@ -176,6 +176,10 @@ struct App {
     confirm_delete: Option<PathBuf>,
     confirm_batch_delete: bool,
     search_query: String,
+    /// The search query currently applied to the cached rows (debounced).
+    applied_search: String,
+    /// When the search text last changed (for debouncing).
+    search_changed_at: Option<Instant>,
     focused_path: Option<PathBuf>,
     last_scan_path: Option<PathBuf>,
     view_mode: ViewMode,
@@ -238,6 +242,8 @@ impl Default for App {
             confirm_delete: None,
             confirm_batch_delete: false,
             search_query: String::new(),
+            applied_search: String::new(),
+            search_changed_at: None,
             focused_path: None,
             last_scan_path,
             view_mode: ViewMode::Tree,
@@ -320,10 +326,10 @@ impl App {
             return;
         }
 
-        let text_cache = if !self.search_query.is_empty() {
+        let text_cache = if !self.applied_search.is_empty() {
             self.tree
                 .as_ref()
-                .map(|t| ui::build_text_match_cache(t, &self.search_query))
+                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
         } else {
             None
         };
@@ -339,7 +345,7 @@ impl App {
         if let Some(ref tree) = self.tree {
             self.cached_rows = ui::collect_cached_rows(
                 tree,
-                &self.search_query,
+                &self.applied_search,
                 self.category_filter,
                 self.show_hidden,
                 text_cache.as_ref(),
@@ -460,6 +466,17 @@ impl eframe::App for App {
         // Log startup time on first frame
         if let Some(start) = self.process_start.take() {
             eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
+        }
+
+        // Apply debounced search query after 150ms of no typing
+        if let Some(changed_at) = self.search_changed_at {
+            if changed_at.elapsed() >= Duration::from_millis(150) {
+                self.applied_search = self.search_query.clone();
+                self.search_changed_at = None;
+                self.rows_dirty = true;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
         }
 
         // Load system icons on first frame
@@ -894,10 +911,12 @@ impl eframe::App for App {
                         if response.changed() {
                             // Convert to lowercase once; node_matches uses lowercase comparison
                             self.search_query = self.search_query.to_lowercase();
-                            self.rows_dirty = true;
+                            self.search_changed_at = Some(Instant::now());
                         }
                         if !self.search_query.is_empty() && ui.small_button("×").clicked() {
                             self.search_query.clear();
+                            self.applied_search.clear();
+                            self.search_changed_at = None;
                             self.rows_dirty = true;
                         }
                     }

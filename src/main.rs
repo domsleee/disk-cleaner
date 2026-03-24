@@ -200,6 +200,9 @@ struct App {
     /// Cached visible row list for rendering; rebuilt when dirty.
     cached_rows: Vec<ui::CachedRow>,
     rows_dirty: bool,
+    /// Cached treemap layout; rebuilt when treemap_dirty.
+    treemap_cache: Option<treemap::TreemapCache>,
+    treemap_dirty: bool,
     /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
     selected_paths: HashSet<PathBuf>,
     /// Anchor path for shift+click range selection.
@@ -263,6 +266,8 @@ impl Default for App {
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
             rows_dirty: true,
+            treemap_cache: None,
+            treemap_dirty: true,
             selected_paths: HashSet::new(),
             selection_anchor: None,
             suggestion_report: None,
@@ -357,6 +362,12 @@ impl App {
         self.rows_dirty = false;
     }
 
+    /// Mark both tree-view and treemap caches as needing rebuild.
+    fn mark_dirty(&mut self) {
+        self.rows_dirty = true;
+        self.treemap_dirty = true;
+    }
+
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
         self.start_background_delete(paths, true);
@@ -416,7 +427,7 @@ impl App {
                         any_deleted = true;
                         if let Some(ref mut tree) = self.tree {
                             ui::remove_node(tree, &path);
-                            self.rows_dirty = true;
+                            self.mark_dirty();
                         }
                     }
                 }
@@ -473,7 +484,7 @@ impl eframe::App for App {
             if changed_at.elapsed() >= Duration::from_millis(150) {
                 self.applied_search = self.search_query.clone();
                 self.search_changed_at = None;
-                self.rows_dirty = true;
+                self.mark_dirty();
             } else {
                 let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
                 ctx.request_repaint_after(remaining);
@@ -499,7 +510,7 @@ impl eframe::App for App {
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;
-                self.rows_dirty = true;
+                self.mark_dirty();
 
                 // Report frame-time stats for the scan
                 if let Some(scan_start) = self.scan_start_time.take() {
@@ -688,7 +699,7 @@ impl eframe::App for App {
                             if left {
                                 if is_dir && expanded {
                                     ui::set_expanded(tree, focused, false);
-                                    self.rows_dirty = true;
+                                    self.mark_dirty();
                                 } else if let Some(parent) = ui::find_parent_path(tree, focused) {
                                     self.focused_path = Some(parent);
                                     self.tree_scroll_to_focus = true;
@@ -696,7 +707,7 @@ impl eframe::App for App {
                             } else if right {
                                 if is_dir && !expanded && has_children {
                                     ui::set_expanded(tree, focused, true);
-                                    self.rows_dirty = true;
+                                    self.mark_dirty();
                                 } else if is_dir && expanded {
                                     let rows = &self.cached_rows;
                                     if let Some(idx) = rows.iter().position(|r| &r.path == focused) {
@@ -723,7 +734,7 @@ impl eframe::App for App {
                 if space {
                     if let Some(ref mut tree) = self.tree {
                         ui::toggle_expand(tree, focused);
-                        self.rows_dirty = true;
+                        self.mark_dirty();
                     }
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
@@ -733,7 +744,7 @@ impl eframe::App for App {
                     } else {
                         if let Some(ref mut tree) = self.tree {
                             ui::remove_node(tree, focused);
-                            self.rows_dirty = true;
+                            self.mark_dirty();
                         }
                         self.refresh_disk_info();
                     }
@@ -826,7 +837,7 @@ impl eframe::App for App {
                 Ok(()) => {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
-                        self.rows_dirty = true;
+                        self.mark_dirty();
                     }
                     self.selected_paths.remove(&path);
                     self.refresh_disk_info();
@@ -918,7 +929,7 @@ impl eframe::App for App {
                             self.search_query.clear();
                             self.applied_search.clear();
                             self.search_changed_at = None;
-                            self.rows_dirty = true;
+                            self.mark_dirty();
                         }
                     }
 
@@ -930,7 +941,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.show_hidden = !self.show_hidden;
-                            self.rows_dirty = true;
+                            self.mark_dirty();
                             // Persist preference
                             if let Some(ref path) = self.last_scan_path {
                                 save_config(path, self.show_hidden);
@@ -952,7 +963,7 @@ impl eframe::App for App {
                             self.show_categories = !self.show_categories;
                             if !self.show_categories {
                                 self.category_filter = None;
-                                self.rows_dirty = true;
+                                self.mark_dirty();
                             }
                         }
                     }
@@ -993,6 +1004,7 @@ impl eframe::App for App {
                         {
                             self.category_filter = None;
                             self.rows_dirty = true;
+                            self.treemap_dirty = true;
                         }
 
                         ui.add_space(4.0);
@@ -1057,6 +1069,7 @@ impl eframe::App for App {
                                     self.category_filter = Some(cat);
                                 }
                                 self.rows_dirty = true;
+                                self.treemap_dirty = true;
                             }
 
                             ui.add_space(2.0);
@@ -1416,7 +1429,7 @@ impl eframe::App for App {
                                 } else {
                                     if let Some(ref mut tree) = self.tree {
                                         ui::remove_node(tree, path);
-                                        self.rows_dirty = true;
+                                        self.mark_dirty();
                                     }
                                     self.refresh_disk_info();
                                 }
@@ -1449,6 +1462,7 @@ impl eframe::App for App {
                             if let ui::TreeAction::ToggleExpand(path) = action {
                                 ui::toggle_expand(tree, path);
                                 self.rows_dirty = true;
+                                self.treemap_dirty = true;
                             }
                         }
                     }
@@ -1473,6 +1487,7 @@ impl eframe::App for App {
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
                                         self.treemap_zoom = new_zoom;
+                                        self.treemap_dirty = true;
                                     }
                                 }
                                 TreemapAction::Focus(path) => {
@@ -1498,6 +1513,7 @@ impl eframe::App for App {
                                         if let Some(ref mut tree) = self.tree {
                                             ui::remove_node(tree, &path);
                                             self.rows_dirty = true;
+                                            self.treemap_dirty = true;
                                         }
                                         needs_disk_refresh = true;
                                     }
@@ -1516,6 +1532,7 @@ impl eframe::App for App {
                                             if let Some(ref mut tree) = self.tree {
                                                 ui::remove_node(tree, &path);
                                                 self.rows_dirty = true;
+                                                self.treemap_dirty = true;
                                             }
                                             needs_disk_refresh = true;
                                         }

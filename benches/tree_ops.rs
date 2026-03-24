@@ -155,11 +155,11 @@ fn bench_count_selected(c: &mut Criterion) {
     ];
 
     for (label, tree) in &cases {
-        let n = count_nodes(&tree);
+        let n = count_nodes(tree);
 
         // Collect all paths, then select ~10% of them
         let mut all_paths = Vec::new();
-        collect_paths(&tree, &mut PathBuf::new(), &mut all_paths);
+        collect_paths(tree, &mut PathBuf::new(), &mut all_paths);
         let selected: HashSet<PathBuf> = all_paths.iter().step_by(10).cloned().collect();
 
         let sel_count = selected.len();
@@ -211,7 +211,7 @@ fn bench_sort_by_size(c: &mut Criterion) {
             b.iter_batched(
                 || build_unsorted_children(n),
                 |mut v| {
-                    v.sort_by(|a, b| b.size().cmp(&a.size()));
+                    v.sort_by_key(|a| std::cmp::Reverse(a.size()));
                     v
                 },
                 criterion::BatchSize::LargeInput,

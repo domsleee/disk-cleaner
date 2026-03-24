@@ -42,7 +42,11 @@ name = "view_bench"
 harness = false
 
 [profile.release]
-lto = true
+lto = "thin"
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[profile.release-dist]
+inherits = "release"
+lto = true

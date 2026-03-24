@@ -125,7 +125,8 @@ fn build_cat_match_inner(
     }
 }
 
-/// Case-insensitive substring search without allocating.
+/// ASCII case-insensitive substring search without allocating.
+/// Only folds a-z/A-Z; non-ASCII characters are compared as-is.
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;

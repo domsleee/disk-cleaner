@@ -475,7 +475,8 @@ impl eframe::App for App {
                 self.search_changed_at = None;
                 self.rows_dirty = true;
             } else {
-                ctx.request_repaint_after(Duration::from_millis(150));
+                let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
+                ctx.request_repaint_after(remaining);
             }
         }
 

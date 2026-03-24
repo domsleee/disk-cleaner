@@ -319,12 +319,31 @@ impl App {
         if !self.rows_dirty {
             return;
         }
+
+        let text_cache = if !self.search_query.is_empty() {
+            self.tree
+                .as_ref()
+                .map(|t| ui::build_text_match_cache(t, &self.search_query))
+        } else {
+            None
+        };
+
+        let cat_cache = if let Some(cat) = self.category_filter {
+            self.tree
+                .as_ref()
+                .map(|t| ui::build_category_match_cache(t, cat))
+        } else {
+            None
+        };
+
         if let Some(ref tree) = self.tree {
             self.cached_rows = ui::collect_cached_rows(
                 tree,
                 &self.search_query,
                 self.category_filter,
                 self.show_hidden,
+                text_cache.as_ref(),
+                cat_cache.as_ref(),
             );
         } else {
             self.cached_rows.clear();

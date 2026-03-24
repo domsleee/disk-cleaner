@@ -83,7 +83,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
             BenchmarkId::new("all_expanded", n),
             &tree,
             |b, t| {
-                b.iter(|| ui::collect_cached_rows(t, "", None, true))
+                b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
             },
         );
     }
@@ -98,7 +98,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
             BenchmarkId::new("root_only", n),
             &tree,
             |b, t| {
-                b.iter(|| ui::collect_cached_rows(t, "", None, true))
+                b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
             },
         );
     }
@@ -112,7 +112,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
             BenchmarkId::new("filter_hit", n),
             &tree,
             |b, t| {
-                b.iter(|| ui::collect_cached_rows(t, "file_5", None, true))
+                b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None))
             },
         );
 
@@ -120,7 +120,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
             BenchmarkId::new("filter_miss", n),
             &tree,
             |b, t| {
-                b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true))
+                b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None))
             },
         );
     }
@@ -140,6 +140,8 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
                         "",
                         Some(categories::FileCategory::Video),
                         true,
+                        None,
+                        None,
                     )
                 })
             },

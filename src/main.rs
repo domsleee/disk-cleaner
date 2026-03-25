@@ -537,7 +537,7 @@ impl eframe::App for App {
                     let n = ft.len();
                     if n > 0 {
                         let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
-                        let p99 = ft[(n as f64 * 0.99) as usize];
+                        let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
                         let over = ft
                             .iter()
                             .filter(|d| **d > Duration::from_millis(16))
@@ -758,16 +758,8 @@ impl eframe::App for App {
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
                 } else if del {
-                    if let Err(e) = trash::delete(focused) {
-                        self.error = Some(format!("Trash failed: {e}"));
-                    } else {
-                        if let Some(ref mut tree) = self.tree {
-                            ui::remove_node(tree, focused);
-                            self.mark_dirty();
-                        }
-                        self.refresh_disk_info();
-                    }
                     self.selected_paths.remove(focused);
+                    self.start_background_delete(vec![focused.clone()], true);
                     self.focused_path = None;
                 }
             }
@@ -1464,10 +1456,13 @@ impl eframe::App for App {
                                 self.confirm_batch_delete = true;
                             }
                             ui::TreeAction::RevealInFinder(path) => {
-                                let _ = std::process::Command::new("open")
+                                if let Err(e) = std::process::Command::new("open")
                                     .arg("-R")
                                     .arg(path)
-                                    .spawn();
+                                    .spawn()
+                                {
+                                    self.error = Some(format!("Could not reveal in Finder: {e}"));
+                                }
                             }
                             ui::TreeAction::CopyPath(path) => {
                                 ctx.copy_text(path.display().to_string());
@@ -1525,7 +1520,9 @@ impl eframe::App for App {
                     }
                 }
                 ViewMode::Suggestions => {
-                    let mut needs_disk_refresh = false;
+                    // Collect actions and trash paths while report is borrowed,
+                    // then apply deletions after the borrow is released.
+                    let mut trash_paths: Vec<PathBuf> = Vec::new();
                     if let Some(ref mut report) = self.suggestion_report {
                         let sg_actions = suggestions_ui::render_suggestions(ui, report);
                         for action in sg_actions {
@@ -1534,42 +1531,21 @@ impl eframe::App for App {
                                     report.groups[idx].expanded = !report.groups[idx].expanded;
                                 }
                                 suggestions_ui::SuggestionAction::TrashItem(path) => {
-                                    if let Err(e) = trash::delete(&path) {
-                                        self.error = Some(format!("Trash failed: {e}"));
-                                    } else {
-                                        if let Some(ref mut tree) = self.tree {
-                                            ui::remove_node(tree, &path);
-                                            self.rows_dirty = true;
-                                            self.treemap_dirty = true;
-                                        }
-                                        needs_disk_refresh = true;
-                                    }
+                                    trash_paths.push(path);
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
-                                    let paths: Vec<PathBuf> = report.groups[idx]
-                                        .items
-                                        .iter()
-                                        .map(|i| i.path.clone())
-                                        .collect();
-                                    for path in paths {
-                                        if let Err(e) = trash::delete(&path) {
-                                            self.error = Some(format!("Trash failed: {e}"));
-                                            break;
-                                        } else {
-                                            if let Some(ref mut tree) = self.tree {
-                                                ui::remove_node(tree, &path);
-                                                self.rows_dirty = true;
-                                                self.treemap_dirty = true;
-                                            }
-                                            needs_disk_refresh = true;
-                                        }
-                                    }
+                                    trash_paths.extend(
+                                        report.groups[idx]
+                                            .items
+                                            .iter()
+                                            .map(|i| i.path.clone()),
+                                    );
                                 }
                             }
                         }
                     }
-                    if needs_disk_refresh {
-                        self.refresh_disk_info();
+                    if !trash_paths.is_empty() {
+                        self.start_background_delete(trash_paths, true);
                     }
                 }
             }

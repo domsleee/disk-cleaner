@@ -1469,39 +1469,17 @@ impl eframe::App for App {
                 }
                 ViewMode::Treemap => {
                     if let Some(ref tree) = self.tree {
-                        let available = ui.available_size();
-                        let needs_rebuild = self.treemap_dirty
-                            || self.treemap_cache.is_none()
-                            || self.treemap_cache.as_ref().is_some_and(|c| {
-                                (c.layout_size.0 - available.x).abs() > 1.0
-                                    || (c.layout_size.1 - available.y).abs() > 1.0
-                            });
-
-                        if needs_rebuild {
-                            let rect = egui::Rect::from_min_size(
-                                ui.cursor().min,
-                                available,
-                            );
-                            self.treemap_cache = Some(treemap::build_treemap_cache(
-                                tree,
-                                &self.treemap_zoom,
-                                self.category_filter,
-                                self.show_hidden,
-                                rect,
-                            ));
-                            self.treemap_dirty = false;
-                        }
-
-                        let tm_actions = if let Some(ref cache) = self.treemap_cache {
-                            treemap::render_treemap(
-                                ui,
-                                cache,
-                                &self.focused_path,
-                                self.treemap_zoom_anim,
-                            )
-                        } else {
-                            Vec::new()
-                        };
+                        let tm_actions = treemap::render_treemap(
+                            ui,
+                            &mut self.treemap_cache,
+                            &mut self.treemap_dirty,
+                            tree,
+                            &self.treemap_zoom,
+                            &self.focused_path,
+                            self.treemap_zoom_anim,
+                            self.category_filter,
+                            self.show_hidden,
+                        );
 
                         for action in tm_actions {
                             match action {

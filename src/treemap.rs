@@ -542,16 +542,32 @@ const MAX_NESTED_CHILDREN: usize = 100;
 /// Returns user-triggered actions.
 pub fn render_treemap(
     ui: &mut egui::Ui,
-    cache: &TreemapCache,
+    cache: &mut Option<TreemapCache>,
+    cache_dirty: &mut bool,
+    root: &FileNode,
+    zoom_path: &Option<PathBuf>,
     focused_path: &Option<PathBuf>,
     zoom_anim_start: Option<f64>,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
-    let crumbs = &cache.breadcrumbs;
+    let root_path = PathBuf::from(root.name());
 
-    // ── Breadcrumb bar ──
+    // ── Breadcrumb bar (cheap — no cache needed) ──
+    let crumbs = zoom_path
+        .as_ref()
+        .map(|p| breadcrumbs(root, p))
+        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+    let view_size = cache.as_ref().map(|c| c.view_size).unwrap_or_else(|| {
+        if let Some(ref zp) = zoom_path {
+            find_node(root, zp).map_or(root.size(), |n| n.size())
+        } else {
+            root.size()
+        }
+    });
+
     ui.horizontal(|ui| {
-        // Back button — only shown when zoomed into a subdirectory
         if crumbs.len() > 1 {
             let parent_path = crumbs[crumbs.len() - 2].1.clone();
             if ui.button("< Back").clicked() {
@@ -573,7 +589,7 @@ pub fn render_treemap(
                 actions.push(TreemapAction::ZoomTo(path.clone()));
             }
         }
-        ui.label(format!("  ({})", ByteSize::b(cache.view_size)));
+        ui.label(format!("  ({})", ByteSize::b(view_size)));
     });
 
     ui.add_space(4.0);
@@ -594,6 +610,25 @@ pub fn render_treemap(
     let available = ui.available_size();
     let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
     let painter = ui.painter_at(full_rect);
+
+    // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
+    let needs_rebuild = *cache_dirty
+        || cache.is_none()
+        || cache.as_ref().is_some_and(|c| {
+            (c.layout_size.0 - full_rect.width()).abs() > 1.0
+                || (c.layout_size.1 - full_rect.height()).abs() > 1.0
+        });
+    if needs_rebuild {
+        *cache = Some(build_treemap_cache(
+            root,
+            zoom_path,
+            category_filter,
+            show_hidden,
+            full_rect,
+        ));
+        *cache_dirty = false;
+    }
+    let cache = cache.as_ref().unwrap();
 
     // Background
     painter.rect_filled(full_rect, 0.0, ui.visuals().extreme_bg_color);

@@ -468,6 +468,71 @@ fn full_pipeline_scan_select_clear() {
 // Scan cancellation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Disclosure triangle click clears stale selection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disclosure_triangle_click_clears_selection() {
+    let tmp = tmpdir();
+    let root = tmp.path();
+
+    fs::create_dir(root.join("folder_a")).unwrap();
+    create_file(&root.join("folder_a"), "a.txt", 100);
+    fs::create_dir(root.join("folder_b")).unwrap();
+    create_file(&root.join("folder_b"), "b.txt", 200);
+
+    let mut tree = scan(root);
+
+    // Simulate the app state fields relevant to selection
+    let mut selected_paths: HashSet<PathBuf> = HashSet::new();
+    // --- Step 1: Plain click on folder_a (Click action) ---
+    // This mirrors the Click handler in main.rs
+    let click_path = root.join("folder_a");
+    selected_paths.clear();
+    selected_paths.insert(click_path.clone());
+    let mut focused_path: Option<PathBuf> = Some(click_path.clone());
+
+    assert_eq!(selected_paths.len(), 1);
+    assert!(selected_paths.contains(&click_path));
+    assert_eq!(focused_path.as_deref(), Some(click_path.as_path()));
+
+    // --- Step 2: Click disclosure triangle on folder_b ---
+    // The UI emits two actions: Focus(folder_b) + ToggleExpand(folder_b)
+    let triangle_path = root.join("folder_b");
+
+    // Focus action (processed first in the action loop)
+    focused_path = Some(triangle_path.clone());
+
+    // ToggleExpand action (processed in the second loop)
+    ui::toggle_expand(&mut tree, &triangle_path);
+    selected_paths.clear(); // <-- the fix under test
+
+    // --- Assertions ---
+    // Selection must be empty (no ghost highlight on folder_a)
+    assert!(
+        selected_paths.is_empty(),
+        "selected_paths should be empty after disclosure triangle click"
+    );
+    // Focus should point to the triangle-clicked row
+    assert_eq!(
+        focused_path.as_deref(),
+        Some(triangle_path.as_path()),
+        "focused_path should be set to the disclosure-triangle target"
+    );
+    // The folder should now be expanded
+    let folder_b = tree
+        .children()
+        .iter()
+        .find(|c| c.name() == "folder_b")
+        .unwrap();
+    assert!(folder_b.expanded(), "folder_b should be expanded after toggle");
+}
+
+// ---------------------------------------------------------------------------
+// Scan cancellation
+// ---------------------------------------------------------------------------
+
 #[test]
 fn cancelled_scan_stops_early() {
     let tmp = tmpdir();

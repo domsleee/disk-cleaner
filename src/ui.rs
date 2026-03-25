@@ -415,8 +415,9 @@ pub fn render_tree(
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                     if row.is_dir && pos.x <= toggle_right {
-                        // Click on disclosure triangle area → toggle expand
+                        // Click on disclosure triangle area → toggle expand + focus
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
+                        actions.push(TreeAction::Focus(row.path.clone()));
                     } else {
                         // Click on content area → select/focus
                         let (shift, toggle) =
@@ -560,6 +561,16 @@ pub fn render_tree(
     actions
 }
 
+/// Get the next path component name to navigate toward when searching for `target`
+/// from the current position `buf`. Returns None if `target` doesn't start with `buf`.
+fn next_component_name<'a>(target: &'a Path, buf: &Path) -> Option<&'a str> {
+    target
+        .strip_prefix(buf)
+        .ok()
+        .and_then(|remaining| remaining.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+}
+
 /// Toggle expand/collapse for the node at `target`. Returns true if found.
 pub fn toggle_expand(node: &mut FileNode, target: &Path) -> bool {
     let mut buf = PathBuf::from(node.name());
@@ -573,13 +584,15 @@ fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) ->
         return true;
     }
     if let FileNode::Dir(d) = node {
-        for child in &mut d.children {
-            buf.push(child.name());
-            if toggle_expand_inner(child, target, buf) {
-                buf.pop();
-                return true;
+        if let Some(next) = next_component_name(target, buf) {
+            for child in &mut d.children {
+                if child.name() == next {
+                    buf.push(child.name());
+                    let found = toggle_expand_inner(child, target, buf);
+                    buf.pop();
+                    return found;
+                }
             }
-            buf.pop();
         }
     }
     false
@@ -594,33 +607,37 @@ pub fn remove_node(node: &mut FileNode, target: &Path) -> Option<u64> {
 fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> Option<u64> {
     let d = node.as_dir_mut()?;
 
-    // Check direct children
-    let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
-        let child_path = buf.join(c.name());
-        if child_path == target {
-            Some(i)
-        } else {
-            None
-        }
-    });
+    if let Some(next) = next_component_name(target, &buf) {
+        let next_str = next;
 
-    if let Some(pos) = found_pos {
-        let removed_size = d.children[pos].size();
-        d.children.remove(pos);
-        d.size -= removed_size;
-        return Some(removed_size);
-    }
-
-    // Recurse into child directories
-    for child in &mut d.children {
-        if child.is_dir() {
-            buf.push(child.name());
-            if let Some(removed_size) = remove_node_inner(child, target, buf) {
-                buf.pop();
-                d.size -= removed_size;
-                return Some(removed_size);
+        // Check if a direct child matches the full target
+        let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
+            if c.name() == next_str && buf.join(c.name()) == target {
+                Some(i)
+            } else {
+                None
             }
-            buf.pop();
+        });
+
+        if let Some(pos) = found_pos {
+            let removed_size = d.children[pos].size();
+            d.children.remove(pos);
+            d.size -= removed_size;
+            return Some(removed_size);
+        }
+
+        // Navigate to the matching child directory
+        for child in &mut d.children {
+            if child.is_dir() && child.name() == next_str {
+                buf.push(child.name());
+                if let Some(removed_size) = remove_node_inner(child, target, buf) {
+                    buf.pop();
+                    d.size -= removed_size;
+                    return Some(removed_size);
+                }
+                buf.pop();
+                return None; // name matched but target not found inside
+            }
         }
     }
 
@@ -635,18 +652,21 @@ pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
 }
 
 fn find_parent_path_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<PathBuf> {
-    for child in node.children() {
-        let child_path = buf.join(child.name());
-        if child_path == target {
-            return Some(buf.clone());
-        }
-        if child.is_dir() {
-            buf.push(child.name());
-            if let Some(parent) = find_parent_path_inner(child, target, buf) {
-                buf.pop();
-                return Some(parent);
+    if let Some(next) = next_component_name(target, buf) {
+        let next_str = next;
+        for child in node.children() {
+            if child.name() == next_str {
+                let child_path = buf.join(child.name());
+                if child_path == target {
+                    return Some(buf.clone());
+                }
+                if child.is_dir() {
+                    buf.push(child.name());
+                    let result = find_parent_path_inner(child, target, buf);
+                    buf.pop();
+                    return result;
+                }
             }
-            buf.pop();
         }
     }
     None
@@ -666,13 +686,16 @@ fn find_node_info_inner(
     if buf.as_path() == target {
         return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
     }
-    for child in node.children() {
-        buf.push(child.name());
-        if let Some(info) = find_node_info_inner(child, target, buf) {
-            buf.pop();
-            return Some(info);
+    if let Some(next) = next_component_name(target, buf) {
+        let next_str = next;
+        for child in node.children() {
+            if child.name() == next_str {
+                buf.push(child.name());
+                let result = find_node_info_inner(child, target, buf);
+                buf.pop();
+                return result;
+            }
         }
-        buf.pop();
     }
     None
 }
@@ -694,13 +717,16 @@ fn set_expanded_inner(
         return true;
     }
     if let FileNode::Dir(d) = node {
-        for child in &mut d.children {
-            buf.push(child.name());
-            if set_expanded_inner(child, target, expanded, buf) {
-                buf.pop();
-                return true;
+        if let Some(next) = next_component_name(target, buf) {
+            let next_str = next;
+            for child in &mut d.children {
+                if child.name() == next_str {
+                    buf.push(child.name());
+                    let found = set_expanded_inner(child, target, expanded, buf);
+                    buf.pop();
+                    return found;
+                }
             }
-            buf.pop();
         }
     }
     false

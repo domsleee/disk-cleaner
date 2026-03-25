@@ -222,10 +222,213 @@ fn bench_sort_by_size(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Tree walk operations at scale (find_node_info, toggle_expand, remove_node,
+// set_expanded, find_parent_path) — these run on every keystroke/click
+// ---------------------------------------------------------------------------
+
+fn bench_tree_walks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tree_walks");
+    group.sample_size(20);
+
+    let cases: Vec<(&str, FileNode)> = vec![
+        ("wide_10k", build_wide_tree(500, 20)),
+        ("wide_100k", build_wide_tree(5_000, 20)),
+    ];
+
+    for (label, tree) in &cases {
+        let n = count_nodes(tree);
+
+        // --- find_node_info: shallow target (first dir) ---
+        let shallow_target = PathBuf::from("root/dir_00000");
+        group.bench_with_input(
+            BenchmarkId::new("find_node_info_shallow", format!("{label}_{n}")),
+            tree,
+            |b, t| b.iter(|| ui::find_node_info(t, &shallow_target)),
+        );
+
+        // --- find_node_info: deep target (last dir, last file) ---
+        let last_dir = format!("dir_{:05}", tree.children().len().saturating_sub(1));
+        let deep_target = PathBuf::from(format!("root/{last_dir}/file_19.dat"));
+        group.bench_with_input(
+            BenchmarkId::new("find_node_info_deep", format!("{label}_{n}")),
+            tree,
+            |b, t| b.iter(|| ui::find_node_info(t, &deep_target)),
+        );
+
+        // --- find_node_info: miss (nonexistent path) ---
+        let miss_target = PathBuf::from("root/nope/nada");
+        group.bench_with_input(
+            BenchmarkId::new("find_node_info_miss", format!("{label}_{n}")),
+            tree,
+            |b, t| b.iter(|| ui::find_node_info(t, &miss_target)),
+        );
+
+        // --- find_parent_path ---
+        group.bench_with_input(
+            BenchmarkId::new("find_parent_path", format!("{label}_{n}")),
+            tree,
+            |b, t| b.iter(|| ui::find_parent_path(t, &deep_target)),
+        );
+    }
+
+    // --- toggle_expand (mutating, use iter_batched) ---
+    for &(n_dirs, files_per_dir) in &[(500, 20), (5_000, 20)] {
+        let n = n_dirs * (files_per_dir + 1) + 1;
+        let mid_dir = format!("root/dir_{:05}", n_dirs / 2);
+        let target = PathBuf::from(&mid_dir);
+
+        group.bench_function(
+            BenchmarkId::new("toggle_expand", format!("{n}")),
+            |b| {
+                b.iter_batched(
+                    || build_wide_tree(n_dirs, files_per_dir),
+                    |mut t| {
+                        ui::toggle_expand(&mut t, &target);
+                        t
+                    },
+                    criterion::BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+
+    // --- set_expanded ---
+    for &(n_dirs, files_per_dir) in &[(500, 20), (5_000, 20)] {
+        let n = n_dirs * (files_per_dir + 1) + 1;
+        let mid_dir = format!("root/dir_{:05}", n_dirs / 2);
+        let target = PathBuf::from(&mid_dir);
+
+        group.bench_function(
+            BenchmarkId::new("set_expanded", format!("{n}")),
+            |b| {
+                b.iter_batched(
+                    || build_wide_tree(n_dirs, files_per_dir),
+                    |mut t| {
+                        ui::set_expanded(&mut t, &target, true);
+                        t
+                    },
+                    criterion::BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+
+    // --- remove_node (mutating) ---
+    for &(n_dirs, files_per_dir) in &[(500, 20), (5_000, 20)] {
+        let n = n_dirs * (files_per_dir + 1) + 1;
+        let target_file = format!("root/dir_{:05}/file_10.dat", n_dirs / 2);
+        let target = PathBuf::from(&target_file);
+
+        group.bench_function(
+            BenchmarkId::new("remove_node", format!("{n}")),
+            |b| {
+                b.iter_batched(
+                    || build_wide_tree(n_dirs, files_per_dir),
+                    |mut t| {
+                        ui::remove_node(&mut t, &target);
+                        t
+                    },
+                    criterion::BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+
+    // --- batch remove_node (simulating multi-delete) ---
+    {
+        let n_dirs = 500;
+        let files_per_dir = 20;
+        let n = n_dirs * (files_per_dir + 1) + 1;
+        // Remove 100 files from different directories
+        let targets: Vec<PathBuf> = (0..100)
+            .map(|i| PathBuf::from(format!("root/dir_{:05}/file_5.dat", i * 5)))
+            .collect();
+
+        group.bench_function(
+            BenchmarkId::new("remove_node_batch_100", format!("{n}")),
+            |b| {
+                b.iter_batched(
+                    || build_wide_tree(n_dirs, files_per_dir),
+                    |mut t| {
+                        for target in &targets {
+                            ui::remove_node(&mut t, target);
+                        }
+                        t
+                    },
+                    criterion::BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Selection building benchmarks (shift-click range, clear, HashSet operations)
+// ---------------------------------------------------------------------------
+
+fn bench_selection_ops(c: &mut Criterion) {
+    let mut group = c.benchmark_group("selection_ops");
+    group.sample_size(20);
+
+    for &(n_dirs, files_per_dir) in &[(500, 20), (5_000, 20)] {
+        let tree = build_wide_tree(n_dirs, files_per_dir);
+        let n = count_nodes(&tree);
+
+        // Collect all paths
+        let mut all_paths = Vec::new();
+        collect_paths(&tree, &mut PathBuf::new(), &mut all_paths);
+
+        // Build a large selection (simulating shift-click range)
+        let range_size = all_paths.len().min(1000);
+        group.bench_function(
+            BenchmarkId::new("build_range_selection", format!("{n}_range{range_size}")),
+            |b| {
+                b.iter(|| {
+                    let sel: HashSet<PathBuf> = all_paths[..range_size].iter().cloned().collect();
+                    sel
+                })
+            },
+        );
+
+        // Lookup in large selection (hot path during rendering)
+        let large_sel: HashSet<PathBuf> = all_paths.iter().step_by(10).cloned().collect();
+        let sel_size = large_sel.len();
+        let lookup_target = all_paths[all_paths.len() / 2].clone();
+        group.bench_function(
+            BenchmarkId::new("selection_contains", format!("{n}_sel{sel_size}")),
+            |b| {
+                b.iter(|| large_sel.contains(&lookup_target))
+            },
+        );
+
+        // Clear large selection
+        group.bench_function(
+            BenchmarkId::new("selection_clear", format!("{n}_sel{sel_size}")),
+            |b| {
+                b.iter_batched(
+                    || large_sel.clone(),
+                    |mut sel| {
+                        sel.clear();
+                        sel
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_node_matches,
     bench_count_selected,
-    bench_sort_by_size
+    bench_sort_by_size,
+    bench_tree_walks,
+    bench_selection_ops,
 );
 criterion_main!(benches);

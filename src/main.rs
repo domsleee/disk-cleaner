@@ -18,6 +18,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use scanner::ScanProgress;
+
+/// Result from the background scan thread — includes pre-computed stats
+/// so they don't block the UI thread.
+struct ScanResult {
+    tree: tree::FileNode,
+    stats: categories::CategoryStats,
+    suggestions: suggestions::SuggestionReport,
+}
 use tree::FileNode;
 use treemap::TreemapAction;
 
@@ -171,7 +179,7 @@ struct App {
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
-    receiver: Option<mpsc::Receiver<FileNode>>,
+    receiver: Option<mpsc::Receiver<ScanResult>>,
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
     confirm_batch_delete: bool,
@@ -322,7 +330,13 @@ impl App {
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
-            let _ = tx.send(tree);
+            let stats = categories::compute_stats(&tree);
+            let suggestions = suggestions::analyze(&tree);
+            let _ = tx.send(ScanResult {
+                tree,
+                stats,
+                suggestions,
+            });
         });
     }
 
@@ -347,6 +361,10 @@ impl App {
             None
         };
 
+        // Drop old rows before building new ones to avoid holding two full
+        // Vec<CachedRow> in memory simultaneously (OOM risk on large trees).
+        self.cached_rows = Vec::new();
+
         if let Some(ref tree) = self.tree {
             self.cached_rows = ui::collect_cached_rows(
                 tree,
@@ -356,8 +374,6 @@ impl App {
                 text_cache.as_ref(),
                 cat_cache.as_ref(),
             );
-        } else {
-            self.cached_rows.clear();
         }
         self.rows_dirty = false;
     }
@@ -484,7 +500,8 @@ impl eframe::App for App {
             if changed_at.elapsed() >= Duration::from_millis(150) {
                 self.applied_search = self.search_query.clone();
                 self.search_changed_at = None;
-                self.mark_dirty();
+                self.rows_dirty = true;
+                // Treemap doesn't filter by search text, so no treemap_dirty
             } else {
                 let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
                 ctx.request_repaint_after(remaining);
@@ -498,10 +515,10 @@ impl eframe::App for App {
 
         // Check if scan completed
         if let Some(ref rx) = self.receiver {
-            if let Ok(tree) = rx.try_recv() {
-                self.category_stats = Some(categories::compute_stats(&tree));
-                self.suggestion_report = Some(suggestions::analyze(&tree));
-                self.tree = Some(tree);
+            if let Ok(result) = rx.try_recv() {
+                self.category_stats = Some(result.stats);
+                self.suggestion_report = Some(result.suggestions);
+                self.tree = Some(result.tree);
                 if let Some(ref mut t) = self.tree {
                     tree::auto_expand(t, 0, 2);
                 }
@@ -702,6 +719,7 @@ impl eframe::App for App {
                                     self.mark_dirty();
                                 } else if let Some(parent) = ui::find_parent_path(tree, focused) {
                                     self.focused_path = Some(parent);
+                                    self.selected_paths.clear();
                                     self.tree_scroll_to_focus = true;
                                 }
                             } else if right {
@@ -713,6 +731,7 @@ impl eframe::App for App {
                                     if let Some(idx) = rows.iter().position(|r| &r.path == focused) {
                                         if idx + 1 < rows.len() {
                                             self.focused_path = Some(rows[idx + 1].path.clone());
+                                            self.selected_paths.clear();
                                             self.tree_scroll_to_focus = true;
                                         }
                                     }
@@ -874,7 +893,6 @@ impl eframe::App for App {
                         for (label, mode) in [
                             ("Tree", ViewMode::Tree),
                             ("Treemap", ViewMode::Treemap),
-                            ("Suggestions", ViewMode::Suggestions),
                         ] {
                             let is_active = self.view_mode == mode;
                             let text = if is_active {
@@ -929,7 +947,8 @@ impl eframe::App for App {
                             self.search_query.clear();
                             self.applied_search.clear();
                             self.search_changed_at = None;
-                            self.mark_dirty();
+                            self.rows_dirty = true;
+                            // Treemap doesn't filter by search text, so no treemap_dirty
                         }
                     }
 
@@ -1462,7 +1481,12 @@ impl eframe::App for App {
                             if let ui::TreeAction::ToggleExpand(path) = action {
                                 ui::toggle_expand(tree, path);
                                 self.rows_dirty = true;
-                                self.treemap_dirty = true;
+                                // Clear selection and anchor so only the focused row is
+                                // highlighted, and a subsequent shift-click starts fresh
+                                // rather than selecting a stale range.
+                                self.selected_paths.clear();
+                                self.selection_anchor = None;
+                                // Note: treemap doesn't use expand state, so no treemap_dirty
                             }
                         }
                     }

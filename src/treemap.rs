@@ -270,7 +270,6 @@ fn breadcrumbs_walk(
 pub struct TreemapCache {
     pub tiles: Vec<TreemapTile>,
     pub other: Option<OtherBucket>,
-    pub breadcrumbs: Vec<(String, PathBuf)>,
     pub view_size: u64,
     pub layout_size: (f32, f32),
 }
@@ -290,6 +289,7 @@ pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
     pub name: Box<str>,
+    #[allow(dead_code)]
     pub is_dir: bool,
     pub color: egui::Color32,
 }
@@ -323,12 +323,6 @@ pub fn build_treemap_cache(
         (root, root_path.clone())
     };
 
-    // Build breadcrumb trail
-    let crumbs = zoom_path
-        .as_ref()
-        .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
-
     let view_size = view_node.size();
 
     // Empty directory — return empty cache
@@ -336,7 +330,7 @@ pub fn build_treemap_cache(
         return TreemapCache {
             tiles: vec![],
             other: None,
-            breadcrumbs: crumbs,
+
             view_size,
             layout_size: (full_rect.width(), full_rect.height()),
         };
@@ -357,7 +351,7 @@ pub fn build_treemap_cache(
         return TreemapCache {
             tiles: vec![],
             other: None,
-            breadcrumbs: crumbs,
+
             view_size,
             layout_size: (full_rect.width(), full_rect.height()),
         };
@@ -396,7 +390,7 @@ pub fn build_treemap_cache(
         return TreemapCache {
             tiles: vec![],
             other: None,
-            breadcrumbs: crumbs,
+
             view_size,
             layout_size: (full_rect.width(), full_rect.height()),
         };
@@ -462,7 +456,6 @@ pub fn build_treemap_cache(
     TreemapCache {
         tiles,
         other,
-        breadcrumbs: crumbs,
         view_size,
         layout_size: (full_rect.width(), full_rect.height()),
     }
@@ -1357,8 +1350,6 @@ mod tests {
         assert!(cache.other.is_none());
         assert_eq!(cache.view_size, 1000);
         assert_eq!(cache.layout_size, (800.0, 600.0));
-        assert_eq!(cache.breadcrumbs.len(), 1);
-        assert_eq!(cache.breadcrumbs[0].0, "root");
     }
 
     #[test]
@@ -1375,8 +1366,6 @@ mod tests {
         let cache = build_treemap_cache(&tree, &zoom, None, true, rect);
         assert_eq!(cache.tiles.len(), 2);
         assert_eq!(cache.view_size, 300);
-        assert_eq!(cache.breadcrumbs.len(), 2);
-        assert_eq!(cache.breadcrumbs[1].0, "sub");
     }
 
     #[test]

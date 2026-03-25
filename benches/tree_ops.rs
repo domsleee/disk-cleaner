@@ -278,19 +278,16 @@ fn bench_tree_walks(c: &mut Criterion) {
         let mid_dir = format!("root/dir_{:05}", n_dirs / 2);
         let target = PathBuf::from(&mid_dir);
 
-        group.bench_function(
-            BenchmarkId::new("toggle_expand", format!("{n}")),
-            |b| {
-                b.iter_batched(
-                    || build_wide_tree(n_dirs, files_per_dir),
-                    |mut t| {
-                        ui::toggle_expand(&mut t, &target);
-                        t
-                    },
-                    criterion::BatchSize::LargeInput,
-                )
-            },
-        );
+        group.bench_function(BenchmarkId::new("toggle_expand", format!("{n}")), |b| {
+            b.iter_batched(
+                || build_wide_tree(n_dirs, files_per_dir),
+                |mut t| {
+                    ui::toggle_expand(&mut t, &target);
+                    t
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
     }
 
     // --- set_expanded ---
@@ -299,19 +296,16 @@ fn bench_tree_walks(c: &mut Criterion) {
         let mid_dir = format!("root/dir_{:05}", n_dirs / 2);
         let target = PathBuf::from(&mid_dir);
 
-        group.bench_function(
-            BenchmarkId::new("set_expanded", format!("{n}")),
-            |b| {
-                b.iter_batched(
-                    || build_wide_tree(n_dirs, files_per_dir),
-                    |mut t| {
-                        ui::set_expanded(&mut t, &target, true);
-                        t
-                    },
-                    criterion::BatchSize::LargeInput,
-                )
-            },
-        );
+        group.bench_function(BenchmarkId::new("set_expanded", format!("{n}")), |b| {
+            b.iter_batched(
+                || build_wide_tree(n_dirs, files_per_dir),
+                |mut t| {
+                    ui::set_expanded(&mut t, &target, true);
+                    t
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
     }
 
     // --- remove_node (mutating) ---
@@ -320,19 +314,16 @@ fn bench_tree_walks(c: &mut Criterion) {
         let target_file = format!("root/dir_{:05}/file_10.dat", n_dirs / 2);
         let target = PathBuf::from(&target_file);
 
-        group.bench_function(
-            BenchmarkId::new("remove_node", format!("{n}")),
-            |b| {
-                b.iter_batched(
-                    || build_wide_tree(n_dirs, files_per_dir),
-                    |mut t| {
-                        ui::remove_node(&mut t, &target);
-                        t
-                    },
-                    criterion::BatchSize::LargeInput,
-                )
-            },
-        );
+        group.bench_function(BenchmarkId::new("remove_node", format!("{n}")), |b| {
+            b.iter_batched(
+                || build_wide_tree(n_dirs, files_per_dir),
+                |mut t| {
+                    ui::remove_node(&mut t, &target);
+                    t
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
     }
 
     // --- batch remove_node (simulating multi-delete) ---
@@ -399,9 +390,7 @@ fn bench_selection_ops(c: &mut Criterion) {
         let lookup_target = all_paths[all_paths.len() / 2].clone();
         group.bench_function(
             BenchmarkId::new("selection_contains", format!("{n}_sel{sel_size}")),
-            |b| {
-                b.iter(|| large_sel.contains(&lookup_target))
-            },
+            |b| b.iter(|| large_sel.contains(&lookup_target)),
         );
 
         // Clear large selection

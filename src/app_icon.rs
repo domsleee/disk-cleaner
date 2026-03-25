@@ -98,12 +98,8 @@ pub fn generate() -> IconData {
                     }
 
                     // Check if we're in the gap between segments
-                    let in_gap = is_near_segment_edge(
-                        pie_angle,
-                        &start_angles,
-                        segments.len(),
-                        gap,
-                    );
+                    let in_gap =
+                        is_near_segment_edge(pie_angle, &start_angles, segments.len(), gap);
 
                     if !in_gap {
                         let (_, sr, sg, sb) = segments[seg_idx];
@@ -158,17 +154,12 @@ fn angle_in_range(a: f64, start: f64, end: f64) -> bool {
 }
 
 /// Check if an angle is close to any segment boundary (for drawing gaps).
-fn is_near_segment_edge(
-    angle: f64,
-    start_angles: &[f64],
-    n_segments: usize,
-    gap: f64,
-) -> bool {
+fn is_near_segment_edge(angle: f64, start_angles: &[f64], n_segments: usize, gap: f64) -> bool {
     let tau = std::f64::consts::TAU;
     let a = ((angle % tau) + tau) % tau;
 
-    for i in 0..n_segments {
-        let edge = ((start_angles[i] % tau) + tau) % tau;
+    for angle_start in start_angles.iter().take(n_segments) {
+        let edge = ((angle_start % tau) + tau) % tau;
         let mut diff = (a - edge).abs();
         if diff > std::f64::consts::PI {
             diff = tau - diff;

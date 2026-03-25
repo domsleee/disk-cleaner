@@ -607,7 +607,7 @@ pub fn remove_node(node: &mut FileNode, target: &Path) -> Option<u64> {
 fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> Option<u64> {
     let d = node.as_dir_mut()?;
 
-    if let Some(next) = next_component_name(target, &buf) {
+    if let Some(next) = next_component_name(target, buf) {
         let next_str = next;
 
         // Check if a direct child matches the full target
@@ -643,7 +643,6 @@ fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> O
 
     None
 }
-
 
 /// Find the parent path of a node in the tree.
 pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
@@ -832,10 +831,7 @@ mod tests {
 
     #[test]
     fn collect_cached_rows_filters_hidden() {
-        let mut tree = dir(
-            "root",
-            vec![leaf(".hidden", 5), leaf("visible.txt", 10)],
-        );
+        let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
 
         let rows = collect_cached_rows(&tree, "", None, false, None, None);
@@ -891,8 +887,7 @@ mod tests {
                 dir("b", vec![leaf("clip2.mp4", 200)]),
             ],
         );
-        let cache =
-            build_category_match_cache(&tree, crate::categories::FileCategory::Video);
+        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
         assert!(cache.contains(&PathBuf::from("root/a")));
         assert!(cache.contains(&PathBuf::from("root/a/clip1.mp4")));
         assert!(cache.contains(&PathBuf::from("root/b")));

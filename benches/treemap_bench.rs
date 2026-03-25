@@ -26,16 +26,15 @@ fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
 
 /// Build a tree mimicking /Applications: many top-level dirs with deep children.
 fn build_applications_like(n_apps: usize, files_per_app: usize) -> FileNode {
-    let exts = ["rs", "dylib", "plist", "png", "strings", "nib", "json", "dat", "xml", "js"];
+    let exts = [
+        "rs", "dylib", "plist", "png", "strings", "nib", "json", "dat", "xml", "js",
+    ];
     let apps: Vec<FileNode> = (0..n_apps)
         .map(|i| {
             let files: Vec<FileNode> = (0..files_per_app)
                 .map(|j| {
                     let ext = exts[j % exts.len()];
-                    make_leaf(
-                        &format!("file_{j}.{ext}"),
-                        (j as u64 + 1) * 4096,
-                    )
+                    make_leaf(&format!("file_{j}.{ext}"), (j as u64 + 1) * 4096)
                 })
                 .collect();
             make_dir(&format!("App_{i:03}.app"), files)
@@ -103,11 +102,7 @@ fn bench_label_formatting(c: &mut Criterion) {
         b.iter(|| {
             let mut labels = Vec::with_capacity(200);
             for i in 0..200 {
-                labels.push(format!(
-                    "{}\n{}",
-                    names[i],
-                    bytesize::ByteSize::b(sizes[i])
-                ));
+                labels.push(format!("{}\n{}", names[i], bytesize::ByteSize::b(sizes[i])));
             }
             labels
         })
@@ -200,34 +195,26 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
 
         // Shallow zoom (top-level dir)
         let shallow = std::path::PathBuf::from("/Applications/App_000.app");
-        group.bench_with_input(
-            BenchmarkId::new("find_node_shallow", n),
-            &tree,
-            |b, t| b.iter(|| treemap::find_node(t, &shallow)),
-        );
+        group.bench_with_input(BenchmarkId::new("find_node_shallow", n), &tree, |b, t| {
+            b.iter(|| treemap::find_node(t, &shallow))
+        });
 
         // Deep zoom (near end — worst case traversal)
         let deep = std::path::PathBuf::from(format!("/Applications/App_{:03}.app", n_apps - 1));
-        group.bench_with_input(
-            BenchmarkId::new("find_node_deep", n),
-            &tree,
-            |b, t| b.iter(|| treemap::find_node(t, &deep)),
-        );
+        group.bench_with_input(BenchmarkId::new("find_node_deep", n), &tree, |b, t| {
+            b.iter(|| treemap::find_node(t, &deep))
+        });
 
         // Miss (nonexistent path)
         let miss = std::path::PathBuf::from("/Applications/NotAnApp.app");
-        group.bench_with_input(
-            BenchmarkId::new("find_node_miss", n),
-            &tree,
-            |b, t| b.iter(|| treemap::find_node(t, &miss)),
-        );
+        group.bench_with_input(BenchmarkId::new("find_node_miss", n), &tree, |b, t| {
+            b.iter(|| treemap::find_node(t, &miss))
+        });
 
         // Breadcrumbs at scale
-        group.bench_with_input(
-            BenchmarkId::new("breadcrumbs", n),
-            &tree,
-            |b, t| b.iter(|| treemap::breadcrumbs(t, &deep)),
-        );
+        group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
+            b.iter(|| treemap::breadcrumbs(t, &deep))
+        });
     }
 
     group.finish();

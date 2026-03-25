@@ -449,7 +449,11 @@ pub fn build_treemap_cache(
         let child_path = view_path.join(child.name());
         let is_dir = child.is_dir();
         let color = extension_color(child.name(), is_dir);
-        let child_count = if is_dir { Some(child.children().len()) } else { None };
+        let child_count = if is_dir {
+            Some(child.children().len())
+        } else {
+            None
+        };
 
         // Build nested sub-tiles for directory tiles large enough (respecting global budget)
         let nested = if is_dir
@@ -503,12 +507,8 @@ pub fn build_treemap_cache(
             count: other_count,
             size: other_size,
             label_short: format!("Other ({})", other_count).into(),
-            label_tall: format!(
-                "Other ({} files)\n{}",
-                other_count,
-                ByteSize::b(other_size)
-            )
-            .into(),
+            label_tall: format!("Other ({} files)\n{}", other_count, ByteSize::b(other_size))
+                .into(),
         })
     } else {
         None
@@ -605,6 +605,7 @@ const MAX_TOTAL_NESTED: usize = 1000;
 
 /// Render the full treemap view (breadcrumbs + map) from a cached layout.
 /// Returns user-triggered actions.
+#[allow(clippy::too_many_arguments)]
 pub fn render_treemap(
     ui: &mut egui::Ui,
     cache: &mut Option<TreemapCache>,
@@ -736,10 +737,7 @@ pub fn render_treemap(
 
     // Paint tiles
     for (idx, tile) in cache.tiles.iter().enumerate() {
-        let is_focused = has_focus
-            && focused_path
-                .as_ref()
-                .is_some_and(|fp| *fp == tile.path);
+        let is_focused = has_focus && focused_path.as_ref().is_some_and(|fp| *fp == tile.path);
 
         if tile.is_dir {
             paint_cached_directory(
@@ -897,7 +895,13 @@ fn paint_other_bucket(
         } else {
             &other.label_short
         };
-        clipped.text(rect.center(), egui::Align2::CENTER_CENTER, text, font.clone(), tc);
+        clipped.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            tc,
+        );
     }
 }
 
@@ -955,9 +959,7 @@ fn paint_cached_directory(
         tile_painter.rect_filled(cr, 1.0, color);
 
         if has_focus {
-            let child_focused = focused_path
-                .as_ref()
-                .is_some_and(|fp| *fp == nested.path);
+            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
             if child_focused {
                 tile_painter.rect_stroke(
                     cr,
@@ -1510,10 +1512,7 @@ mod tests {
 
     #[test]
     fn build_cache_hidden_filtered() {
-        let tree = dir(
-            "root",
-            vec![leaf(".hidden", 500), leaf("visible.txt", 500)],
-        );
+        let tree = dir("root", vec![leaf(".hidden", 500), leaf("visible.txt", 500)]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let cache = build_treemap_cache(&tree, &None, None, false, rect);
         assert_eq!(cache.tiles.len(), 1);

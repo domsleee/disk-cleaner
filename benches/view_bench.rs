@@ -66,11 +66,11 @@ fn count_nodes(node: &FileNode) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Tree view benchmarks: collect_visible_paths (frame hot path proxy)
+// Tree view benchmarks: collect_cached_rows (frame hot path proxy)
 // ---------------------------------------------------------------------------
 
 fn bench_collect_visible_paths(c: &mut Criterion) {
-    let mut group = c.benchmark_group("collect_visible_paths");
+    let mut group = c.benchmark_group("collect_cached_rows");
     group.sample_size(20);
 
     // All expanded — worst case for tree view rendering
@@ -79,11 +79,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| {
-                let mut result = Vec::new();
-                ui::collect_visible_paths(t, "", None, true, &mut result);
-                result
-            })
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
         });
     }
 
@@ -94,54 +90,77 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| {
-                let mut result = Vec::new();
-                ui::collect_visible_paths(t, "", None, true, &mut result);
-                result
-            })
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
         });
     }
 
-    // With text filter active — forces node_matches on every subtree
+    // With text filter — uncached (O(N^2)) vs cached (O(N))
     {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(BenchmarkId::new("filter_hit", n), &tree, |b, t| {
-            b.iter(|| {
-                let mut result = Vec::new();
-                ui::collect_visible_paths(t, "file_5", None, true, &mut result);
-                result
-            })
+        group.bench_with_input(BenchmarkId::new("filter_hit_uncached", n), &tree, |b, t| {
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None))
         });
 
-        group.bench_with_input(BenchmarkId::new("filter_miss", n), &tree, |b, t| {
+        let text_cache = ui::build_text_match_cache(&tree, "file_5");
+        group.bench_with_input(BenchmarkId::new("filter_hit_cached", n), &tree, |b, t| {
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None))
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("filter_miss_uncached", n),
+            &tree,
+            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None)),
+        );
+
+        let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz");
+        group.bench_with_input(BenchmarkId::new("filter_miss_cached", n), &tree, |b, t| {
             b.iter(|| {
-                let mut result = Vec::new();
-                ui::collect_visible_paths(t, "nonexistent_zzz", None, true, &mut result);
-                result
+                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None)
             })
         });
     }
 
-    // With category filter
+    // With category filter — uncached vs cached
     {
         let tree = build_expanded_tree(500, 20);
         let n = count_nodes(&tree);
 
-        group.bench_with_input(BenchmarkId::new("category_video", n), &tree, |b, t| {
-            b.iter(|| {
-                let mut result = Vec::new();
-                ui::collect_visible_paths(
-                    t,
-                    "",
-                    Some(categories::FileCategory::Video),
-                    true,
-                    &mut result,
-                );
-                result
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("category_video_uncached", n),
+            &tree,
+            |b, t| {
+                b.iter(|| {
+                    ui::collect_cached_rows(
+                        t,
+                        "",
+                        Some(categories::FileCategory::Video),
+                        true,
+                        None,
+                        None,
+                    )
+                })
+            },
+        );
+
+        let cat_cache = ui::build_category_match_cache(&tree, categories::FileCategory::Video);
+        group.bench_with_input(
+            BenchmarkId::new("category_video_cached", n),
+            &tree,
+            |b, t| {
+                b.iter(|| {
+                    ui::collect_cached_rows(
+                        t,
+                        "",
+                        Some(categories::FileCategory::Video),
+                        true,
+                        None,
+                        Some(&cat_cache),
+                    )
+                })
+            },
+        );
     }
 
     group.finish();
@@ -257,11 +276,136 @@ fn bench_node_matches_category(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// build_text_match_cache / build_category_match_cache — filter cache building
+// These run on every search keystroke (after debounce) and category filter change
+// ---------------------------------------------------------------------------
+
+fn bench_build_filter_caches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("build_filter_caches");
+    group.sample_size(20);
+
+    for &(n_dirs, files_per_dir) in &[(500, 20), (2000, 20), (5000, 20)] {
+        let tree = build_categorized_tree(n_dirs, files_per_dir);
+        let n = count_nodes(&tree);
+
+        // Text cache — hit (query matches many nodes)
+        group.bench_with_input(BenchmarkId::new("text_cache_hit", n), &tree, |b, t| {
+            b.iter(|| ui::build_text_match_cache(t, "file_5"))
+        });
+
+        // Text cache — miss (query matches nothing)
+        group.bench_with_input(BenchmarkId::new("text_cache_miss", n), &tree, |b, t| {
+            b.iter(|| ui::build_text_match_cache(t, "nonexistent_zzz"))
+        });
+
+        // Category cache — Video
+        group.bench_with_input(
+            BenchmarkId::new("category_cache_video", n),
+            &tree,
+            |b, t| b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Video)),
+        );
+
+        // Category cache — Code
+        group.bench_with_input(BenchmarkId::new("category_cache_code", n), &tree, |b, t| {
+            b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Code))
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Full filter pipeline — cache build + collect_cached_rows end-to-end
+// Simulates what happens when user types a search query or changes category
+// ---------------------------------------------------------------------------
+
+fn bench_full_filter_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("full_filter_pipeline");
+    group.sample_size(20);
+
+    for &(n_dirs, files_per_dir) in &[(500, 20), (2000, 20)] {
+        let tree = build_expanded_tree(n_dirs, files_per_dir);
+        let n = count_nodes(&tree);
+
+        // Full text search pipeline: build cache + collect rows
+        group.bench_with_input(BenchmarkId::new("text_search_e2e", n), &tree, |b, t| {
+            b.iter(|| {
+                let cache = ui::build_text_match_cache(t, "file_5");
+                ui::collect_cached_rows(t, "file_5", None, true, Some(&cache), None)
+            })
+        });
+
+        // Full category filter pipeline: build cache + collect rows
+        group.bench_with_input(BenchmarkId::new("category_filter_e2e", n), &tree, |b, t| {
+            b.iter(|| {
+                let cache = ui::build_category_match_cache(t, categories::FileCategory::Video);
+                ui::collect_cached_rows(
+                    t,
+                    "",
+                    Some(categories::FileCategory::Video),
+                    true,
+                    None,
+                    Some(&cache),
+                )
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// collect_cached_rows at larger scale (100K+ nodes)
+// ---------------------------------------------------------------------------
+
+fn bench_collect_rows_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collect_cached_rows_large");
+    group.sample_size(10);
+
+    // 100K nodes — all expanded (worst case)
+    {
+        let tree = build_expanded_tree(5000, 20);
+        let n = count_nodes(&tree);
+
+        group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+        });
+    }
+
+    // 100K nodes — root only expanded (best case, most realistic)
+    {
+        let mut tree = build_categorized_tree(5000, 20);
+        tree.set_expanded(true);
+        let n = count_nodes(&tree);
+
+        group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+        });
+    }
+
+    // 100K nodes — with text filter + cache
+    {
+        let tree = build_expanded_tree(5000, 20);
+        let n = count_nodes(&tree);
+        let text_cache = ui::build_text_match_cache(&tree, "file_5");
+
+        group.bench_with_input(BenchmarkId::new("filter_cached", n), &tree, |b, t| {
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None))
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_collect_visible_paths,
     bench_auto_expand,
     bench_compute_stats,
     bench_node_matches_category,
+    bench_build_filter_caches,
+    bench_full_filter_pipeline,
+    bench_collect_rows_large,
 );
 criterion_main!(benches);

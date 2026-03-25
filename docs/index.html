@@ -5,282 +5,451 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Disk Cleaner — Fast Native Disk Usage Analyzer</title>
 <meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #1a1a2e;
-    --bg-card: #16213e;
-    --bg-hero: #0f3460;
-    --accent: #e94560;
-    --accent-light: #ff6b81;
-    --text: #eaeaea;
-    --text-muted: #a0a0b0;
-    --border: #2a2a4a;
+    --bg: #09090b;
+    --surface: #111113;
+    --surface-raised: #18181b;
+    --border: #1e1e23;
+    --border-subtle: #151518;
+    --text: #e4e4e7;
+    --text-secondary: #a1a1aa;
+    --text-muted: #63636e;
+    --amber: #f59e0b;
+    --amber-dim: rgba(245, 158, 11, 0.10);
+    --amber-border: rgba(245, 158, 11, 0.20);
+    --amber-glow: rgba(245, 158, 11, 0.06);
+    --sans: "DM Sans", -apple-system, sans-serif;
+    --mono: "JetBrains Mono", "SF Mono", monospace;
+    --max-w: 960px;
     --radius: 12px;
-    --max-width: 1100px;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: var(--sans);
     background: var(--bg);
     color: var(--text);
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
   }
 
-  a { color: var(--accent-light); text-decoration: none; }
+  /* Noise overlay for texture */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    opacity: 0.025;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 256px 256px;
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  a { color: var(--amber); text-decoration: none; }
   a:hover { text-decoration: underline; }
 
-  /* Hero */
+  /* ---- Animations ---- */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(24px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  .anim { opacity: 0; animation: fadeUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .anim-d1 { animation-delay: 0.08s; }
+  .anim-d2 { animation-delay: 0.16s; }
+  .anim-d3 { animation-delay: 0.28s; }
+  .anim-d4 { animation-delay: 0.45s; }
+  .anim-d5 { animation-delay: 0.6s; }
+
+  /* ---- Hero ---- */
   .hero {
     text-align: center;
-    padding: 80px 24px 60px;
-    background: linear-gradient(180deg, var(--bg-hero) 0%, var(--bg) 100%);
+    padding: 120px 24px 80px;
+    position: relative;
   }
+  .hero::before {
+    content: "";
+    position: absolute;
+    top: -40%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 800px;
+    height: 600px;
+    background: radial-gradient(ellipse, var(--amber-glow) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
   .hero h1 {
-    font-size: 3rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    margin-bottom: 12px;
+    font-family: var(--sans);
+    font-size: clamp(2.8rem, 6vw, 3.8rem);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    margin-bottom: 18px;
+    line-height: 1.1;
+    color: var(--text);
   }
+
   .hero .tagline {
-    font-size: 1.25rem;
-    color: var(--text-muted);
-    max-width: 600px;
+    font-size: 1.1rem;
+    color: var(--text-secondary);
+    max-width: 440px;
     margin: 0 auto 32px;
+    line-height: 1.65;
+    font-weight: 400;
   }
-  .hero .badges {
+
+  .hero .pills {
     display: flex;
-    gap: 12px;
+    gap: 8px;
     justify-content: center;
     flex-wrap: wrap;
-    margin-bottom: 40px;
+    margin-bottom: 56px;
   }
-  .badge {
-    display: inline-block;
-    padding: 6px 16px;
-    border-radius: 20px;
-    font-size: 0.85rem;
+  .pill {
+    padding: 5px 14px;
+    border-radius: 100px;
+    font-size: 0.78rem;
     font-weight: 500;
-    background: rgba(233, 69, 96, 0.15);
-    color: var(--accent-light);
-    border: 1px solid rgba(233, 69, 96, 0.3);
+    font-family: var(--mono);
+    background: var(--amber-dim);
+    color: var(--amber);
+    border: 1px solid var(--amber-border);
+    letter-spacing: 0.02em;
   }
-  .hero-screenshot {
-    max-width: min(900px, 90vw);
-    border-radius: var(--radius);
-    border: 1px solid var(--border);
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+
+  /* Hero screenshot with window chrome */
+  .hero-window {
+    max-width: min(880px, 92vw);
     margin: 0 auto;
-    display: block;
-  }
-
-  /* Sections */
-  section {
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 80px 24px;
-  }
-  section h2 {
-    font-size: 2rem;
-    font-weight: 700;
-    margin-bottom: 12px;
-    text-align: center;
-  }
-  section .subtitle {
-    text-align: center;
-    color: var(--text-muted);
-    margin-bottom: 48px;
-    font-size: 1.1rem;
-  }
-
-  /* Features */
-  .features-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 24px;
-  }
-  .feature-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 28px;
-  }
-  .feature-card .icon {
-    font-size: 1.6rem;
-    margin-bottom: 12px;
-    display: block;
-  }
-  .feature-card h3 {
-    font-size: 1.1rem;
-    margin-bottom: 8px;
-    font-weight: 600;
-  }
-  .feature-card p {
-    color: var(--text-muted);
-    font-size: 0.95rem;
-  }
-
-  /* Screenshots */
-  .screenshots-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
-    gap: 32px;
-  }
-  .screenshot-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow: hidden;
+    border: 1px solid var(--border);
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.03),
+      0 24px 80px rgba(0,0,0,0.6),
+      0 0 120px var(--amber-glow);
+    position: relative;
+  }
+  .window-bar {
+    background: var(--surface-raised);
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border-bottom: 1px solid var(--border);
+  }
+  .window-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--border);
+  }
+  .window-dot:nth-child(1) { background: #ff5f57; }
+  .window-dot:nth-child(2) { background: #febc2e; }
+  .window-dot:nth-child(3) { background: #28c840; }
+  .hero-window img {
+    width: 100%;
+    display: block;
+  }
+
+  /* ---- Sections ---- */
+  section {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    padding: 88px 24px;
+  }
+
+  .section-label {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin-bottom: 12px;
+    display: block;
+    text-align: center;
+  }
+
+  section h2 {
+    font-family: var(--sans);
+    font-size: 1.8rem;
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    margin-bottom: 48px;
+    text-align: center;
+    color: var(--text);
+  }
+
+  /* ---- Features ---- */
+  .features {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1px;
+    background: var(--border-subtle);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .feature {
+    background: var(--bg);
+    padding: 28px 24px;
+    transition: background 0.25s ease;
+  }
+  .feature:hover {
+    background: var(--surface);
+  }
+  .feature h3 {
+    font-family: var(--sans);
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: var(--text);
+  }
+  .feature p {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+  }
+
+  /* ---- Screenshots ---- */
+  .screenshots-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .screenshot-card {
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s ease;
+  }
+  .screenshot-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 16px 48px rgba(0,0,0,0.4);
   }
   .screenshot-card img {
     width: 100%;
     display: block;
   }
-  .screenshot-card .caption {
-    padding: 16px 20px;
-    font-size: 0.95rem;
+  .screenshot-card figcaption {
+    padding: 14px 18px;
+    font-size: 0.82rem;
     color: var(--text-muted);
   }
-  .screenshot-card .caption strong {
-    color: var(--text);
+  .screenshot-card figcaption strong {
+    color: var(--text-secondary);
+    font-weight: 500;
   }
 
-  /* Install */
+  /* ---- Install / Terminal ---- */
   .install-section {
     text-align: center;
   }
-  .install-section pre {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 20px 28px;
-    font-size: 0.95rem;
-    text-align: left;
-    max-width: 500px;
+  .terminal {
+    max-width: 520px;
     margin: 0 auto;
-    overflow-x: auto;
-    color: var(--text);
-    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+    text-align: left;
   }
-  .install-section pre .comment { color: #6a6a8a; }
-  .install-section pre .cmd { color: var(--accent-light); }
+  .terminal-bar {
+    background: var(--surface-raised);
+    padding: 9px 14px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border-bottom: 1px solid var(--border);
+  }
+  .terminal-bar .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+  .terminal-bar .dot:nth-child(1) { background: #ff5f57; }
+  .terminal-bar .dot:nth-child(2) { background: #febc2e; }
+  .terminal-bar .dot:nth-child(3) { background: #28c840; }
+  .terminal-bar span {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-left: 6px;
+  }
+  .terminal-body {
+    background: var(--surface);
+    padding: 20px 22px;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    line-height: 1.8;
+    color: var(--text-secondary);
+  }
+  .terminal-body .prompt { color: var(--amber); }
+  .terminal-body .comment { color: var(--text-muted); font-style: italic; }
+  .terminal-body .cursor {
+    display: inline-block;
+    width: 8px;
+    height: 15px;
+    background: var(--amber);
+    vertical-align: text-bottom;
+    margin-left: 2px;
+    animation: blink 1.1s step-end infinite;
+  }
 
-  /* Footer */
+  /* ---- Footer ---- */
   footer {
     text-align: center;
     padding: 40px 24px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--border-subtle);
+  }
+  footer p {
+    font-size: 0.8rem;
     color: var(--text-muted);
-    font-size: 0.9rem;
   }
   footer a { color: var(--text-muted); }
-  footer a:hover { color: var(--text); }
+  footer a:hover { color: var(--text-secondary); text-decoration: none; }
 
-  /* Responsive */
-  @media (max-width: 600px) {
-    .hero h1 { font-size: 2rem; }
-    .hero .tagline { font-size: 1rem; }
+  /* ---- Divider ---- */
+  .divider {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    border: none;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ---- Responsive ---- */
+  @media (max-width: 768px) {
+    .hero { padding: 80px 20px 56px; }
+    .features { grid-template-columns: 1fr; }
     .screenshots-grid { grid-template-columns: 1fr; }
-    section { padding: 48px 16px; }
+    section { padding: 56px 20px; }
+    section h2 { font-size: 1.8rem; }
   }
 </style>
 </head>
 <body>
 
+<!-- ============ Hero ============ -->
 <div class="hero">
-  <h1>Disk Cleaner</h1>
-  <p class="tagline">A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.</p>
-  <div class="badges">
-    <span class="badge">Rust</span>
-    <span class="badge">Native GUI</span>
-    <span class="badge">Parallel Scanning</span>
-    <span class="badge">MIT License</span>
+  <h1 class="anim anim-d1">Disk Cleaner</h1>
+  <p class="tagline anim anim-d2">
+    See what's eating your storage and clean it up.<br>
+    Native, fast, built with Rust.
+  </p>
+  <div class="pills anim anim-d3">
+    <span class="pill">rust + egui</span>
+    <span class="pill">parallel scan</span>
+    <span class="pill">tree + treemap</span>
+    <span class="pill">MIT</span>
   </div>
-  <img src="screenshots/app_tree.png" alt="Disk Cleaner scan results showing file tree sorted by size" class="hero-screenshot">
+  <div class="hero-window anim anim-d4">
+    <div class="window-bar">
+      <div class="window-dot"></div>
+      <div class="window-dot"></div>
+      <div class="window-dot"></div>
+    </div>
+    <img src="screenshots/app_tree_full.png" alt="Disk Cleaner showing file tree sorted by size with category sidebar">
+  </div>
 </div>
 
+<!-- ============ Features ============ -->
 <section>
-  <h2>Features</h2>
-  <p class="subtitle">Everything you need to find and reclaim wasted disk space.</p>
-  <div class="features-grid">
-    <div class="feature-card">
-      <span class="icon">&#9889;</span>
+  <span class="section-label">Features</span>
+  <h2>Everything you need to reclaim disk space</h2>
+  <div class="features">
+    <div class="feature">
       <h3>Parallel Scanning</h3>
-      <p>Multi-threaded directory traversal powered by rayon. Scans hundreds of thousands of files in seconds.</p>
+      <p>Multi-threaded traversal via rayon. Hundreds of thousands of files in seconds.</p>
     </div>
-    <div class="feature-card">
-      <span class="icon">&#128202;</span>
+    <div class="feature">
       <h3>Tree View</h3>
-      <p>Browse your file system sorted by size with proportional bars. Instantly see what's eating your disk.</p>
+      <p>File system sorted by size with proportional bars. Spot the biggest offenders instantly.</p>
     </div>
-    <div class="feature-card">
-      <span class="icon">&#127912;</span>
-      <h3>Treemap Visualization</h3>
-      <p>Interactive squarified treemap shows disk usage at a glance. Click to drill into any directory.</p>
+    <div class="feature">
+      <h3>Treemap</h3>
+      <p>Interactive squarified treemap. Click any directory to drill in.</p>
     </div>
-    <div class="feature-card">
-      <span class="icon">&#128161;</span>
-      <h3>Smart Suggestions</h3>
-      <p>Automatically identifies build artifacts, caches, and other safely deletable files with one-click cleanup.</p>
+    <div class="feature">
+      <h3>Category Breakdown</h3>
+      <p>Filter by type: images, video, code, archives, documents. See where each lives.</p>
     </div>
-    <div class="feature-card">
-      <span class="icon">&#128465;</span>
+    <div class="feature">
       <h3>Safe Deletion</h3>
-      <p>Move files to Trash or delete permanently. Batch operations for cleaning up multiple items at once.</p>
+      <p>Trash or permanent delete. Multi-select and batch operations for fast cleanup.</p>
     </div>
-    <div class="feature-card">
-      <span class="icon">&#128270;</span>
-      <h3>Filter &amp; Search</h3>
-      <p>Filter by file name or type. Category sidebar breaks down space by archives, images, documents, and more.</p>
+    <div class="feature">
+      <h3>Search &amp; Filter</h3>
+      <p>Find files by name. Combine with category filters to narrow down exactly what you need.</p>
     </div>
   </div>
 </section>
 
+<hr class="divider">
+
+<!-- ============ Screenshots ============ -->
 <section>
-  <h2>Screenshots</h2>
-  <p class="subtitle">See Disk Cleaner in action.</p>
+  <span class="section-label">In action</span>
+  <h2>See it for yourself</h2>
   <div class="screenshots-grid">
-    <div class="screenshot-card">
-      <img src="screenshots/app_home.png" alt="Home screen showing volume selection" loading="lazy">
-      <div class="caption"><strong>Home Screen</strong> &mdash; Pick a volume or open a directory to scan. See disk usage at a glance.</div>
+    <figure class="screenshot-card">
+      <img src="screenshots/app_home.png" alt="Home screen with volume selection" loading="lazy">
+      <figcaption><strong>Home</strong> &mdash; Pick a volume or directory to scan</figcaption>
+    </figure>
+    <figure class="screenshot-card">
+      <img src="screenshots/app_tree.png" alt="Tree view sorted by size" loading="lazy">
+      <figcaption><strong>Tree View</strong> &mdash; Files sorted by size with visual bars</figcaption>
+    </figure>
+    <figure class="screenshot-card">
+      <img src="screenshots/app_tree_full.png" alt="Tree view with category sidebar" loading="lazy">
+      <figcaption><strong>Categories</strong> &mdash; Filter and break down by file type</figcaption>
+    </figure>
+    <figure class="screenshot-card">
+      <img src="screenshots/app_treemap.png" alt="Treemap visualization" loading="lazy">
+      <figcaption><strong>Treemap</strong> &mdash; Visual overview of disk usage</figcaption>
+    </figure>
+  </div>
+</section>
+
+<hr class="divider">
+
+<!-- ============ Install ============ -->
+<section class="install-section">
+  <span class="section-label">Get started</span>
+  <h2>Clone, build, run</h2>
+  <div class="terminal">
+    <div class="terminal-bar">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <span>Terminal</span>
     </div>
-    <div class="screenshot-card">
-      <img src="screenshots/app_tree.png" alt="Scan results with file tree" loading="lazy">
-      <div class="caption"><strong>Scan Results</strong> &mdash; File tree sorted by size with colored bars showing relative usage.</div>
-    </div>
-    <div class="screenshot-card">
-      <img src="screenshots/app_tree_full.png" alt="Full tree view with file type sidebar" loading="lazy">
-      <div class="caption"><strong>File Types</strong> &mdash; Filter by category to see breakdown of images, code, archives, and more.</div>
-    </div>
-    <div class="screenshot-card">
-      <img src="screenshots/app_treemap.png" alt="Treemap visualization of disk usage" loading="lazy">
-      <div class="caption"><strong>Treemap</strong> &mdash; Interactive squarified treemap shows disk usage at a glance. Click to drill in.</div>
-    </div>
-    <div class="screenshot-card">
-      <img src="screenshots/app_suggestions.png" alt="Smart cleanup suggestions" loading="lazy">
-      <div class="caption"><strong>Smart Suggestions</strong> &mdash; Automatically finds build artifacts and caches you can safely remove.</div>
+    <div class="terminal-body">
+      <div><span class="comment"># requires Rust 1.70+</span></div>
+      <div><span class="prompt">$</span> git clone https://github.com/domsleee/disk-cleaner.git</div>
+      <div><span class="prompt">$</span> cd disk-cleaner</div>
+      <div><span class="prompt">$</span> cargo run --release<span class="cursor"></span></div>
     </div>
   </div>
 </section>
 
-<section class="install-section">
-  <h2>Install</h2>
-  <p class="subtitle">Requires Rust 1.70+. Clone and build from source.</p>
-  <pre><span class="comment"># Clone the repository</span>
-<span class="cmd">git clone</span> https://github.com/domsleee/disk-cleaner.git
-<span class="cmd">cd</span> disk-cleaner
-
-<span class="comment"># Build and run</span>
-<span class="cmd">cargo run</span> --release</pre>
-</section>
-
+<!-- ============ Footer ============ -->
 <footer>
-  <p>Disk Cleaner is open source under the <strong>MIT License</strong>.</p>
-  <p style="margin-top: 8px;">
-    <a href="https://github.com/domsleee/disk-cleaner">GitHub</a>
-  </p>
+  <p>Open source under MIT &middot; <a href="https://github.com/domsleee/disk-cleaner">GitHub</a></p>
 </footer>
 
 </body>

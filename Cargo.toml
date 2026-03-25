@@ -41,6 +41,10 @@ harness = false
 name = "view_bench"
 harness = false
 
+[[bench]]
+name = "treemap_bench"
+harness = false
+
 [profile.release]
 lto = "thin"
 strip = true

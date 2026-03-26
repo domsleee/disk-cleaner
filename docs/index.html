@@ -17,7 +17,7 @@
     --border-subtle: #151518;
     --text: #e4e4e7;
     --text-secondary: #a1a1aa;
-    --text-muted: #63636e;
+    --text-muted: #8b8b96;
     --amber: #f59e0b;
     --amber-dim: rgba(245, 158, 11, 0.10);
     --amber-border: rgba(245, 158, 11, 0.20);
@@ -51,8 +51,8 @@
     z-index: 9999;
   }
 
-  a { color: var(--amber); text-decoration: none; }
-  a:hover { text-decoration: underline; }
+  a { color: var(--amber); text-decoration: underline; text-decoration-color: rgba(245, 158, 11, 0.3); text-underline-offset: 2px; }
+  a:hover { text-decoration-color: var(--amber); }
 
   /* ---- Animations ---- */
   @keyframes fadeUp {
@@ -111,6 +111,46 @@
     line-height: 1.65;
     font-weight: 400;
   }
+
+  .hero .cta {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 40px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 28px;
+    border-radius: 10px;
+    font-family: var(--sans);
+    font-size: 0.95rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .btn { text-decoration: none; }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn-primary {
+    background: var(--amber);
+    color: var(--bg);
+    box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3);
+  }
+  .btn-primary:hover {
+    box-shadow: 0 6px 24px rgba(245, 158, 11, 0.4);
+  }
+  .btn-secondary {
+    background: var(--surface-raised);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover {
+    background: var(--surface);
+    border-color: var(--amber-border);
+  }
+  .btn svg { width: 18px; height: 18px; }
 
   .hero .pills {
     display: flex;
@@ -321,8 +361,8 @@
     font-size: 0.8rem;
     color: var(--text-muted);
   }
-  footer a { color: var(--text-muted); }
-  footer a:hover { color: var(--text-secondary); text-decoration: none; }
+  footer a { color: var(--text-muted); text-decoration: underline; }
+  footer a:hover { color: var(--text-secondary); }
 
   /* ---- Divider ---- */
   .divider {
@@ -344,6 +384,7 @@
 </head>
 <body>
 
+<main>
 <!-- ============ Hero ============ -->
 <div class="hero">
   <h1 class="anim anim-d1">Disk Cleaner</h1>
@@ -351,13 +392,26 @@
     See what's eating your storage and clean it up.<br>
     Native, fast, built with Rust.
   </p>
-  <div class="pills anim anim-d3">
-    <span class="pill">rust + egui</span>
+  <div class="cta anim anim-d3">
+    <a id="download-btn" href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <span id="download-label">Download</span>
+    </a>
+    <a href="https://github.com/domsleee/disk-cleaner" class="btn btn-secondary">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      View on GitHub
+    </a>
+  </div>
+  <p id="other-platforms" class="anim anim-d3" style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px;"></p>
+  <div class="pills anim anim-d4">
+    <span class="pill">macOS</span>
+    <span class="pill">Linux</span>
+    <span class="pill">Windows</span>
     <span class="pill">parallel scan</span>
     <span class="pill">tree + treemap</span>
     <span class="pill">MIT</span>
   </div>
-  <div class="hero-window anim anim-d4">
+  <div class="hero-window anim anim-d5">
     <div class="window-bar">
       <div class="window-dot"></div>
       <div class="window-dot"></div>
@@ -430,7 +484,14 @@
 <!-- ============ Install ============ -->
 <section class="install-section">
   <span class="section-label">Get started</span>
-  <h2>Clone, build, run</h2>
+  <h2>Download or build from source</h2>
+  <div class="cta" style="margin-bottom: 32px;">
+    <a href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download for Mac
+    </a>
+  </div>
+  <p id="install-note" style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 24px;"></p>
   <div class="terminal">
     <div class="terminal-bar">
       <div class="dot"></div>
@@ -439,7 +500,7 @@
       <span>Terminal</span>
     </div>
     <div class="terminal-body">
-      <div><span class="comment"># requires Rust 1.70+</span></div>
+      <div><span class="comment"># or build from source (requires Rust 1.70+)</span></div>
       <div><span class="prompt">$</span> git clone https://github.com/domsleee/disk-cleaner.git</div>
       <div><span class="prompt">$</span> cd disk-cleaner</div>
       <div><span class="prompt">$</span> cargo run --release<span class="cursor"></span></div>
@@ -447,10 +508,40 @@
   </div>
 </section>
 
+</main>
 <!-- ============ Footer ============ -->
 <footer>
   <p>Open source under MIT &middot; <a href="https://github.com/domsleee/disk-cleaner">GitHub</a></p>
 </footer>
 
+<script>
+(function() {
+  var ua = navigator.userAgent || navigator.platform || '';
+  var os = /Mac/i.test(ua) ? 'mac' : /Win/i.test(ua) ? 'windows' : /Linux/i.test(ua) ? 'linux' : 'unknown';
+
+  var labels = { mac: 'Download for Mac', windows: 'Download for Windows', linux: 'Download for Linux' };
+  var notes = {
+    mac: 'Universal binary \u2014 works on Apple Silicon and Intel',
+    windows: 'Windows 10+ (64-bit)',
+    linux: 'Linux x86_64 \u2014 requires GTK3'
+  };
+  var others = {
+    mac: ['Windows', 'Linux'],
+    windows: ['Mac', 'Linux'],
+    linux: ['Mac', 'Windows']
+  };
+
+  var btn = document.getElementById('download-label');
+  var note = document.getElementById('install-note');
+  var otherEl = document.getElementById('other-platforms');
+
+  if (labels[os]) btn.textContent = labels[os];
+  if (notes[os]) note.textContent = notes[os];
+  if (others[os] && otherEl) {
+    otherEl.innerHTML = 'Also available for ' + others[os].join(' and ') +
+      ' \u2014 <a href="https://github.com/domsleee/disk-cleaner/releases/latest">all downloads</a>';
+  }
+})();
+</script>
 </body>
 </html>

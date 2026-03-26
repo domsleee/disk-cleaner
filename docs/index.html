@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Disk Cleaner — Fast Native Disk Usage Analyzer</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2309090b'/%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%23f59e0b' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23f59e0b'/%3E%3Cpath d='M16 5v7M16 20v7' stroke='%23f59e0b' stroke-width='1.5' opacity='0.4'/%3E%3C/svg%3E">
 <meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -517,26 +518,29 @@
 </footer>
 
 <script>
-(function() {
-  var ua = navigator.userAgent || navigator.platform || '';
-  var os = /Mac/i.test(ua) ? 'mac' : /Win/i.test(ua) ? 'windows' : /Linux/i.test(ua) ? 'linux' : 'unknown';
+(async () => {
+  const ua = navigator.userAgent || navigator.platform || '';
+  const os = /Mac/i.test(ua) ? 'mac' : /Win/i.test(ua) ? 'windows' : /Linux/i.test(ua) ? 'linux' : 'unknown';
 
-  var labels = { mac: 'Download for Mac', windows: 'Download for Windows', linux: 'Download for Linux' };
-  var notes = {
+  const labels = { mac: 'Download for Mac', windows: 'Download for Windows', linux: 'Download for Linux' };
+  const notes = {
     mac: 'Universal binary \u2014 works on Apple Silicon and Intel. First launch: right-click \u2192 Open to bypass Gatekeeper.',
     windows: 'Windows 10+ (64-bit)',
     linux: 'Linux x86_64 \u2014 requires GTK3'
   };
-  var others = {
+  const assetSuffix = { mac: '-mac.dmg', windows: '-windows-x86_64.zip', linux: '-linux-x86_64.tar.gz' };
+  const others = {
     mac: ['Windows', 'Linux'],
     windows: ['Mac', 'Linux'],
     linux: ['Mac', 'Windows']
   };
 
-  var btn = document.getElementById('download-label');
-  var btnInstall = document.getElementById('download-label-install');
-  var note = document.getElementById('install-note');
-  var otherEl = document.getElementById('other-platforms');
+  const btn = document.getElementById('download-label');
+  const btnInstall = document.getElementById('download-label-install');
+  const dlBtn = document.getElementById('download-btn');
+  const dlBtnInstall = document.getElementById('download-btn-install');
+  const note = document.getElementById('install-note');
+  const otherEl = document.getElementById('other-platforms');
 
   if (labels[os]) {
     btn.textContent = labels[os];
@@ -544,23 +548,34 @@
   }
   if (notes[os]) note.textContent = notes[os];
   if (others[os] && otherEl) {
-    otherEl.innerHTML = 'Also available for ' + others[os].join(' and ') +
-      ' \u2014 <a href="https://github.com/domsleee/disk-cleaner/releases/latest">all downloads</a>';
+    otherEl.innerHTML = `Also available for ${others[os].join(' and ')} \u2014 <a href="https://github.com/domsleee/disk-cleaner/releases/latest">all downloads</a>`;
   }
 
-  // Verify release exists — fall back to releases list if /latest 404s
-  var dlBtn = document.getElementById('download-btn');
-  var dlBtnInstall = document.getElementById('download-btn-install');
-  fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest', { method: 'HEAD' })
-    .then(function(r) {
-      if (!r.ok) {
-        var fallback = 'https://github.com/domsleee/disk-cleaner/releases';
-        if (dlBtn) dlBtn.href = fallback;
-        if (dlBtnInstall) dlBtnInstall.href = fallback;
-        if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
+  // Fetch latest release and link directly to the platform-specific asset
+  try {
+    const r = await fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest');
+    if (!r.ok) {
+      // Any failure (404, 403, 429, 5xx) — fall back to releases list
+      const fallback = 'https://github.com/domsleee/disk-cleaner/releases';
+      if (dlBtn) dlBtn.href = fallback;
+      if (dlBtnInstall) dlBtnInstall.href = fallback;
+      if (r.status === 404 && note) {
+        note.textContent = 'No release yet \u2014 build from source or check back soon.';
       }
-    })
-    .catch(function() {});
+    } else {
+      const release = await r.json();
+      const suffix = assetSuffix[os];
+      if (suffix) {
+        const asset = release.assets.find(a => a.name.toLowerCase().startsWith('disk-cleaner-') && a.name.endsWith(suffix));
+        if (asset) {
+          if (dlBtn) dlBtn.href = asset.browser_download_url;
+          if (dlBtnInstall) dlBtnInstall.href = asset.browser_download_url;
+        }
+      }
+    }
+  } catch {
+    // Network error, blocked by extension, etc.: leave default links intact
+  }
 })();
 </script>
 </body>

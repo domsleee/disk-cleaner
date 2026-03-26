@@ -527,6 +527,7 @@
     windows: 'Windows 10+ (64-bit)',
     linux: 'Linux x86_64 \u2014 requires GTK3'
   };
+  var assetSuffix = { mac: '-mac.dmg', windows: '-windows-x86_64.zip', linux: '-linux-x86_64.tar.gz' };
   var others = {
     mac: ['Windows', 'Linux'],
     windows: ['Mac', 'Linux'],
@@ -535,6 +536,8 @@
 
   var btn = document.getElementById('download-label');
   var btnInstall = document.getElementById('download-label-install');
+  var dlBtn = document.getElementById('download-btn');
+  var dlBtnInstall = document.getElementById('download-btn-install');
   var note = document.getElementById('install-note');
   var otherEl = document.getElementById('other-platforms');
 
@@ -548,19 +551,25 @@
       ' \u2014 <a href="https://github.com/domsleee/disk-cleaner/releases/latest">all downloads</a>';
   }
 
-  // Verify release exists — fall back to releases list if /latest 404s
-  var dlBtn = document.getElementById('download-btn');
-  var dlBtnInstall = document.getElementById('download-btn-install');
-  fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest', { method: 'HEAD' })
-    .then(function(r) {
-      if (!r.ok) {
-        var fallback = 'https://github.com/domsleee/disk-cleaner/releases';
-        if (dlBtn) dlBtn.href = fallback;
-        if (dlBtnInstall) dlBtnInstall.href = fallback;
-        if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
+  // Fetch latest release and link directly to the platform-specific asset
+  fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest')
+    .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
+    .then(function(release) {
+      var suffix = assetSuffix[os];
+      if (!suffix) return;
+      var asset = release.assets.find(function(a) { return a.name.endsWith(suffix); });
+      if (asset) {
+        if (dlBtn) dlBtn.href = asset.browser_download_url;
+        if (dlBtnInstall) dlBtnInstall.href = asset.browser_download_url;
       }
     })
-    .catch(function() {});
+    .catch(function() {
+      // No release yet — fall back to releases list
+      var fallback = 'https://github.com/domsleee/disk-cleaner/releases';
+      if (dlBtn) dlBtn.href = fallback;
+      if (dlBtnInstall) dlBtnInstall.href = fallback;
+      if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
+    });
 })();
 </script>
 </body>

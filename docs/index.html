@@ -486,9 +486,9 @@
   <span class="section-label">Get started</span>
   <h2>Download or build from source</h2>
   <div class="cta" style="margin-bottom: 32px;">
-    <a href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
+    <a id="download-btn-install" href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      Download for Mac
+      <span id="download-label-install">Download for Mac</span>
     </a>
   </div>
   <p id="install-note" style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 24px;">
@@ -534,10 +534,14 @@
   };
 
   var btn = document.getElementById('download-label');
+  var btnInstall = document.getElementById('download-label-install');
   var note = document.getElementById('install-note');
   var otherEl = document.getElementById('other-platforms');
 
-  if (labels[os]) btn.textContent = labels[os];
+  if (labels[os]) {
+    btn.textContent = labels[os];
+    if (btnInstall) btnInstall.textContent = labels[os];
+  }
   if (notes[os]) note.textContent = notes[os];
   if (others[os] && otherEl) {
     otherEl.innerHTML = 'Also available for ' + others[os].join(' and ') +
@@ -546,13 +550,13 @@
 
   // Verify release exists — fall back to releases list if /latest 404s
   var dlBtn = document.getElementById('download-btn');
-  var installBtn = document.querySelector('.install-section .btn-primary');
+  var dlBtnInstall = document.getElementById('download-btn-install');
   fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest', { method: 'HEAD' })
     .then(function(r) {
       if (!r.ok) {
         var fallback = 'https://github.com/domsleee/disk-cleaner/releases';
         if (dlBtn) dlBtn.href = fallback;
-        if (installBtn) installBtn.href = fallback;
+        if (dlBtnInstall) dlBtnInstall.href = fallback;
         if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
       }
     })

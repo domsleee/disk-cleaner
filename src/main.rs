@@ -728,7 +728,8 @@ impl eframe::App for App {
                                     self.mark_dirty();
                                 } else if is_dir && expanded {
                                     let rows = &self.cached_rows;
-                                    if let Some(idx) = rows.iter().position(|r| &r.path == focused) {
+                                    if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                    {
                                         if idx + 1 < rows.len() {
                                             self.focused_path = Some(rows[idx + 1].path.clone());
                                             self.selected_paths.clear();
@@ -882,10 +883,9 @@ impl eframe::App for App {
                     // View mode toggle
                     if self.tree.is_some() {
                         ui.separator();
-                        for (label, mode) in [
-                            ("Tree", ViewMode::Tree),
-                            ("Treemap", ViewMode::Treemap),
-                        ] {
+                        for (label, mode) in
+                            [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
+                        {
                             let is_active = self.view_mode == mode;
                             let text = if is_active {
                                 egui::RichText::new(label).strong().size(14.0)
@@ -1403,7 +1403,8 @@ impl eframe::App for App {
                                     // Range select: select all visible rows between anchor and clicked row
                                     if let Some(ref anchor) = self.selection_anchor {
                                         let rows = &self.cached_rows;
-                                        let anchor_idx = rows.iter().position(|r| &r.path == anchor);
+                                        let anchor_idx =
+                                            rows.iter().position(|r| &r.path == anchor);
                                         let click_idx = rows.iter().position(|r| &r.path == path);
                                         if let (Some(a), Some(b)) = (anchor_idx, click_idx) {
                                             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -1535,10 +1536,7 @@ impl eframe::App for App {
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
                                     trash_paths.extend(
-                                        report.groups[idx]
-                                            .items
-                                            .iter()
-                                            .map(|i| i.path.clone()),
+                                        report.groups[idx].items.iter().map(|i| i.path.clone()),
                                     );
                                 }
                             }

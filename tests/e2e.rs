@@ -526,7 +526,10 @@ fn disclosure_triangle_click_clears_selection() {
         .iter()
         .find(|c| c.name() == "folder_b")
         .unwrap();
-    assert!(folder_b.expanded(), "folder_b should be expanded after toggle");
+    assert!(
+        folder_b.expanded(),
+        "folder_b should be expanded after toggle"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -42,6 +42,9 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # Static link MSVC CRT so Windows users don't need VC++ redistributable
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

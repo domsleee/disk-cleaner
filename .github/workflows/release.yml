@@ -41,7 +41,7 @@ jobs:
             libxkbcommon-dev libgtk-3-dev
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --profile release-dist --target ${{ matrix.target }}
         env:
           # Static link MSVC CRT so Windows users don't need VC++ redistributable
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
@@ -50,7 +50,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: disk-cleaner-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/disk-cleaner${{ runner.os == 'Windows' && '.exe' || '' }}
+          path: target/${{ matrix.target }}/release-dist/disk-cleaner${{ runner.os == 'Windows' && '.exe' || '' }}
 
   package:
     needs: build
@@ -128,7 +128,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          generate_release_notes: false
           files: |
             Disk-Cleaner-*-mac.dmg
             Disk-Cleaner-*-linux-x86_64.tar.gz

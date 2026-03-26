@@ -553,22 +553,26 @@
   // Fetch latest release and link directly to the platform-specific asset
   try {
     const r = await fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest');
-    if (!r.ok) throw new Error();
-    const release = await r.json();
-    const suffix = assetSuffix[os];
-    if (suffix) {
-      const asset = release.assets.find(a => a.name.endsWith(suffix));
-      if (asset) {
-        if (dlBtn) dlBtn.href = asset.browser_download_url;
-        if (dlBtnInstall) dlBtnInstall.href = asset.browser_download_url;
+    if (r.status === 404) {
+      // No release exists — point to releases list instead of 404ing /releases/latest
+      const fallback = 'https://github.com/domsleee/disk-cleaner/releases';
+      if (dlBtn) dlBtn.href = fallback;
+      if (dlBtnInstall) dlBtnInstall.href = fallback;
+      if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
+    } else if (r.ok) {
+      const release = await r.json();
+      const suffix = assetSuffix[os];
+      if (suffix) {
+        const asset = release.assets.find(a => a.name.endsWith(suffix));
+        if (asset) {
+          if (dlBtn) dlBtn.href = asset.browser_download_url;
+          if (dlBtnInstall) dlBtnInstall.href = asset.browser_download_url;
+        }
       }
     }
+    // Other status codes (rate limit, server error): leave default /releases/latest links intact
   } catch {
-    // No release yet — fall back to releases list
-    const fallback = 'https://github.com/domsleee/disk-cleaner/releases';
-    if (dlBtn) dlBtn.href = fallback;
-    if (dlBtnInstall) dlBtnInstall.href = fallback;
-    if (note) note.textContent = 'No release yet \u2014 build from source or check back soon.';
+    // Network error, blocked by extension, etc.: leave default links intact
   }
 })();
 </script>

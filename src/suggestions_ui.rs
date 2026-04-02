@@ -297,12 +297,28 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                                                 ));
                                             }
 
-                                            // Summary label: "12 × node_modules"
+                                            // Summary label: "12 files in ~/Projects/myapp"
+                                            let folder_display = {
+                                                let s = &cluster.label;
+                                                if s.chars().count() > 50 {
+                                                    let tail: String = s
+                                                        .chars()
+                                                        .rev()
+                                                        .take(47)
+                                                        .collect::<Vec<_>>()
+                                                        .into_iter()
+                                                        .rev()
+                                                        .collect();
+                                                    format!("...{tail}")
+                                                } else {
+                                                    s.clone()
+                                                }
+                                            };
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "{} \u{00D7} {}",
+                                                    "{} files in {}",
                                                     cluster.items.len(),
-                                                    cluster.label,
+                                                    folder_display,
                                                 ))
                                                 .monospace()
                                                 .size(12.0),

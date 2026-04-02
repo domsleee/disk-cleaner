@@ -161,21 +161,11 @@ const TEMP_EXTENSIONS: &[&str] = &["tmp", "temp", "log", "bak", "swp", "swo"];
 const INSTALLER_EXTENSIONS: &[&str] = &["dmg", "pkg", "iso", "msi", "exe"];
 
 /// Derive a grouping key for an item path.
-/// Directories group by their final component name; files group by extension.
+/// Groups items by their parent folder so "all files in folder" are clustered.
 fn cluster_key(path: &std::path::Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-    // If it looks like a dotfile/dotdir or known dir pattern, use the name directly
-    if name.starts_with('.') || !name.contains('.') {
-        return name.to_string();
-    }
-    // For files with extensions, group by extension
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        return format!(".{ext} files");
-    }
-    name.to_string()
+    path.parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".to_string())
 }
 
 /// Build clusters from a flat list of items, grouping by `cluster_key`.
@@ -448,40 +438,40 @@ mod tests {
     }
 
     #[test]
-    fn clusters_group_similar_items() {
+    fn clusters_group_by_parent_folder() {
+        // Two node_modules in the same parent → one cluster
+        let tree = dir(
+            "/test",
+            vec![dir(
+                "project_a",
+                vec![
+                    dir("node_modules", vec![leaf("a.js", 3000)]),
+                    dir("target", vec![leaf("bin", 2000)]),
+                ],
+            )],
+        );
+        let report = analyze(&tree);
+        // node_modules → PackageCaches, target → BuildArtifacts
+        // Each category has 1 item so cluster count is 1 in each
+        for group in &report.groups {
+            assert_eq!(group.clusters.len(), 1);
+            assert_eq!(group.clusters[0].label, "/test/project_a");
+        }
+    }
+
+    #[test]
+    fn clusters_separate_different_folders() {
         let tree = dir(
             "/test",
             vec![
                 dir("project_a", vec![dir("node_modules", vec![leaf("a.js", 3000)])]),
                 dir("project_b", vec![dir("node_modules", vec![leaf("b.js", 2000)])]),
-                dir("project_c", vec![dir("node_modules", vec![leaf("c.js", 1000)])]),
             ],
         );
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         let group = &report.groups[0];
-        assert_eq!(group.category, SuggestionCategory::PackageCaches);
-        // All three node_modules should be in one cluster
-        assert_eq!(group.clusters.len(), 1);
-        assert_eq!(group.clusters[0].label, "node_modules");
-        assert_eq!(group.clusters[0].items.len(), 3);
-        assert_eq!(group.clusters[0].total_size, 6000);
-        assert_eq!(group.item_count(), 3);
-    }
-
-    #[test]
-    fn clusters_separate_different_names() {
-        let tree = dir(
-            "/test",
-            vec![
-                dir("project_a", vec![dir("target", vec![leaf("bin", 1000)])]),
-                dir("project_b", vec![dir("build", vec![leaf("out", 500)])]),
-            ],
-        );
-        let report = analyze(&tree);
-        assert_eq!(report.groups.len(), 1);
-        let group = &report.groups[0];
-        // "target" and "build" should be separate clusters
+        // Different parent folders → separate clusters
         assert_eq!(group.clusters.len(), 2);
         assert_eq!(group.item_count(), 2);
     }

@@ -435,19 +435,22 @@ impl App {
         }
         if let Some(ref rx) = self.delete_receiver {
             if let Ok(results) = rx.try_recv() {
-                let mut any_deleted = false;
+                let mut deleted_paths = Vec::new();
                 for (path, err) in results {
                     if let Some(msg) = err {
                         self.error = Some(format!("Delete failed: {msg}"));
                     } else {
-                        any_deleted = true;
                         if let Some(ref mut tree) = self.tree {
                             ui::remove_node(tree, &path);
                             self.mark_dirty();
                         }
+                        deleted_paths.push(path);
                     }
                 }
-                if any_deleted {
+                if !deleted_paths.is_empty() {
+                    if let Some(ref mut report) = self.suggestion_report {
+                        report.remove_paths(&deleted_paths);
+                    }
                     self.refresh_disk_info();
                 }
                 self.deleting = false;
@@ -850,6 +853,9 @@ impl eframe::App for App {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
                         self.mark_dirty();
+                    }
+                    if let Some(ref mut report) = self.suggestion_report {
+                        report.remove_paths(std::slice::from_ref(&path));
                     }
                     self.selected_paths.remove(&path);
                     self.refresh_disk_info();
@@ -1442,6 +1448,9 @@ impl eframe::App for App {
                                     if let Some(ref mut tree) = self.tree {
                                         ui::remove_node(tree, path);
                                         self.mark_dirty();
+                                    }
+                                    if let Some(ref mut report) = self.suggestion_report {
+                                        report.remove_paths(std::slice::from_ref(path));
                                     }
                                     self.refresh_disk_info();
                                 }

@@ -8,8 +8,50 @@ use crate::suggestions::{SafetyLevel, SuggestionReport};
 /// Actions produced by the suggestions UI.
 pub enum SuggestionAction {
     ToggleGroup(usize),
+    ToggleCluster(usize, usize),
     TrashItem(PathBuf),
     TrashGroup(usize),
+    TrashCluster(usize, usize),
+}
+
+/// Render a single item row with trash button, path, and size.
+fn render_item_row(
+    ui: &mut egui::Ui,
+    item: &crate::suggestions::SuggestionItem,
+    actions: &mut Vec<SuggestionAction>,
+) {
+    ui.horizontal(|ui| {
+        let trash_btn = ui.add(
+            egui::Button::new(egui::RichText::new("\u{1F5D1}").size(12.0)).frame(false),
+        );
+        if trash_btn.clicked() {
+            actions.push(SuggestionAction::TrashItem(item.path.clone()));
+        }
+
+        let display_path = item.path.display().to_string();
+        let truncated = if display_path.chars().count() > 60 {
+            let tail: String = display_path
+                .chars()
+                .rev()
+                .take(57)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("...{tail}")
+        } else {
+            display_path
+        };
+        ui.label(egui::RichText::new(truncated).monospace().size(12.0));
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(ByteSize::b(item.size).to_string())
+                    .monospace()
+                    .size(12.0),
+            );
+        });
+    });
 }
 
 /// Render the Smart Cleanup suggestions panel.
@@ -45,7 +87,7 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                 );
                 ui.add_space(4.0);
                 let group_count = report.groups.len();
-                let item_count: usize = report.groups.iter().map(|g| g.items.len()).sum();
+                let item_count: usize = report.groups.iter().map(|g| g.item_count()).sum();
                 ui.label(
                     egui::RichText::new(format!(
                         "{item_count} items across {group_count} categories"
@@ -178,12 +220,13 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                             // Item count + total size
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                let item_word = if group.items.len() == 1 { "item" } else { "items" };
+                                let count = group.item_count();
+                                let item_word = if count == 1 { "item" } else { "items" };
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{} \u{2014} {} {} will be moved to Trash",
                                         ByteSize::b(group.total_size),
-                                        group.items.len(),
+                                        count,
                                         item_word,
                                     ))
                                     .size(13.0),
@@ -209,68 +252,102 @@ pub fn render_suggestions(ui: &mut egui::Ui, report: &SuggestionReport) -> Vec<S
                                 actions.push(SuggestionAction::ToggleGroup(group_idx));
                             }
 
-                            // Expanded item list
+                            // Expanded cluster list
                             if group.expanded {
                                 ui.add_space(4.0);
                                 ui.separator();
                                 ui.add_space(4.0);
 
-                                let max_show = 20;
-                                let show_count = group.items.len().min(max_show);
+                                for (cluster_idx, cluster) in group.clusters.iter().enumerate() {
+                                    if cluster.items.len() == 1 {
+                                        // Singleton cluster: show item directly
+                                        let item = &cluster.items[0];
+                                        render_item_row(ui, item, &mut actions);
+                                    } else {
+                                        // Multi-item cluster: summary row
+                                        ui.horizontal(|ui| {
+                                            // Trash-all button for cluster
+                                            let trash_btn = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("\u{1F5D1}").size(12.0),
+                                                )
+                                                .frame(false),
+                                            );
+                                            if trash_btn.clicked() {
+                                                actions.push(SuggestionAction::TrashCluster(
+                                                    group_idx, cluster_idx,
+                                                ));
+                                            }
 
-                                for item in &group.items[..show_count] {
-                                    ui.horizontal(|ui| {
-                                        // Trash button
-                                        let trash_btn = ui.add(
-                                            egui::Button::new(
-                                                egui::RichText::new("\u{1F5D1}").size(12.0),
-                                            )
-                                            .frame(false),
-                                        );
-                                        if trash_btn.clicked() {
-                                            actions.push(SuggestionAction::TrashItem(
-                                                item.path.clone(),
-                                            ));
+                                            // Expand/collapse arrow
+                                            let arrow = if cluster.expanded {
+                                                "\u{25BC}"
+                                            } else {
+                                                "\u{25B6}"
+                                            };
+                                            let toggle = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(arrow).size(11.0),
+                                                )
+                                                .frame(false),
+                                            );
+                                            if toggle.clicked() {
+                                                actions.push(SuggestionAction::ToggleCluster(
+                                                    group_idx, cluster_idx,
+                                                ));
+                                            }
+
+                                            // Summary label: "12 × node_modules"
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} \u{00D7} {}",
+                                                    cluster.items.len(),
+                                                    cluster.label,
+                                                ))
+                                                .monospace()
+                                                .size(12.0),
+                                            );
+
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            ByteSize::b(cluster.total_size)
+                                                                .to_string(),
+                                                        )
+                                                        .monospace()
+                                                        .size(12.0),
+                                                    );
+                                                },
+                                            );
+                                        });
+
+                                        // Expanded items within cluster
+                                        if cluster.expanded {
+                                            ui.indent(
+                                                egui::Id::new(("cluster", group_idx, cluster_idx)),
+                                                |ui| {
+                                                    let max_show = 20;
+                                                    let show_count =
+                                                        cluster.items.len().min(max_show);
+                                                    for item in &cluster.items[..show_count] {
+                                                        render_item_row(ui, item, &mut actions);
+                                                    }
+                                                    if cluster.items.len() > max_show {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "... and {} more",
+                                                                cluster.items.len() - max_show,
+                                                            ))
+                                                            .weak()
+                                                            .size(12.0),
+                                                        );
+                                                    }
+                                                },
+                                            );
                                         }
-
-                                        // Path (truncated at char boundary)
-                                        let display_path = item.path.display().to_string();
-                                        let truncated = if display_path.chars().count() > 60 {
-                                            let tail: String =
-                                                display_path.chars().rev().take(57).collect::<Vec<_>>().into_iter().rev().collect();
-                                            format!("...{tail}")
-                                        } else {
-                                            display_path
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(truncated).monospace().size(12.0),
-                                        );
-
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        ByteSize::b(item.size).to_string(),
-                                                    )
-                                                    .monospace()
-                                                    .size(12.0),
-                                                );
-                                            },
-                                        );
-                                    });
-                                }
-
-                                if group.items.len() > max_show {
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "... and {} more items",
-                                            group.items.len() - max_show
-                                        ))
-                                        .weak()
-                                        .size(12.0),
-                                    );
+                                    }
                                 }
                             }
                         });

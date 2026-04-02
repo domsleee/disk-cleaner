@@ -1462,6 +1462,10 @@ impl eframe::App for App {
                                 suggestions_ui::SuggestionAction::ToggleGroup(idx) => {
                                     report.groups[idx].expanded = !report.groups[idx].expanded;
                                 }
+                                suggestions_ui::SuggestionAction::ToggleCluster(g, c) => {
+                                    report.groups[g].clusters[c].expanded =
+                                        !report.groups[g].clusters[c].expanded;
+                                }
                                 suggestions_ui::SuggestionAction::TrashItem(path) => {
                                     if let Err(e) = trash::delete(&path) {
                                         self.error = Some(format!("Trash failed: {e}"));
@@ -1474,7 +1478,23 @@ impl eframe::App for App {
                                     }
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
-                                    let paths: Vec<PathBuf> = report.groups[idx]
+                                    let paths: Vec<PathBuf> =
+                                        report.groups[idx].all_item_paths().cloned().collect();
+                                    for path in paths {
+                                        if let Err(e) = trash::delete(&path) {
+                                            self.error = Some(format!("Trash failed: {e}"));
+                                            break;
+                                        } else {
+                                            if let Some(ref mut tree) = self.tree {
+                                                ui::remove_node(tree, &path);
+                                                self.visible_paths_dirty = true;
+                                            }
+                                            needs_disk_refresh = true;
+                                        }
+                                    }
+                                }
+                                suggestions_ui::SuggestionAction::TrashCluster(g, c) => {
+                                    let paths: Vec<PathBuf> = report.groups[g].clusters[c]
                                         .items
                                         .iter()
                                         .map(|i| i.path.clone())

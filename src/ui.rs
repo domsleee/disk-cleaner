@@ -358,7 +358,13 @@ pub fn render_tree(
                 ui.label(egui::RichText::new(&*row.name).monospace());
 
                 // Size bar + label (painted at fixed right-edge positions for alignment)
+                // Use max_rect for horizontal extent (right edge) but min_rect for
+                // vertical centering.  Inside show_rows, max_rect extends to the
+                // bottom of the remaining scroll area, so its center().y drifts with
+                // scroll position.  min_rect is bounded by set_min_height(row_height)
+                // and gives a stable per-row center.
                 let row_max = ui.max_rect();
+                let row_center_y = ui.min_rect().center().y;
                 let painter = ui.painter();
                 let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
@@ -371,7 +377,7 @@ pub fn render_tree(
                     painter.layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
                 let text_x = row_max.right() - text_margin - text_width;
-                let text_y = row_max.center().y - text_galley.size().y / 2.0;
+                let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
                     text_galley,
@@ -380,7 +386,7 @@ pub fn render_tree(
 
                 let bar_gap = 4.0_f32;
                 let bar_x = text_x - bar_gap - bar_width;
-                let bar_y = row_max.center().y - bar_h / 2.0;
+                let bar_y = row_center_y - bar_h / 2.0;
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(bar_x, bar_y),
                     egui::vec2(bar_width, bar_h),

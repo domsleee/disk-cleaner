@@ -23,6 +23,7 @@ fn main() {
     let progress = Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        permission_denied: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
     });
 

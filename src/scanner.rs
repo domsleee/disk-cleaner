@@ -100,6 +100,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
+    pub permission_denied: AtomicU64,
     pub cancelled: AtomicBool,
 }
 
@@ -240,7 +241,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => {
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                progress.permission_denied.fetch_add(1, Ordering::Relaxed);
+            }
             return FileNode::Dir(DirNode {
                 name: dir_name,
                 size: 0,
@@ -305,6 +309,7 @@ mod tests {
         Arc::new(ScanProgress {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
+            permission_denied: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -532,5 +537,39 @@ mod tests {
         assert!(root.children().is_empty());
         assert_eq!(root.size(), 0);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_without_fda_reports_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a normal file and a directory we can't read
+        fs::write(tmp.path().join("visible.txt"), "hello").unwrap();
+        let denied = tmp.path().join("denied_dir");
+        fs::create_dir(&denied).unwrap();
+        fs::write(denied.join("secret.txt"), "hidden").unwrap();
+
+        // Remove all permissions on the directory
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        // Should have scanned the visible file
+        assert_eq!(progress.file_count.load(Ordering::Relaxed), 1);
+
+        // Should have recorded the permission-denied error
+        assert_eq!(progress.permission_denied.load(Ordering::Relaxed), 1);
+
+        // The denied_dir should appear as an empty dir (size 0)
+        let denied_node = root.children().iter().find(|c| c.name() == "denied_dir");
+        assert!(denied_node.is_some());
+        assert_eq!(denied_node.unwrap().size(), 0);
+
+        // Restore permissions for cleanup
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

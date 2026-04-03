@@ -5,7 +5,7 @@ edition = "2021"
 default-run = "disk-cleaner"
 
 [dependencies]
-eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 bytesize = "2"
 trash = "5"
 rfd = "0.17"
@@ -41,8 +41,17 @@ harness = false
 name = "view_bench"
 harness = false
 
+[[bench]]
+name = "treemap_bench"
+harness = false
+
+
 [profile.release]
-lto = true
+lto = "thin"
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[profile.release-dist]
+inherits = "release"
+lto = true

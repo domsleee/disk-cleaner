@@ -315,21 +315,21 @@ fn toggle_expand_reveals_children_in_visible_paths() {
     // Root is already expanded by scanner
 
     // Before expanding folder, inner.txt should not be visible
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
     let inner_path = root.join("folder").join("inner.txt");
     assert!(
-        !paths.contains(&inner_path),
+        !paths.contains(&&inner_path),
         "inner.txt should not be visible when folder is collapsed"
     );
 
     // Expand the folder
     ui::toggle_expand(&mut tree, &root.join("folder"));
 
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
     assert!(
-        paths.contains(&inner_path),
+        paths.contains(&&inner_path),
         "inner.txt should be visible after expanding folder"
     );
 }
@@ -351,16 +351,16 @@ fn category_filter_shows_only_matching_files() {
     // Root is already expanded by scanner
 
     // Filter to videos only
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", Some(FileCategory::Video), true, &mut paths);
+    let rows = ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true, None, None);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
 
     let video_path = root.join("video.mp4");
     let code_path = root.join("code.rs");
     let photo_path = root.join("photo.jpg");
 
-    assert!(paths.contains(&video_path));
-    assert!(!paths.contains(&code_path));
-    assert!(!paths.contains(&photo_path));
+    assert!(paths.contains(&&video_path));
+    assert!(!paths.contains(&&code_path));
+    assert!(!paths.contains(&&photo_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -379,16 +379,16 @@ fn hidden_files_excluded_by_default() {
     // Root is already expanded by scanner
 
     // Without show_hidden, .hidden should be excluded
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, false, &mut paths);
-    assert!(!paths.contains(&root.join(".hidden")));
-    assert!(paths.contains(&root.join("visible.txt")));
+    let rows = ui::collect_cached_rows(&tree, "", None, false, None, None);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    assert!(!paths.contains(&&root.join(".hidden")));
+    assert!(paths.contains(&&root.join("visible.txt")));
 
     // With show_hidden, both should be visible
-    let mut paths = Vec::new();
-    ui::collect_visible_paths(&tree, "", None, true, &mut paths);
-    assert!(paths.contains(&root.join(".hidden")));
-    assert!(paths.contains(&root.join("visible.txt")));
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None);
+    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    assert!(paths.contains(&&root.join(".hidden")));
+    assert!(paths.contains(&&root.join("visible.txt")));
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +462,74 @@ fn full_pipeline_scan_select_clear() {
     assert_eq!(src.children().len(), 2);
     let docs = tree.children().iter().find(|c| c.name() == "docs").unwrap();
     assert_eq!(docs.children().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Scan cancellation
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Disclosure triangle click clears stale selection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disclosure_triangle_click_clears_selection() {
+    let tmp = tmpdir();
+    let root = tmp.path();
+
+    fs::create_dir(root.join("folder_a")).unwrap();
+    create_file(&root.join("folder_a"), "a.txt", 100);
+    fs::create_dir(root.join("folder_b")).unwrap();
+    create_file(&root.join("folder_b"), "b.txt", 200);
+
+    let mut tree = scan(root);
+
+    // Simulate the app state fields relevant to selection
+    let mut selected_paths: HashSet<PathBuf> = HashSet::new();
+    // --- Step 1: Plain click on folder_a (Click action) ---
+    // This mirrors the Click handler in main.rs
+    let click_path = root.join("folder_a");
+    selected_paths.clear();
+    selected_paths.insert(click_path.clone());
+    let mut focused_path: Option<PathBuf> = Some(click_path.clone());
+
+    assert_eq!(selected_paths.len(), 1);
+    assert!(selected_paths.contains(&click_path));
+    assert_eq!(focused_path.as_deref(), Some(click_path.as_path()));
+
+    // --- Step 2: Click disclosure triangle on folder_b ---
+    // The UI emits two actions: Focus(folder_b) + ToggleExpand(folder_b)
+    let triangle_path = root.join("folder_b");
+
+    // Focus action (processed first in the action loop)
+    focused_path = Some(triangle_path.clone());
+
+    // ToggleExpand action (processed in the second loop)
+    ui::toggle_expand(&mut tree, &triangle_path);
+    selected_paths.clear(); // <-- the fix under test
+
+    // --- Assertions ---
+    // Selection must be empty (no ghost highlight on folder_a)
+    assert!(
+        selected_paths.is_empty(),
+        "selected_paths should be empty after disclosure triangle click"
+    );
+    // Focus should point to the triangle-clicked row
+    assert_eq!(
+        focused_path.as_deref(),
+        Some(triangle_path.as_path()),
+        "focused_path should be set to the disclosure-triangle target"
+    );
+    // The folder should now be expanded
+    let folder_b = tree
+        .children()
+        .iter()
+        .find(|c| c.name() == "folder_b")
+        .unwrap();
+    assert!(
+        folder_b.expanded(),
+        "folder_b should be expanded after toggle"
+    );
 }
 
 // ---------------------------------------------------------------------------

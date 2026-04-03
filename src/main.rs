@@ -18,8 +18,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use scanner::ScanProgress;
+
+/// Result from the background scan thread — includes pre-computed stats
+/// so they don't block the UI thread.
+struct ScanResult {
+    tree: tree::FileNode,
+    stats: categories::CategoryStats,
+    suggestions: suggestions::SuggestionReport,
+}
 use tree::FileNode;
 use treemap::TreemapAction;
+
+/// Result of background deletion: list of (path, optional error message).
+type DeleteResults = Vec<(PathBuf, Option<String>)>;
 
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
@@ -168,11 +179,15 @@ struct App {
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
-    receiver: Option<mpsc::Receiver<FileNode>>,
+    receiver: Option<mpsc::Receiver<ScanResult>>,
     error: Option<String>,
     confirm_delete: Option<PathBuf>,
     confirm_batch_delete: bool,
     search_query: String,
+    /// The search query currently applied to the cached rows (debounced).
+    applied_search: String,
+    /// When the search text last changed (for debouncing).
+    search_changed_at: Option<Instant>,
     focused_path: Option<PathBuf>,
     last_scan_path: Option<PathBuf>,
     view_mode: ViewMode,
@@ -190,9 +205,12 @@ struct App {
     last_scan_total_size: u64,
     show_categories: bool,
     tree_scroll_to_focus: bool,
-    /// Cached visible path list for keyboard navigation; rebuilt when dirty.
-    cached_visible_paths: Vec<PathBuf>,
-    visible_paths_dirty: bool,
+    /// Cached visible row list for rendering; rebuilt when dirty.
+    cached_rows: Vec<ui::CachedRow>,
+    rows_dirty: bool,
+    /// Cached treemap layout; rebuilt when treemap_dirty.
+    treemap_cache: Option<treemap::TreemapCache>,
+    treemap_dirty: bool,
     /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
     selected_paths: HashSet<PathBuf>,
     /// Anchor path for shift+click range selection.
@@ -215,7 +233,7 @@ struct App {
     deleting: bool,
     delete_progress: Arc<AtomicUsize>,
     delete_total: usize,
-    delete_receiver: Option<mpsc::Receiver<Vec<(PathBuf, Option<String>)>>>,
+    delete_receiver: Option<mpsc::Receiver<DeleteResults>>,
 }
 
 impl Default for App {
@@ -235,6 +253,8 @@ impl Default for App {
             confirm_delete: None,
             confirm_batch_delete: false,
             search_query: String::new(),
+            applied_search: String::new(),
+            search_changed_at: None,
             focused_path: None,
             last_scan_path,
             view_mode: ViewMode::Tree,
@@ -252,8 +272,10 @@ impl Default for App {
             last_scan_total_size: 0,
             show_categories: false,
             tree_scroll_to_focus: false,
-            cached_visible_paths: Vec::new(),
-            visible_paths_dirty: true,
+            cached_rows: Vec::new(),
+            rows_dirty: true,
+            treemap_cache: None,
+            treemap_dirty: true,
             selected_paths: HashSet::new(),
             selection_anchor: None,
             suggestion_report: None,
@@ -308,25 +330,58 @@ impl App {
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
-            let _ = tx.send(tree);
+            let stats = categories::compute_stats(&tree);
+            let suggestions = suggestions::analyze(&tree);
+            let _ = tx.send(ScanResult {
+                tree,
+                stats,
+                suggestions,
+            });
         });
     }
 
-    fn visible_paths(&mut self) -> &[PathBuf] {
-        if self.visible_paths_dirty {
-            self.cached_visible_paths.clear();
-            if let Some(ref tree) = self.tree {
-                ui::collect_visible_paths(
-                    tree,
-                    &self.search_query,
-                    self.category_filter,
-                    self.show_hidden,
-                    &mut self.cached_visible_paths,
-                );
-            }
-            self.visible_paths_dirty = false;
+    fn rebuild_rows_if_dirty(&mut self) {
+        if !self.rows_dirty {
+            return;
         }
-        &self.cached_visible_paths
+
+        let text_cache = if !self.applied_search.is_empty() {
+            self.tree
+                .as_ref()
+                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
+        } else {
+            None
+        };
+
+        let cat_cache = if let Some(cat) = self.category_filter {
+            self.tree
+                .as_ref()
+                .map(|t| ui::build_category_match_cache(t, cat))
+        } else {
+            None
+        };
+
+        // Drop old rows before building new ones to avoid holding two full
+        // Vec<CachedRow> in memory simultaneously (OOM risk on large trees).
+        self.cached_rows = Vec::new();
+
+        if let Some(ref tree) = self.tree {
+            self.cached_rows = ui::collect_cached_rows(
+                tree,
+                &self.applied_search,
+                self.category_filter,
+                self.show_hidden,
+                text_cache.as_ref(),
+                cat_cache.as_ref(),
+            );
+        }
+        self.rows_dirty = false;
+    }
+
+    /// Mark both tree-view and treemap caches as needing rebuild.
+    fn mark_dirty(&mut self) {
+        self.rows_dirty = true;
+        self.treemap_dirty = true;
     }
 
     fn batch_trash_selected(&mut self) {
@@ -388,7 +443,7 @@ impl App {
                         any_deleted = true;
                         if let Some(ref mut tree) = self.tree {
                             ui::remove_node(tree, &path);
-                            self.visible_paths_dirty = true;
+                            self.mark_dirty();
                         }
                     }
                 }
@@ -440,6 +495,19 @@ impl eframe::App for App {
             eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
         }
 
+        // Apply debounced search query after 150ms of no typing
+        if let Some(changed_at) = self.search_changed_at {
+            if changed_at.elapsed() >= Duration::from_millis(150) {
+                self.applied_search = self.search_query.clone();
+                self.search_changed_at = None;
+                self.rows_dirty = true;
+                // Treemap doesn't filter by search text, so no treemap_dirty
+            } else {
+                let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
+                ctx.request_repaint_after(remaining);
+            }
+        }
+
         // Load system icons on first frame
         if self.icon_cache.is_none() {
             self.icon_cache = icons::IconCache::load(ctx);
@@ -447,10 +515,10 @@ impl eframe::App for App {
 
         // Check if scan completed
         if let Some(ref rx) = self.receiver {
-            if let Ok(tree) = rx.try_recv() {
-                self.category_stats = Some(categories::compute_stats(&tree));
-                self.suggestion_report = Some(suggestions::analyze(&tree));
-                self.tree = Some(tree);
+            if let Ok(result) = rx.try_recv() {
+                self.category_stats = Some(result.stats);
+                self.suggestion_report = Some(result.suggestions);
+                self.tree = Some(result.tree);
                 if let Some(ref mut t) = self.tree {
                     tree::auto_expand(t, 0, 2);
                 }
@@ -459,7 +527,7 @@ impl eframe::App for App {
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;
-                self.visible_paths_dirty = true;
+                self.mark_dirty();
 
                 // Report frame-time stats for the scan
                 if let Some(scan_start) = self.scan_start_time.take() {
@@ -469,7 +537,7 @@ impl eframe::App for App {
                     let n = ft.len();
                     if n > 0 {
                         let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
-                        let p99 = ft[(n as f64 * 0.99) as usize];
+                        let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
                         let over = ft
                             .iter()
                             .filter(|d| **d > Duration::from_millis(16))
@@ -533,9 +601,7 @@ impl eframe::App for App {
 
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
-                    if self.tree.is_none() && !self.scanning {
-                        self.screenshot_state = ScreenshotState::WaitFrames(5);
-                    } else if self.tree.is_some() && !self.scanning {
+                    if !self.scanning {
                         self.screenshot_state = ScreenshotState::WaitFrames(5);
                     }
                 }
@@ -608,7 +674,7 @@ impl eframe::App for App {
         let has_text_focus = ctx.memory(|m| m.focused().is_some());
         if !has_text_focus {
             // Ensure visible path cache is fresh before keyboard nav
-            self.visible_paths();
+            self.rebuild_rows_if_dirty();
 
             // Arrow key navigation
             let (up, down, left, right) = ctx.input(|i| {
@@ -621,19 +687,19 @@ impl eframe::App for App {
             });
 
             if up || down {
-                let visible = &self.cached_visible_paths;
-                if !visible.is_empty() {
+                let rows = &self.cached_rows;
+                if !rows.is_empty() {
                     if let Some(ref focused) = self.focused_path {
-                        if let Some(idx) = visible.iter().position(|p| p == focused) {
+                        if let Some(idx) = rows.iter().position(|r| &r.path == focused) {
                             let new_idx = if up {
                                 idx.saturating_sub(1)
                             } else {
-                                (idx + 1).min(visible.len() - 1)
+                                (idx + 1).min(rows.len() - 1)
                             };
-                            self.focused_path = Some(visible[new_idx].clone());
+                            self.focused_path = Some(rows[new_idx].path.clone());
                         }
                     } else {
-                        self.focused_path = Some(visible[0].clone());
+                        self.focused_path = Some(rows[0].path.clone());
                     }
                     // Clear selection so only the focused row is highlighted
                     self.selected_paths.clear();
@@ -650,20 +716,23 @@ impl eframe::App for App {
                             if left {
                                 if is_dir && expanded {
                                     ui::set_expanded(tree, focused, false);
-                                    self.visible_paths_dirty = true;
+                                    self.mark_dirty();
                                 } else if let Some(parent) = ui::find_parent_path(tree, focused) {
                                     self.focused_path = Some(parent);
+                                    self.selected_paths.clear();
                                     self.tree_scroll_to_focus = true;
                                 }
                             } else if right {
                                 if is_dir && !expanded && has_children {
                                     ui::set_expanded(tree, focused, true);
-                                    self.visible_paths_dirty = true;
+                                    self.mark_dirty();
                                 } else if is_dir && expanded {
-                                    let visible = &self.cached_visible_paths;
-                                    if let Some(idx) = visible.iter().position(|p| p == focused) {
-                                        if idx + 1 < visible.len() {
-                                            self.focused_path = Some(visible[idx + 1].clone());
+                                    let rows = &self.cached_rows;
+                                    if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                    {
+                                        if idx + 1 < rows.len() {
+                                            self.focused_path = Some(rows[idx + 1].path.clone());
+                                            self.selected_paths.clear();
                                             self.tree_scroll_to_focus = true;
                                         }
                                     }
@@ -685,21 +754,13 @@ impl eframe::App for App {
                 if space {
                     if let Some(ref mut tree) = self.tree {
                         ui::toggle_expand(tree, focused);
-                        self.visible_paths_dirty = true;
+                        self.mark_dirty();
                     }
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
                 } else if del {
-                    if let Err(e) = trash::delete(focused) {
-                        self.error = Some(format!("Trash failed: {e}"));
-                    } else {
-                        if let Some(ref mut tree) = self.tree {
-                            ui::remove_node(tree, focused);
-                            self.visible_paths_dirty = true;
-                        }
-                        self.refresh_disk_info();
-                    }
                     self.selected_paths.remove(focused);
+                    self.start_background_delete(vec![focused.clone()], true);
                     self.focused_path = None;
                 }
             }
@@ -723,8 +784,7 @@ impl eframe::App for App {
                     ));
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete all")
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new("Yes, delete all").color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(220, 50, 50));
                         if ui.add(delete_btn).clicked() || enter_pressed {
@@ -760,8 +820,7 @@ impl eframe::App for App {
                     ui.label(format!("Permanently delete?\n{}", path.display()));
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete")
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(220, 50, 50));
                         if ui.add(delete_btn).clicked() || enter_pressed {
@@ -790,7 +849,7 @@ impl eframe::App for App {
                 Ok(()) => {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
-                        self.visible_paths_dirty = true;
+                        self.mark_dirty();
                     }
                     self.selected_paths.remove(&path);
                     self.refresh_disk_info();
@@ -804,131 +863,132 @@ impl eframe::App for App {
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
         let show_toolbar = self.tree.is_some() || self.scanning;
         if show_toolbar {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Standardize widget height so buttons and selectable labels align
-                ui.spacing_mut().interact_size.y = 24.0;
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Standardize widget height so buttons and selectable labels align
+                    ui.spacing_mut().interact_size.y = 24.0;
 
-                if ui.button("Open Directory...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.start_scan(path);
-                    }
-                }
-
-                if self.tree.is_some() && ui.button("Re-scan").clicked() {
-                    if let Some(path) = self.scan_path.clone() {
-                        self.start_scan(path);
-                    }
-                }
-
-                // View mode toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    for (label, mode) in [
-                        ("Tree", ViewMode::Tree),
-                        ("Treemap", ViewMode::Treemap),
-                        ("Suggestions", ViewMode::Suggestions),
-                    ] {
-                        let is_active = self.view_mode == mode;
-                        let text = if is_active {
-                            egui::RichText::new(label).strong().size(14.0)
-                        } else {
-                            egui::RichText::new(label)
-                                .size(14.0)
-                                .color(ui.visuals().weak_text_color())
-                        };
-
-                        let btn = egui::Button::new(text)
-                            .frame(false)
-                            .min_size(egui::vec2(0.0, 24.0));
-                        let response = ui.add(btn);
-
-                        // Draw underline for active tab
-                        if is_active {
-                            let rect = response.rect;
-                            let painter = ui.painter();
-                            let accent = egui::Color32::from_rgb(100, 180, 255);
-                            painter.rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                    egui::vec2(rect.width(), 2.0),
-                                ),
-                                0.0,
-                                accent,
-                            );
-                        }
-
-                        if response.clicked() {
-                            self.view_mode = mode;
+                    if ui.button("Open Directory...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.start_scan(path);
                         }
                     }
-                }
 
-                // Search/filter bar
-                if self.tree.is_some() {
-                    ui.separator();
-                    ui.label("Filter:");
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("file name...")
-                            .desired_width(200.0),
-                    );
-                    if response.changed() {
-                        // Convert to lowercase once; node_matches uses lowercase comparison
-                        self.search_query = self.search_query.to_lowercase();
-                        self.visible_paths_dirty = true;
-                    }
-                    if !self.search_query.is_empty() && ui.small_button("×").clicked() {
-                        self.search_query.clear();
-                        self.visible_paths_dirty = true;
-                    }
-                }
-
-                // Hidden files toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.show_hidden, "Show hidden")
-                        .clicked()
-                    {
-                        self.show_hidden = !self.show_hidden;
-                        self.visible_paths_dirty = true;
-                        // Persist preference
-                        if let Some(ref path) = self.last_scan_path {
-                            save_config(path, self.show_hidden);
-                        }
-                        // Recompute stats
-                        if let Some(ref tree) = self.tree {
-                            self.category_stats = Some(categories::compute_stats(tree));
+                    if self.tree.is_some() && ui.button("Re-scan").clicked() {
+                        if let Some(path) = self.scan_path.clone() {
+                            self.start_scan(path);
                         }
                     }
-                }
 
-                // File types panel toggle
-                if self.tree.is_some() {
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.show_categories, "File Types")
-                        .clicked()
-                    {
-                        self.show_categories = !self.show_categories;
-                        if !self.show_categories {
-                            self.category_filter = None;
-                            self.visible_paths_dirty = true;
+                    // View mode toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        for (label, mode) in
+                            [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
+                        {
+                            let is_active = self.view_mode == mode;
+                            let text = if is_active {
+                                egui::RichText::new(label).strong().size(14.0)
+                            } else {
+                                egui::RichText::new(label)
+                                    .size(14.0)
+                                    .color(ui.visuals().weak_text_color())
+                            };
+
+                            let btn = egui::Button::new(text)
+                                .frame(false)
+                                .min_size(egui::vec2(0.0, 24.0));
+                            let response = ui.add(btn);
+
+                            // Draw underline for active tab
+                            if is_active {
+                                let rect = response.rect;
+                                let painter = ui.painter();
+                                let accent = egui::Color32::from_rgb(100, 180, 255);
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                        egui::vec2(rect.width(), 2.0),
+                                    ),
+                                    0.0,
+                                    accent,
+                                );
+                            }
+
+                            if response.clicked() {
+                                self.view_mode = mode;
+                            }
                         }
                     }
-                }
 
-                if self.scanning {
-                    // Full-page scanning UI is in CentralPanel; just keep repainting
-                    ctx.request_repaint();
-                }
+                    // Search/filter bar
+                    if self.tree.is_some() {
+                        ui.separator();
+                        ui.label("Filter:");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .hint_text("file name...")
+                                .desired_width(200.0),
+                        );
+                        if response.changed() {
+                            // Convert to lowercase once; node_matches uses lowercase comparison
+                            self.search_query = self.search_query.to_lowercase();
+                            self.search_changed_at = Some(Instant::now());
+                        }
+                        if !self.search_query.is_empty() && ui.small_button("×").clicked() {
+                            self.search_query.clear();
+                            self.applied_search.clear();
+                            self.search_changed_at = None;
+                            self.rows_dirty = true;
+                            // Treemap doesn't filter by search text, so no treemap_dirty
+                        }
+                    }
 
-                if let Some(ref err) = self.error {
-                    ui.colored_label(egui::Color32::RED, err);
-                }
+                    // Hidden files toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_hidden, "Show hidden")
+                            .clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.mark_dirty();
+                            // Persist preference
+                            if let Some(ref path) = self.last_scan_path {
+                                save_config(path, self.show_hidden);
+                            }
+                            // Recompute stats
+                            if let Some(ref tree) = self.tree {
+                                self.category_stats = Some(categories::compute_stats(tree));
+                            }
+                        }
+                    }
+
+                    // File types panel toggle
+                    if self.tree.is_some() {
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_categories, "File Types")
+                            .clicked()
+                        {
+                            self.show_categories = !self.show_categories;
+                            if !self.show_categories {
+                                self.category_filter = None;
+                                self.mark_dirty();
+                            }
+                        }
+                    }
+
+                    if self.scanning {
+                        // Full-page scanning UI is in CentralPanel; just keep repainting
+                        ctx.request_repaint();
+                    }
+
+                    if let Some(ref err) = self.error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
             });
-        });
         } // show_toolbar
 
         // Category side panel (toggled via toolbar button)
@@ -954,7 +1014,8 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.category_filter = None;
-                            self.visible_paths_dirty = true;
+                            self.rows_dirty = true;
+                            self.treemap_dirty = true;
                         }
 
                         ui.add_space(4.0);
@@ -1018,7 +1079,8 @@ impl eframe::App for App {
                                 } else {
                                     self.category_filter = Some(cat);
                                 }
-                                self.visible_paths_dirty = true;
+                                self.rows_dirty = true;
+                                self.treemap_dirty = true;
                             }
 
                             ui.add_space(2.0);
@@ -1046,9 +1108,7 @@ impl eframe::App for App {
                         }
                         ui.label(egui::RichText::new(status).small());
                     } else if selected_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{selected_count} selected")).small(),
-                        );
+                        ui.label(egui::RichText::new(format!("{selected_count} selected")).small());
                     } else if let Some(ref path) = self.scan_path {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1100,11 +1160,9 @@ impl eframe::App for App {
 
                         // Keyboard hints
                         ui.label(
-                            egui::RichText::new(
-                                "Arrow keys navigate  Space expand  Del trash",
-                            )
-                            .small()
-                            .weak(),
+                            egui::RichText::new("Arrow keys navigate  Space expand  Del trash")
+                                .small()
+                                .weak(),
                         );
                         ui.separator();
                     }
@@ -1138,17 +1196,14 @@ impl eframe::App for App {
                     let size_str = bytesize::ByteSize::b(size).to_string();
                     ui.label(format!("{files} files — {size_str}"));
 
-                    // Progress bar: show fraction of used disk space when scanning a volume root
+                    // Progress bar: estimated scan progress based on used disk space
                     if self.scan_is_volume {
                         if let Some((total, available)) = self.scan_disk_info {
                             let used = total.saturating_sub(available);
                             if used > 0 {
                                 ui.add_space(12.0);
                                 let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                                let used_str = bytesize::ByteSize::b(used).to_string();
-                                let bar = egui::ProgressBar::new(fraction)
-                                    .text(format!("{size_str} / {used_str} used"))
-                                    .desired_width(300.0);
+                                let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
                                 ui.add(bar);
                             }
                         }
@@ -1172,10 +1227,8 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(24.0);
-                    let cancel_btn = egui::Button::new(
-                        egui::RichText::new("Cancel").size(15.0),
-                    )
-                    .min_size(egui::vec2(120.0, 36.0));
+                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0))
+                        .min_size(egui::vec2(120.0, 36.0));
                     if ui.add(cancel_btn).clicked() {
                         self.cancel_scan();
                     }
@@ -1223,10 +1276,7 @@ impl eframe::App for App {
                                 .show(ui, |ui| {
                                     ui.set_width(400.0);
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("\u{1F4BD}")
-                                                .size(16.0),
-                                        );
+                                        ui.label(egui::RichText::new("\u{1F4BD}").size(16.0));
                                         ui.strong(&vol.name);
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1320,24 +1370,27 @@ impl eframe::App for App {
 
             match self.view_mode {
                 ViewMode::Tree => {
-                    let actions = if let Some(ref tree) = self.tree {
-                        let root_size = tree.size();
-                        ui::render_tree(
-                            ui,
-                            tree,
-                            root_size,
-                            &self.search_query,
-                            &self.focused_path,
-                            self.category_filter,
-                            self.show_hidden,
-                            self.icon_cache.as_ref(),
-                            self.tree_scroll_to_focus,
-                            &self.selected_paths,
-                        )
-                    } else {
-                        Vec::new()
-                    };
+                    let render_start = std::time::Instant::now();
+                    let rebuild_needed = self.rows_dirty;
+                    self.rebuild_rows_if_dirty();
+                    let actions = ui::render_tree(
+                        ui,
+                        &self.cached_rows,
+                        &self.focused_path,
+                        self.icon_cache.as_ref(),
+                        self.tree_scroll_to_focus,
+                        &self.selected_paths,
+                    );
                     self.tree_scroll_to_focus = false;
+                    let render_elapsed = render_start.elapsed();
+                    if render_elapsed > std::time::Duration::from_millis(16) {
+                        eprintln!(
+                            "[perf] tree frame: {:?} ({} rows, rebuild={})",
+                            render_elapsed,
+                            self.cached_rows.len(),
+                            rebuild_needed,
+                        );
+                    }
                     // Handle actions from tree rendering
                     for action in &actions {
                         match action {
@@ -1349,14 +1402,15 @@ impl eframe::App for App {
                                 if *shift {
                                     // Range select: select all visible rows between anchor and clicked row
                                     if let Some(ref anchor) = self.selection_anchor {
-                                        let visible = &self.cached_visible_paths;
-                                        let anchor_idx = visible.iter().position(|p| p == anchor);
-                                        let click_idx = visible.iter().position(|p| p == path);
+                                        let rows = &self.cached_rows;
+                                        let anchor_idx =
+                                            rows.iter().position(|r| &r.path == anchor);
+                                        let click_idx = rows.iter().position(|r| &r.path == path);
                                         if let (Some(a), Some(b)) = (anchor_idx, click_idx) {
                                             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                                             self.selected_paths.clear();
-                                            for p in &visible[lo..=hi] {
-                                                self.selected_paths.insert(p.clone());
+                                            for r in &rows[lo..=hi] {
+                                                self.selected_paths.insert(r.path.clone());
                                             }
                                         }
                                     } else {
@@ -1387,7 +1441,7 @@ impl eframe::App for App {
                                 } else {
                                     if let Some(ref mut tree) = self.tree {
                                         ui::remove_node(tree, path);
-                                        self.visible_paths_dirty = true;
+                                        self.mark_dirty();
                                     }
                                     self.refresh_disk_info();
                                 }
@@ -1403,10 +1457,13 @@ impl eframe::App for App {
                                 self.confirm_batch_delete = true;
                             }
                             ui::TreeAction::RevealInFinder(path) => {
-                                let _ = std::process::Command::new("open")
+                                if let Err(e) = std::process::Command::new("open")
                                     .arg("-R")
                                     .arg(path)
-                                    .spawn();
+                                    .spawn()
+                                {
+                                    self.error = Some(format!("Could not reveal in Finder: {e}"));
+                                }
                             }
                             ui::TreeAction::CopyPath(path) => {
                                 ctx.copy_text(path.display().to_string());
@@ -1419,7 +1476,13 @@ impl eframe::App for App {
                         for action in &actions {
                             if let ui::TreeAction::ToggleExpand(path) = action {
                                 ui::toggle_expand(tree, path);
-                                self.visible_paths_dirty = true;
+                                self.rows_dirty = true;
+                                // Clear selection and anchor so only the focused row is
+                                // highlighted, and a subsequent shift-click starts fresh
+                                // rather than selecting a stale range.
+                                self.selected_paths.clear();
+                                self.selection_anchor = None;
+                                // Note: treemap doesn't use expand state, so no treemap_dirty
                             }
                         }
                     }
@@ -1428,6 +1491,8 @@ impl eframe::App for App {
                     if let Some(ref tree) = self.tree {
                         let tm_actions = treemap::render_treemap(
                             ui,
+                            &mut self.treemap_cache,
+                            &mut self.treemap_dirty,
                             tree,
                             &self.treemap_zoom,
                             &self.focused_path,
@@ -1435,6 +1500,7 @@ impl eframe::App for App {
                             self.category_filter,
                             self.show_hidden,
                         );
+
                         for action in tm_actions {
                             match action {
                                 TreemapAction::ZoomTo(path) => {
@@ -1444,6 +1510,7 @@ impl eframe::App for App {
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
                                         self.treemap_zoom = new_zoom;
+                                        self.treemap_dirty = true;
                                     }
                                 }
                                 TreemapAction::Focus(path) => {
@@ -1454,7 +1521,9 @@ impl eframe::App for App {
                     }
                 }
                 ViewMode::Suggestions => {
-                    let mut needs_disk_refresh = false;
+                    // Collect actions and trash paths while report is borrowed,
+                    // then apply deletions after the borrow is released.
+                    let mut trash_paths: Vec<PathBuf> = Vec::new();
                     if let Some(ref mut report) = self.suggestion_report {
                         let sg_actions = suggestions_ui::render_suggestions(ui, report);
                         for action in sg_actions {
@@ -1462,61 +1531,31 @@ impl eframe::App for App {
                                 suggestions_ui::SuggestionAction::ToggleGroup(idx) => {
                                     report.groups[idx].expanded = !report.groups[idx].expanded;
                                 }
-                                suggestions_ui::SuggestionAction::ToggleCluster(g, c) => {
-                                    report.groups[g].clusters[c].expanded =
-                                        !report.groups[g].clusters[c].expanded;
-                                }
                                 suggestions_ui::SuggestionAction::TrashItem(path) => {
-                                    if let Err(e) = trash::delete(&path) {
-                                        self.error = Some(format!("Trash failed: {e}"));
-                                    } else {
-                                        if let Some(ref mut tree) = self.tree {
-                                            ui::remove_node(tree, &path);
-                                            self.visible_paths_dirty = true;
-                                        }
-                                        needs_disk_refresh = true;
-                                    }
+                                    trash_paths.push(path);
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
-                                    let paths: Vec<PathBuf> =
-                                        report.groups[idx].all_item_paths().cloned().collect();
-                                    for path in paths {
-                                        if let Err(e) = trash::delete(&path) {
-                                            self.error = Some(format!("Trash failed: {e}"));
-                                            break;
-                                        } else {
-                                            if let Some(ref mut tree) = self.tree {
-                                                ui::remove_node(tree, &path);
-                                                self.visible_paths_dirty = true;
-                                            }
-                                            needs_disk_refresh = true;
-                                        }
-                                    }
+                                    trash_paths.extend(
+                                        report.groups[idx].all_item_paths().cloned(),
+                                    );
                                 }
-                                suggestions_ui::SuggestionAction::TrashCluster(g, c) => {
-                                    let paths: Vec<PathBuf> = report.groups[g].clusters[c]
-                                        .items
-                                        .iter()
-                                        .map(|i| i.path.clone())
-                                        .collect();
-                                    for path in paths {
-                                        if let Err(e) = trash::delete(&path) {
-                                            self.error = Some(format!("Trash failed: {e}"));
-                                            break;
-                                        } else {
-                                            if let Some(ref mut tree) = self.tree {
-                                                ui::remove_node(tree, &path);
-                                                self.visible_paths_dirty = true;
-                                            }
-                                            needs_disk_refresh = true;
-                                        }
-                                    }
+                                suggestions_ui::SuggestionAction::ToggleCluster(gi, ci) => {
+                                    report.groups[gi].clusters[ci].expanded =
+                                        !report.groups[gi].clusters[ci].expanded;
+                                }
+                                suggestions_ui::SuggestionAction::TrashCluster(gi, ci) => {
+                                    trash_paths.extend(
+                                        report.groups[gi].clusters[ci]
+                                            .items
+                                            .iter()
+                                            .map(|i| i.path.clone()),
+                                    );
                                 }
                             }
                         }
                     }
-                    if needs_disk_refresh {
-                        self.refresh_disk_info();
+                    if !trash_paths.is_empty() {
+                        self.start_background_delete(trash_paths, true);
                     }
                 }
             }
@@ -1524,7 +1563,11 @@ impl eframe::App for App {
 
         // Floating batch actions bar (shown when items are selected)
         let selected_count = self.selected_paths.len();
-        if selected_count > 0 && self.tree.is_some() && !self.scanning && self.view_mode == ViewMode::Tree {
+        if selected_count > 0
+            && self.tree.is_some()
+            && !self.scanning
+            && self.view_mode == ViewMode::Tree
+        {
             egui::Area::new(egui::Id::new("batch_actions_float"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
                 .interactable(true)
@@ -1562,7 +1605,11 @@ impl eframe::App for App {
                                     self.confirm_batch_delete = true;
                                 }
                                 ui.add_space(4.0);
-                                if ui.small_button("×").on_hover_text("Clear selection").clicked() {
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Clear selection")
+                                    .clicked()
+                                {
                                     self.selected_paths.clear();
                                 }
                             });
@@ -1597,15 +1644,10 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "Deleting {done}/{total}..."
-                                    ))
-                                    .strong(),
+                                    egui::RichText::new(format!("Deleting {done}/{total}..."))
+                                        .strong(),
                                 );
-                                ui.add(
-                                    egui::ProgressBar::new(fraction)
-                                        .desired_width(200.0),
-                                );
+                                ui.add(egui::ProgressBar::new(fraction).desired_width(200.0));
                             });
                         });
                 });

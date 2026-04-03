@@ -52,8 +52,89 @@ fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
 
 /// Returns true if this node's name matches the query or any descendant does.
 pub fn node_matches(node: &FileNode, query: &str) -> bool {
-    node.name().to_lowercase().contains(query)
+    contains_case_insensitive(node.name(), query)
         || node.children().iter().any(|c| node_matches(c, query))
+}
+
+/// Pre-compute which subtrees contain nodes matching the text query.
+/// Returns a set of paths that match or have matching descendants.
+pub fn build_text_match_cache(node: &FileNode, query: &str) -> HashSet<PathBuf> {
+    let mut cache = HashSet::new();
+    let mut buf = PathBuf::from(node.name());
+    build_text_match_inner(node, query, &mut buf, &mut cache);
+    cache
+}
+
+fn build_text_match_inner(
+    node: &FileNode,
+    query: &str,
+    buf: &mut PathBuf,
+    cache: &mut HashSet<PathBuf>,
+) -> bool {
+    let self_matches = contains_case_insensitive(node.name(), query);
+    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
+    let child_matches = node.children().iter().fold(false, |acc, c| {
+        buf.push(c.name());
+        let m = build_text_match_inner(c, query, buf, cache);
+        buf.pop();
+        acc || m
+    });
+    if self_matches || child_matches {
+        cache.insert(buf.clone());
+        true
+    } else {
+        false
+    }
+}
+
+/// Pre-compute which subtrees contain nodes matching the given category.
+/// Returns a set of paths that match or have matching descendants.
+pub fn build_category_match_cache(
+    node: &FileNode,
+    cat: crate::categories::FileCategory,
+) -> HashSet<PathBuf> {
+    let mut cache = HashSet::new();
+    let mut buf = PathBuf::from(node.name());
+    build_cat_match_inner(node, cat, &mut buf, &mut cache);
+    cache
+}
+
+fn build_cat_match_inner(
+    node: &FileNode,
+    cat: crate::categories::FileCategory,
+    buf: &mut PathBuf,
+    cache: &mut HashSet<PathBuf>,
+) -> bool {
+    let self_matches = if node.is_dir() {
+        false
+    } else {
+        crate::categories::categorize(node.name()) == cat
+    };
+    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
+    let child_matches = node.children().iter().fold(false, |acc, c| {
+        buf.push(c.name());
+        let m = build_cat_match_inner(c, cat, buf, cache);
+        buf.pop();
+        acc || m
+    });
+    if self_matches || child_matches {
+        cache.insert(buf.clone());
+        true
+    } else {
+        false
+    }
+}
+
+/// ASCII case-insensitive substring search without allocating.
+/// Only folds a-z/A-Z; non-ASCII characters are compared as-is.
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Actions produced by tree rendering, applied after the frame.
@@ -73,46 +154,89 @@ pub enum TreeAction {
     CopyPath(PathBuf),
 }
 
-/// Flattened row data for virtualized rendering.
-/// Path is reconstructed during traversal (owned); name borrows from the tree.
-struct VisibleRow<'a> {
-    path: PathBuf,
-    name: &'a str,
-    size: u64,
-    is_dir: bool,
-    expanded: bool,
-    depth: usize,
-    parent_size: u64,
-    children_count: usize,
-    category: crate::categories::FileCategory,
+/// Cached row data for the visible tree. Rebuilt only when the tree state changes.
+/// Owns all data so it can outlive a single frame.
+pub struct CachedRow {
+    pub path: PathBuf,
+    pub name: Box<str>,
+    pub size: u64,
+    pub is_dir: bool,
+    pub expanded: bool,
+    pub depth: usize,
+    pub parent_size: u64,
+    pub children_count: usize,
+    pub category: crate::categories::FileCategory,
+}
+
+/// Collect all visible rows into owned `CachedRow` structs. This replaces both
+/// `collect_visible_rows` (rendering data) and `collect_visible_paths` (keyboard
+/// nav), producing a single flat list that can be cached across frames.
+///
+/// When `text_cache` / `cat_cache` are provided, filter checks are O(1) lookups
+/// instead of O(N) recursive descents, bringing overall cost from O(N^2) to O(N).
+pub fn collect_cached_rows(
+    node: &FileNode,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+) -> Vec<CachedRow> {
+    let mut result = Vec::new();
+    let mut path_buf = PathBuf::from(node.name());
+    collect_cached_rows_inner(
+        node,
+        0,
+        node.size(),
+        &mut path_buf,
+        filter,
+        category_filter,
+        show_hidden,
+        text_cache,
+        cat_cache,
+        &mut result,
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_visible_rows<'a>(
-    node: &'a FileNode,
+fn collect_cached_rows_inner(
+    node: &FileNode,
     depth: usize,
     parent_size: u64,
     current_path: &mut PathBuf,
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    result: &mut Vec<VisibleRow<'a>>,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.name().starts_with('.') {
         return;
     }
-    if !filter.is_empty() && !node_matches(node, filter) {
+    // Use pre-computed caches for O(1) lookup when available,
+    // fall back to recursive match for backwards compatibility.
+    if let Some(tc) = text_cache {
+        if !tc.contains(current_path.as_path()) {
+            return;
+        }
+    } else if !filter.is_empty() && !node_matches(node, filter) {
         return;
     }
-    if let Some(cat) = category_filter {
+    if let Some(cc) = cat_cache {
+        if !cc.contains(current_path.as_path()) {
+            return;
+        }
+    } else if let Some(cat) = category_filter {
         if !crate::categories::node_matches_category(node, cat) {
             return;
         }
     }
 
-    result.push(VisibleRow {
+    result.push(CachedRow {
         path: current_path.clone(),
-        name: node.name(),
+        name: node.name().into(),
         size: node.size(),
         is_dir: node.is_dir(),
         expanded: node.expanded(),
@@ -130,7 +254,7 @@ fn collect_visible_rows<'a>(
     if show_children {
         for child in node.children() {
             current_path.push(child.name());
-            collect_visible_rows(
+            collect_cached_rows_inner(
                 child,
                 depth + 1,
                 node.size(),
@@ -138,6 +262,8 @@ fn collect_visible_rows<'a>(
                 filter,
                 category_filter,
                 show_hidden,
+                text_cache,
+                cat_cache,
                 result,
             );
             current_path.pop();
@@ -146,32 +272,15 @@ fn collect_visible_rows<'a>(
 }
 
 /// Render the tree view with virtualized scrolling. Returns actions to apply.
-#[allow(clippy::too_many_arguments)]
+/// Accepts pre-built `CachedRow` data so the caller can cache and reuse it.
 pub fn render_tree(
     ui: &mut egui::Ui,
-    tree: &FileNode,
-    root_size: u64,
-    filter: &str,
+    rows: &[CachedRow],
     focused_path: &Option<PathBuf>,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
     icon_cache: Option<&IconCache>,
     scroll_to_focus: bool,
     selected_paths: &HashSet<PathBuf>,
 ) -> Vec<TreeAction> {
-    let mut rows = Vec::new();
-    let mut path_buf = PathBuf::from(tree.name());
-    collect_visible_rows(
-        tree,
-        0,
-        root_size,
-        &mut path_buf,
-        filter,
-        category_filter,
-        show_hidden,
-        &mut rows,
-    );
-
     let total_rows = rows.len();
     let row_height = 20.0_f32;
     let mut actions = Vec::new();
@@ -246,7 +355,7 @@ pub fn render_tree(
                 }
 
                 // Name
-                ui.label(egui::RichText::new(row.name).monospace());
+                ui.label(egui::RichText::new(&*row.name).monospace());
 
                 // Size bar + label (painted at fixed right-edge positions for alignment)
                 let row_max = ui.max_rect();
@@ -306,8 +415,9 @@ pub fn render_tree(
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                     if row.is_dir && pos.x <= toggle_right {
-                        // Click on disclosure triangle area → toggle expand
+                        // Click on disclosure triangle area → toggle expand + focus
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
+                        actions.push(TreeAction::Focus(row.path.clone()));
                     } else {
                         // Click on content area → select/focus
                         let (shift, toggle) =
@@ -451,6 +561,16 @@ pub fn render_tree(
     actions
 }
 
+/// Get the next path component name to navigate toward when searching for `target`
+/// from the current position `buf`. Returns None if `target` doesn't start with `buf`.
+fn next_component_name<'a>(target: &'a Path, buf: &Path) -> Option<&'a str> {
+    target
+        .strip_prefix(buf)
+        .ok()
+        .and_then(|remaining| remaining.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+}
+
 /// Toggle expand/collapse for the node at `target`. Returns true if found.
 pub fn toggle_expand(node: &mut FileNode, target: &Path) -> bool {
     let mut buf = PathBuf::from(node.name());
@@ -464,13 +584,15 @@ fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) ->
         return true;
     }
     if let FileNode::Dir(d) = node {
-        for child in &mut d.children {
-            buf.push(child.name());
-            if toggle_expand_inner(child, target, buf) {
-                buf.pop();
-                return true;
+        if let Some(next) = next_component_name(target, buf) {
+            for child in &mut d.children {
+                if child.name() == next {
+                    buf.push(child.name());
+                    let found = toggle_expand_inner(child, target, buf);
+                    buf.pop();
+                    return found;
+                }
             }
-            buf.pop();
         }
     }
     false
@@ -485,88 +607,41 @@ pub fn remove_node(node: &mut FileNode, target: &Path) -> Option<u64> {
 fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> Option<u64> {
     let d = node.as_dir_mut()?;
 
-    // Check direct children
-    let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
-        let child_path = buf.join(c.name());
-        if child_path == target {
-            Some(i)
-        } else {
-            None
-        }
-    });
+    if let Some(next) = next_component_name(target, buf) {
+        let next_str = next;
 
-    if let Some(pos) = found_pos {
-        let removed_size = d.children[pos].size();
-        d.children.remove(pos);
-        d.size -= removed_size;
-        return Some(removed_size);
-    }
-
-    // Recurse into child directories
-    for child in &mut d.children {
-        if child.is_dir() {
-            buf.push(child.name());
-            if let Some(removed_size) = remove_node_inner(child, target, buf) {
-                buf.pop();
-                d.size -= removed_size;
-                return Some(removed_size);
+        // Check if a direct child matches the full target
+        let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
+            if c.name() == next_str && buf.join(c.name()) == target {
+                Some(i)
+            } else {
+                None
             }
-            buf.pop();
+        });
+
+        if let Some(pos) = found_pos {
+            let removed_size = d.children[pos].size();
+            d.children.remove(pos);
+            d.size -= removed_size;
+            return Some(removed_size);
+        }
+
+        // Navigate to the matching child directory
+        for child in &mut d.children {
+            if child.is_dir() && child.name() == next_str {
+                buf.push(child.name());
+                if let Some(removed_size) = remove_node_inner(child, target, buf) {
+                    buf.pop();
+                    d.size -= removed_size;
+                    return Some(removed_size);
+                }
+                buf.pop();
+                return None; // name matched but target not found inside
+            }
         }
     }
 
     None
-}
-
-/// Collect paths of all visible nodes in render order (for keyboard navigation).
-pub fn collect_visible_paths(
-    node: &FileNode,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    result: &mut Vec<PathBuf>,
-) {
-    let mut buf = PathBuf::from(node.name());
-    collect_visible_paths_inner(node, &mut buf, filter, category_filter, show_hidden, result);
-}
-
-fn collect_visible_paths_inner(
-    node: &FileNode,
-    current_path: &mut PathBuf,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    result: &mut Vec<PathBuf>,
-) {
-    if !show_hidden && node.name().starts_with('.') {
-        return;
-    }
-    if !filter.is_empty() && !node_matches(node, filter) {
-        return;
-    }
-    if let Some(cat) = category_filter {
-        if !crate::categories::node_matches_category(node, cat) {
-            return;
-        }
-    }
-
-    result.push(current_path.clone());
-
-    let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
-    if show_children {
-        for child in node.children() {
-            current_path.push(child.name());
-            collect_visible_paths_inner(
-                child,
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                result,
-            );
-            current_path.pop();
-        }
-    }
 }
 
 /// Find the parent path of a node in the tree.
@@ -576,18 +651,21 @@ pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
 }
 
 fn find_parent_path_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<PathBuf> {
-    for child in node.children() {
-        let child_path = buf.join(child.name());
-        if child_path == target {
-            return Some(buf.clone());
-        }
-        if child.is_dir() {
-            buf.push(child.name());
-            if let Some(parent) = find_parent_path_inner(child, target, buf) {
-                buf.pop();
-                return Some(parent);
+    if let Some(next) = next_component_name(target, buf) {
+        let next_str = next;
+        for child in node.children() {
+            if child.name() == next_str {
+                let child_path = buf.join(child.name());
+                if child_path == target {
+                    return Some(buf.clone());
+                }
+                if child.is_dir() {
+                    buf.push(child.name());
+                    let result = find_parent_path_inner(child, target, buf);
+                    buf.pop();
+                    return result;
+                }
             }
-            buf.pop();
         }
     }
     None
@@ -607,13 +685,16 @@ fn find_node_info_inner(
     if buf.as_path() == target {
         return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
     }
-    for child in node.children() {
-        buf.push(child.name());
-        if let Some(info) = find_node_info_inner(child, target, buf) {
-            buf.pop();
-            return Some(info);
+    if let Some(next) = next_component_name(target, buf) {
+        let next_str = next;
+        for child in node.children() {
+            if child.name() == next_str {
+                buf.push(child.name());
+                let result = find_node_info_inner(child, target, buf);
+                buf.pop();
+                return result;
+            }
         }
-        buf.pop();
     }
     None
 }
@@ -635,13 +716,16 @@ fn set_expanded_inner(
         return true;
     }
     if let FileNode::Dir(d) = node {
-        for child in &mut d.children {
-            buf.push(child.name());
-            if set_expanded_inner(child, target, expanded, buf) {
-                buf.pop();
-                return true;
+        if let Some(next) = next_component_name(target, buf) {
+            let next_str = next;
+            for child in &mut d.children {
+                if child.name() == next_str {
+                    buf.push(child.name());
+                    let found = set_expanded_inner(child, target, expanded, buf);
+                    buf.pop();
+                    return found;
+                }
             }
-            buf.pop();
         }
     }
     false
@@ -715,5 +799,159 @@ mod tests {
         let mut tree = dir("root", vec![leaf("a.txt", 10)]);
         assert_eq!(remove_node(&mut tree, Path::new("nope")), None);
         assert_eq!(tree.size(), 10); // unchanged
+    }
+
+    #[test]
+    fn collect_cached_rows_is_deterministic() {
+        let mut tree = dir(
+            "root",
+            vec![
+                dir("src", vec![leaf("main.rs", 50), leaf("lib.rs", 30)]),
+                leaf("Cargo.toml", 10),
+            ],
+        );
+        // Expand "src" so its children are visible
+        tree.as_dir_mut().unwrap().children[0].set_expanded(true);
+
+        let rows_a = collect_cached_rows(&tree, "", None, true, None, None);
+        let rows_b = collect_cached_rows(&tree, "", None, true, None, None);
+
+        assert_eq!(rows_a.len(), rows_b.len());
+        for (a, b) in rows_a.iter().zip(rows_b.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(&*a.name, &*b.name);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.is_dir, b.is_dir);
+            assert_eq!(a.expanded, b.expanded);
+            assert_eq!(a.depth, b.depth);
+            assert_eq!(a.parent_size, b.parent_size);
+            assert_eq!(a.children_count, b.children_count);
+        }
+    }
+
+    #[test]
+    fn collect_cached_rows_filters_hidden() {
+        let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
+        tree.set_expanded(true);
+
+        let rows = collect_cached_rows(&tree, "", None, false, None, None);
+        // Root + visible.txt (hidden file excluded)
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&*rows[1].name, "visible.txt");
+
+        let rows_all = collect_cached_rows(&tree, "", None, true, None, None);
+        // Root + .hidden + visible.txt
+        assert_eq!(rows_all.len(), 3);
+    }
+
+    #[test]
+    fn build_text_match_cache_marks_matching_subtrees() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("src", vec![leaf("main.rs", 50)]),
+                dir("docs", vec![leaf("readme.md", 10)]),
+            ],
+        );
+        let cache = build_text_match_cache(&tree, "main");
+        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
+        assert!(cache.contains(&PathBuf::from("root/src"))); // has matching descendant
+        assert!(cache.contains(&PathBuf::from("root/src/main.rs"))); // direct match
+        assert!(!cache.contains(&PathBuf::from("root/docs"))); // no matching descendant
+        assert!(!cache.contains(&PathBuf::from("root/docs/readme.md"))); // no match
+    }
+
+    #[test]
+    fn build_text_match_cache_visits_all_siblings() {
+        // Regression: any() short-circuits, so second matching sibling could be missed.
+        let tree = dir(
+            "root",
+            vec![
+                dir("a", vec![leaf("main.rs", 50)]),
+                dir("b", vec![leaf("main.py", 30)]),
+            ],
+        );
+        let cache = build_text_match_cache(&tree, "main");
+        assert!(cache.contains(&PathBuf::from("root/a")));
+        assert!(cache.contains(&PathBuf::from("root/a/main.rs")));
+        assert!(cache.contains(&PathBuf::from("root/b")));
+        assert!(cache.contains(&PathBuf::from("root/b/main.py")));
+    }
+
+    #[test]
+    fn build_category_match_cache_visits_all_siblings() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("a", vec![leaf("clip1.mp4", 100)]),
+                dir("b", vec![leaf("clip2.mp4", 200)]),
+            ],
+        );
+        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
+        assert!(cache.contains(&PathBuf::from("root/a")));
+        assert!(cache.contains(&PathBuf::from("root/a/clip1.mp4")));
+        assert!(cache.contains(&PathBuf::from("root/b")));
+        assert!(cache.contains(&PathBuf::from("root/b/clip2.mp4")));
+    }
+
+    #[test]
+    fn build_category_match_cache_marks_matching_subtrees() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("media", vec![leaf("movie.mp4", 1000)]),
+                dir("src", vec![leaf("main.rs", 50)]),
+            ],
+        );
+        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
+        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
+        assert!(cache.contains(&PathBuf::from("root/media"))); // has matching descendant
+        assert!(cache.contains(&PathBuf::from("root/media/movie.mp4"))); // direct match
+        assert!(!cache.contains(&PathBuf::from("root/src"))); // no matching descendant
+        assert!(!cache.contains(&PathBuf::from("root/src/main.rs"))); // wrong category
+    }
+
+    #[test]
+    fn cached_rows_with_text_cache_matches_uncached() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("src", vec![leaf("main.rs", 50), leaf("lib.rs", 30)]),
+                dir("docs", vec![leaf("readme.md", 10)]),
+            ],
+        );
+        let query = "main";
+        let cache = build_text_match_cache(&tree, query);
+
+        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None);
+        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None);
+
+        assert_eq!(rows_uncached.len(), rows_cached.len());
+        for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(&*a.name, &*b.name);
+        }
+    }
+
+    #[test]
+    fn cached_rows_with_cat_cache_matches_uncached() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("media", vec![leaf("movie.mp4", 1000)]),
+                dir("src", vec![leaf("main.rs", 50)]),
+            ],
+        );
+        let cat = crate::categories::FileCategory::Video;
+        let cache = build_category_match_cache(&tree, cat);
+
+        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None);
+        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache));
+
+        assert_eq!(rows_uncached.len(), rows_cached.len());
+        for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(&*a.name, &*b.name);
+        }
     }
 }

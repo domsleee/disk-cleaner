@@ -5,7 +5,7 @@ use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Tracking allocator that measures peak and current memory usage.
@@ -42,11 +42,12 @@ fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        cancelled: AtomicBool::new(false),
     })
 }
 
 fn count_nodes(node: &FileNode) -> usize {
-    1 + node.children.iter().map(count_nodes).sum::<usize>()
+    1 + node.children().iter().map(count_nodes).sum::<usize>()
 }
 
 /// Measure memory for building a synthetic tree (1000 files, 100 dirs)
@@ -124,9 +125,7 @@ fn bench_tree_ops(c: &mut Criterion) {
         b.iter(|| ui::node_matches(&tree, "nonexistent_zzz"))
     });
 
-    c.bench_function("count_selected_1100_nodes", |b| {
-        b.iter(|| ui::count_selected(&tree))
-    });
+    // count_selected is benchmarked in tree_ops.rs with configurable selection sets
 }
 
 /// Memory benchmark for a large synthetic tree (10,000 files / 500 dirs)

@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: mac-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: mac-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev
+
+      - name: Build
+        run: cargo build --profile release-dist --target ${{ matrix.target }}
+        env:
+          # Static link MSVC CRT so Windows users don't need VC++ redistributable
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-cleaner-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release-dist/disk-cleaner${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  package:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create macOS universal binary and .app bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # Universal binary
+          chmod +x artifacts/disk-cleaner-mac-arm64/disk-cleaner artifacts/disk-cleaner-mac-x86_64/disk-cleaner
+          lipo -create artifacts/disk-cleaner-mac-arm64/disk-cleaner artifacts/disk-cleaner-mac-x86_64/disk-cleaner \
+            -output disk-cleaner-universal
+          file disk-cleaner-universal
+
+          # .app bundle
+          APP="Disk Cleaner.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp disk-cleaner-universal "$APP/Contents/MacOS/disk-cleaner"
+
+          cat > "$APP/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Disk Cleaner</string>
+            <key>CFBundleDisplayName</key>
+            <string>Disk Cleaner</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.domsleee.disk-cleaner</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>disk-cleaner</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          codesign --force --deep -s - "$APP"
+
+          # DMG
+          mkdir dmg-contents
+          cp -R "$APP" dmg-contents/
+          ln -s /Applications dmg-contents/Applications
+          hdiutil create -volname "Disk Cleaner" -srcfolder dmg-contents \
+            -ov -format UDZO "Disk-Cleaner-${GITHUB_REF_NAME}-mac.dmg"
+
+      - name: Package Linux
+        run: |
+          chmod +x artifacts/disk-cleaner-linux-x86_64/disk-cleaner
+          tar -czf "Disk-Cleaner-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+            -C artifacts/disk-cleaner-linux-x86_64 disk-cleaner
+
+      - name: Package Windows
+        run: |
+          cd artifacts/disk-cleaner-windows-x86_64
+          zip "../../Disk-Cleaner-${GITHUB_REF_NAME}-windows-x86_64.zip" disk-cleaner.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+          files: |
+            Disk-Cleaner-*-mac.dmg
+            Disk-Cleaner-*-linux-x86_64.tar.gz
+            Disk-Cleaner-*-windows-x86_64.zip

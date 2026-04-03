@@ -173,13 +173,20 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     root_node
 }
 
+/// Convert an OsString to Box<str>, avoiding intermediate String for ASCII names.
+fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
+    match name.to_str() {
+        Some(s) => s.into(),
+        None => name.to_string_lossy().into_owned().into_boxed_str(),
+    }
+}
+
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.to_string_lossy().into_owned())
-        .into_boxed_str();
+        .map(|n| os_name_to_boxed(n.to_os_string()))
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
     let empty_dir = FileNode::Dir(DirNode {
         name: dir_name.clone(),
@@ -219,11 +226,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-                    .into_boxed_str();
+                let name = os_name_to_boxed(entry.file_name());
                 Some(FileNode::File(FileLeaf { name, size: len }))
             } else {
                 None

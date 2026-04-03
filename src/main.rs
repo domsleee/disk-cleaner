@@ -1563,28 +1563,12 @@ impl eframe::App for App {
                                 suggestions_ui::SuggestionAction::ToggleGroup(idx) => {
                                     report.groups[idx].expanded = !report.groups[idx].expanded;
                                 }
-                                suggestions_ui::SuggestionAction::ToggleCluster(gi, ci) => {
-                                    report.groups[gi].clusters[ci].expanded =
-                                        !report.groups[gi].clusters[ci].expanded;
-                                }
                                 suggestions_ui::SuggestionAction::TrashItem(path) => {
                                     trash_paths.push(path);
                                 }
                                 suggestions_ui::SuggestionAction::TrashGroup(idx) => {
                                     trash_paths.extend(
-                                        report.groups[idx]
-                                            .clusters
-                                            .iter()
-                                            .flat_map(|c| c.items.iter())
-                                            .map(|i| i.path.clone()),
-                                    );
-                                }
-                                suggestions_ui::SuggestionAction::TrashCluster(gi, ci) => {
-                                    trash_paths.extend(
-                                        report.groups[gi].clusters[ci]
-                                            .items
-                                            .iter()
-                                            .map(|i| i.path.clone()),
+                                        report.groups[idx].items.iter().map(|i| i.path.clone()),
                                     );
                                 }
                             }

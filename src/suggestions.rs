@@ -86,26 +86,12 @@ pub struct SuggestionItem {
     pub size: u64,
 }
 
-/// A cluster of items sharing the same parent folder.
-pub struct ItemCluster {
-    pub label: String,
-    pub items: Vec<SuggestionItem>,
-    pub total_size: u64,
-    pub expanded: bool,
-}
-
 /// A group of suggestions under one category.
 pub struct SuggestionGroup {
     pub category: SuggestionCategory,
-    pub clusters: Vec<ItemCluster>,
+    pub items: Vec<SuggestionItem>,
     pub total_size: u64,
     pub expanded: bool,
-}
-
-impl SuggestionGroup {
-    pub fn item_count(&self) -> usize {
-        self.clusters.iter().map(|c| c.items.len()).sum()
-    }
 }
 
 /// All detected suggestions after analyzing a scan.
@@ -118,16 +104,12 @@ impl SuggestionReport {
     /// Remove deleted paths from the report and recalculate sizes.
     pub fn remove_paths(&mut self, deleted: &[std::path::PathBuf]) {
         for group in &mut self.groups {
-            for cluster in &mut group.clusters {
-                cluster.items.retain(|item| {
-                    !deleted.iter().any(|d| item.path == *d || item.path.starts_with(d))
-                });
-                cluster.total_size = cluster.items.iter().map(|i| i.size).sum();
-            }
-            group.clusters.retain(|c| !c.items.is_empty());
-            group.total_size = group.clusters.iter().map(|c| c.total_size).sum();
+            group.items.retain(|item| {
+                !deleted.iter().any(|d| item.path == *d || item.path.starts_with(d))
+            });
+            group.total_size = group.items.iter().map(|i| i.size).sum();
         }
-        self.groups.retain(|g| !g.clusters.is_empty());
+        self.groups.retain(|g| !g.items.is_empty());
         self.total_reclaimable = self.groups.iter().map(|g| g.total_size).sum();
     }
 }
@@ -171,41 +153,6 @@ const TEMP_EXTENSIONS: &[&str] = &["tmp", "temp", "log", "bak", "swp", "swo"];
 
 /// File extensions for old installers.
 const INSTALLER_EXTENSIONS: &[&str] = &["dmg", "pkg", "iso", "msi", "exe"];
-
-/// Derive a grouping key for an item path.
-/// Groups items by their parent folder so "all files in folder" are clustered.
-fn cluster_key(path: &std::path::Path) -> String {
-    path.parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/".to_string())
-}
-
-/// Build clusters from a flat list of items, grouping by parent folder.
-fn build_clusters(items: Vec<SuggestionItem>) -> Vec<ItemCluster> {
-    use std::collections::BTreeMap;
-
-    let mut map: BTreeMap<String, Vec<SuggestionItem>> = BTreeMap::new();
-    for item in items {
-        let key = cluster_key(&item.path);
-        map.entry(key).or_default().push(item);
-    }
-
-    let mut clusters: Vec<ItemCluster> = map
-        .into_iter()
-        .map(|(label, items)| {
-            let total_size = items.iter().map(|i| i.size).sum();
-            ItemCluster {
-                label,
-                items,
-                total_size,
-                expanded: false,
-            }
-        })
-        .collect();
-
-    clusters.sort_by(|a, b| b.total_size.cmp(&a.total_size));
-    clusters
-}
 
 fn matches_dir_pattern(name: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| name.eq_ignore_ascii_case(p))
@@ -253,12 +200,11 @@ pub fn analyze(tree: &FileNode) -> SuggestionReport {
     ] {
         if !items.is_empty() {
             let total_size = items.iter().map(|i| i.size).sum();
-            let clusters = build_clusters(items);
             // Auto-expand Caution groups so users can review before cleaning
             let auto_expand = category.safety() == SafetyLevel::Caution;
             groups.push(SuggestionGroup {
                 category,
-                clusters,
+                items,
                 total_size,
                 expanded: auto_expand,
             });
@@ -436,7 +382,7 @@ mod tests {
         );
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].item_count(), 1);
+        assert_eq!(report.groups[0].items.len(), 1);
         assert_eq!(report.groups[0].total_size, 500);
     }
 
@@ -446,44 +392,6 @@ mod tests {
         let report = analyze(&tree);
         assert!(report.groups.is_empty());
         assert_eq!(report.total_reclaimable, 0);
-    }
-
-    #[test]
-    fn clusters_group_by_parent_folder() {
-        let tree = dir(
-            "/test",
-            vec![dir(
-                "project_a",
-                vec![
-                    dir("node_modules", vec![leaf("a.js", 3000)]),
-                    dir("target", vec![leaf("bin", 2000)]),
-                ],
-            )],
-        );
-        let report = analyze(&tree);
-        // node_modules -> PackageCaches, target -> BuildArtifacts
-        // Each category has 1 item in 1 cluster
-        for group in &report.groups {
-            assert_eq!(group.clusters.len(), 1);
-            assert_eq!(group.clusters[0].label, "/test/project_a");
-        }
-    }
-
-    #[test]
-    fn clusters_separate_different_folders() {
-        let tree = dir(
-            "/test",
-            vec![
-                dir("project_a", vec![dir("node_modules", vec![leaf("a.js", 3000)])]),
-                dir("project_b", vec![dir("node_modules", vec![leaf("b.js", 2000)])]),
-            ],
-        );
-        let report = analyze(&tree);
-        assert_eq!(report.groups.len(), 1);
-        let group = &report.groups[0];
-        // Different parent folders -> separate clusters
-        assert_eq!(group.clusters.len(), 2);
-        assert_eq!(group.item_count(), 2);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod app_icon;
 mod categories;
 mod icons;
+mod permissions;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -255,6 +256,7 @@ impl Default for App {
             scan_progress: Arc::new(ScanProgress {
                 file_count: 0.into(),
                 total_size: 0.into(),
+                permission_denied: 0.into(),
                 cancelled: false.into(),
             }),
             receiver: None,
@@ -328,6 +330,7 @@ impl App {
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
             total_size: 0.into(),
+            permission_denied: 0.into(),
             cancelled: false.into(),
         });
         self.scan_progress = progress.clone();

@@ -146,7 +146,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Disk Cleaner",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Disable debug warnings that cause red rectangles with virtual scrolling
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.debug.warn_if_rect_changes_id = false;
+            });
             let mut app = App {
                 process_start: Some(process_start),
                 screenshot_prefix: screenshot_prefix.clone(),

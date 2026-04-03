@@ -118,7 +118,14 @@ fn main() -> eframe::Result {
                     print_help();
                     std::process::exit(1);
                 }
-                let p = PathBuf::from(other);
+                let expanded = if other.starts_with("~/") || other == "~" {
+                    dirs::home_dir()
+                        .map(|h| h.join(other.strip_prefix("~/").unwrap_or("")))
+                        .unwrap_or_else(|| PathBuf::from(other))
+                } else {
+                    PathBuf::from(other)
+                };
+                let p = expanded;
                 if !p.is_dir() {
                     eprintln!("Error: not a directory: {other}");
                     std::process::exit(1);

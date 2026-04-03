@@ -127,6 +127,16 @@ jobs:
             <true/>
             <key>LSMinimumSystemVersion</key>
             <string>11.0</string>
+            <key>NSDesktopFolderUsageDescription</key>
+            <string>Disk Cleaner needs access to your Desktop folder to analyze disk usage.</string>
+            <key>NSDocumentsFolderUsageDescription</key>
+            <string>Disk Cleaner needs access to your Documents folder to analyze disk usage.</string>
+            <key>NSDownloadsFolderUsageDescription</key>
+            <string>Disk Cleaner needs access to your Downloads folder to analyze disk usage.</string>
+            <key>NSRemovableVolumesUsageDescription</key>
+            <string>Disk Cleaner needs access to removable volumes to analyze disk usage.</string>
+            <key>NSNetworkVolumesUsageDescription</key>
+            <string>Disk Cleaner needs access to network volumes to analyze disk usage.</string>
           </dict>
           </plist>
           PLIST

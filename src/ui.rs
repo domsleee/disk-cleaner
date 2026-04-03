@@ -277,25 +277,7 @@ fn collect_cached_rows_inner(
             && filter.is_empty()
             && category_filter.is_none();
 
-        // Emit directory children normally
-        for child in &dirs {
-            current_path.push(child.name());
-            collect_cached_rows_inner(
-                child,
-                depth + 1,
-                node.size(),
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                text_cache,
-                cat_cache,
-                expanded_file_groups,
-                result,
-            );
-            current_path.pop();
-        }
-
+        // File group goes at the top of the folder's children
         if should_group_files {
             // Emit a synthetic file group summary row
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
@@ -355,6 +337,25 @@ fn collect_cached_rows_inner(
                 );
                 current_path.pop();
             }
+        }
+
+        // Emit directory children after the file group
+        for child in &dirs {
+            current_path.push(child.name());
+            collect_cached_rows_inner(
+                child,
+                depth + 1,
+                node.size(),
+                current_path,
+                filter,
+                category_filter,
+                show_hidden,
+                text_cache,
+                cat_cache,
+                expanded_file_groups,
+                result,
+            );
+            current_path.pop();
         }
     }
 }

@@ -140,6 +140,7 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// Actions produced by tree rendering, applied after the frame.
 pub enum TreeAction {
     ToggleExpand(PathBuf),
+    ToggleFileGroup(PathBuf),
     Click {
         path: PathBuf,
         shift: bool,
@@ -153,6 +154,9 @@ pub enum TreeAction {
     RevealInFinder(PathBuf),
     CopyPath(PathBuf),
 }
+
+/// Minimum number of loose files in a folder to trigger grouping.
+const FILE_GROUP_THRESHOLD: usize = 2;
 
 /// Cached row data for the visible tree. Rebuilt only when the tree state changes.
 /// Owns all data so it can outlive a single frame.
@@ -168,6 +172,8 @@ pub struct CachedRow {
     pub category: crate::categories::FileCategory,
     /// True when the file/folder name starts with `.` or has OS-level hidden flag.
     pub is_hidden: bool,
+    /// True for synthetic "N files" summary rows that group loose files.
+    pub is_file_group: bool,
 }
 
 /// Collect all visible rows into owned `CachedRow` structs. This replaces both
@@ -183,6 +189,7 @@ pub fn collect_cached_rows(
     show_hidden: bool,
     text_cache: Option<&HashSet<PathBuf>>,
     cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
     let mut path_buf = PathBuf::from(node.name());
@@ -196,6 +203,7 @@ pub fn collect_cached_rows(
         show_hidden,
         text_cache,
         cat_cache,
+        expanded_file_groups,
         &mut result,
     );
     result
@@ -212,6 +220,7 @@ fn collect_cached_rows_inner(
     show_hidden: bool,
     text_cache: Option<&HashSet<PathBuf>>,
     cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.is_hidden() {
@@ -251,11 +260,25 @@ fn collect_cached_rows_inner(
             crate::categories::categorize(node.name())
         },
         is_hidden: node.is_hidden(),
+        is_file_group: false,
     });
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
     if show_children {
-        for child in node.children() {
+        // Separate children into dirs and files for grouping.
+        // Only consider visible files (respecting show_hidden).
+        let dirs: Vec<_> = node.children().iter().filter(|c| c.is_dir()).collect();
+        let files: Vec<_> = node
+            .children()
+            .iter()
+            .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
+            .collect();
+        let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
+            && filter.is_empty()
+            && category_filter.is_none();
+
+        // Emit directory children normally
+        for child in &dirs {
             current_path.push(child.name());
             collect_cached_rows_inner(
                 child,
@@ -267,9 +290,71 @@ fn collect_cached_rows_inner(
                 show_hidden,
                 text_cache,
                 cat_cache,
+                expanded_file_groups,
                 result,
             );
             current_path.pop();
+        }
+
+        if should_group_files {
+            // Emit a synthetic file group summary row
+            let file_size: u64 = files.iter().map(|f| f.size()).sum();
+            let group_expanded = expanded_file_groups
+                .is_some_and(|s| s.contains(current_path.as_path()));
+            let file_count = files.len();
+            result.push(CachedRow {
+                path: current_path.join("__file_group__"),
+                name: format!("{file_count} files").into(),
+                size: file_size,
+                is_dir: false,
+                expanded: group_expanded,
+                depth: depth + 1,
+                parent_size: node.size(),
+                children_count: file_count,
+                category: crate::categories::FileCategory::Other,
+                is_hidden: false,
+                is_file_group: true,
+            });
+
+            // Only emit individual file rows if the group is expanded
+            if group_expanded {
+                for child in &files {
+                    current_path.push(child.name());
+                    collect_cached_rows_inner(
+                        child,
+                        depth + 2,
+                        file_size,
+                        current_path,
+                        filter,
+                        category_filter,
+                        show_hidden,
+                        text_cache,
+                        cat_cache,
+                        expanded_file_groups,
+                        result,
+                    );
+                    current_path.pop();
+                }
+            }
+        } else {
+            // Few files or filtered view — emit files normally
+            for child in &files {
+                current_path.push(child.name());
+                collect_cached_rows_inner(
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
+                );
+                current_path.pop();
+            }
         }
     }
 }
@@ -333,7 +418,7 @@ pub fn render_tree(
                 ui.add_space(indent);
 
                 // Disclosure toggle (visual only — click handled by row interaction)
-                let toggle_right = if row.is_dir {
+                let toggle_right = if row.is_dir || row.is_file_group {
                     paint_disclosure(ui, row.expanded).right()
                 } else {
                     let (rect, _) =
@@ -341,8 +426,11 @@ pub fn render_tree(
                     rect.right()
                 };
 
-                // Icon
-                if let Some(icons) = icon_cache {
+                // Icon (file groups have no icon)
+                if row.is_file_group {
+                    // No icon — just allocate equivalent space for alignment
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                } else if let Some(icons) = icon_cache {
                     let tex = if row.is_dir {
                         &icons.folder
                     } else {
@@ -357,8 +445,8 @@ pub fn render_tree(
                     ui.label(icon);
                 }
 
-                // Name (hidden files use weak/greyed-out text)
-                if row.is_hidden {
+                // Name (hidden files and file groups use weak/greyed-out text)
+                if row.is_hidden || row.is_file_group {
                     ui.label(egui::RichText::new(&*row.name).monospace().weak());
                 } else {
                     ui.label(egui::RichText::new(&*row.name).monospace());
@@ -419,7 +507,7 @@ pub fn render_tree(
             // Use PointingHand only when hovering over the disclosure triangle area
             if row_interact.hovered() {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    if row.is_dir && pos.x <= toggle_right {
+                    if (row.is_dir || row.is_file_group) && pos.x <= toggle_right {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
@@ -427,7 +515,11 @@ pub fn render_tree(
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    if row.is_dir && pos.x <= toggle_right {
+                    if row.is_file_group {
+                        // Any click on file group row → toggle expand
+                        actions.push(TreeAction::ToggleFileGroup(row.path.clone()));
+                        actions.push(TreeAction::Focus(row.path.clone()));
+                    } else if row.is_dir && pos.x <= toggle_right {
                         // Click on disclosure triangle area → toggle expand + focus
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
                         actions.push(TreeAction::Focus(row.path.clone()));
@@ -826,8 +918,8 @@ mod tests {
         // Expand "src" so its children are visible
         tree.as_dir_mut().unwrap().children[0].set_expanded(true);
 
-        let rows_a = collect_cached_rows(&tree, "", None, true, None, None);
-        let rows_b = collect_cached_rows(&tree, "", None, true, None, None);
+        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None);
 
         assert_eq!(rows_a.len(), rows_b.len());
         for (a, b) in rows_a.iter().zip(rows_b.iter()) {
@@ -847,14 +939,16 @@ mod tests {
         let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
 
-        let rows = collect_cached_rows(&tree, "", None, false, None, None);
-        // Root + visible.txt (hidden file excluded)
+        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        // Root + visible.txt (hidden file excluded, 1 file = no grouping)
         assert_eq!(rows.len(), 2);
         assert_eq!(&*rows[1].name, "visible.txt");
 
-        let rows_all = collect_cached_rows(&tree, "", None, true, None, None);
-        // Root + .hidden + visible.txt
-        assert_eq!(rows_all.len(), 3);
+        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None);
+        // Root + "2 files" group (both files visible → grouped)
+        assert_eq!(rows_all.len(), 2);
+        assert!(rows_all[1].is_file_group);
+        assert_eq!(&*rows_all[1].name, "2 files");
     }
 
     #[test]
@@ -936,8 +1030,8 @@ mod tests {
         let query = "main";
         let cache = build_text_match_cache(&tree, query);
 
-        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None);
-        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None);
+        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None);
+        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
@@ -958,8 +1052,8 @@ mod tests {
         let cat = crate::categories::FileCategory::Video;
         let cache = build_category_match_cache(&tree, cat);
 
-        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None);
-        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache));
+        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None);
+        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {

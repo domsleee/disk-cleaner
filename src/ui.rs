@@ -166,6 +166,8 @@ pub struct CachedRow {
     pub parent_size: u64,
     pub children_count: usize,
     pub category: crate::categories::FileCategory,
+    /// True when the file/folder name starts with `.` or has OS-level hidden flag.
+    pub is_hidden: bool,
 }
 
 /// Collect all visible rows into owned `CachedRow` structs. This replaces both
@@ -212,7 +214,7 @@ fn collect_cached_rows_inner(
     cat_cache: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
-    if !show_hidden && node.name().starts_with('.') {
+    if !show_hidden && node.is_hidden() {
         return;
     }
     // Use pre-computed caches for O(1) lookup when available,
@@ -248,6 +250,7 @@ fn collect_cached_rows_inner(
         } else {
             crate::categories::categorize(node.name())
         },
+        is_hidden: node.is_hidden(),
     });
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
@@ -354,8 +357,12 @@ pub fn render_tree(
                     ui.label(icon);
                 }
 
-                // Name
-                ui.label(egui::RichText::new(&*row.name).monospace());
+                // Name (hidden files use weak/greyed-out text)
+                if row.is_hidden {
+                    ui.label(egui::RichText::new(&*row.name).monospace().weak());
+                } else {
+                    ui.label(egui::RichText::new(&*row.name).monospace());
+                }
 
                 // Size bar + label (painted at fixed right-edge positions for alignment)
                 // Use max_rect for horizontal extent (right edge) but min_rect for

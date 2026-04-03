@@ -6,6 +6,8 @@
 pub struct FileLeaf {
     pub name: Box<str>,
     pub size: u64,
+    /// True when the file is hidden (dotfile or OS-level UF_HIDDEN flag).
+    pub hidden: bool,
 }
 
 pub struct DirNode {
@@ -13,6 +15,8 @@ pub struct DirNode {
     pub size: u64,
     pub children: Vec<FileNode>,
     pub expanded: bool,
+    /// True when the directory is hidden (dotfile or OS-level UF_HIDDEN flag).
+    pub hidden: bool,
 }
 
 pub enum FileNode {
@@ -37,6 +41,13 @@ impl FileNode {
 
     pub fn is_dir(&self) -> bool {
         matches!(self, FileNode::Dir(_))
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        match self {
+            FileNode::File(f) => f.hidden,
+            FileNode::Dir(d) => d.hidden,
+        }
     }
 
     pub fn children(&self) -> &[FileNode] {
@@ -89,6 +100,7 @@ pub fn leaf(name: &str, size: u64) -> FileNode {
     FileNode::File(FileLeaf {
         name: name.into(),
         size,
+        hidden: name.starts_with('.'),
     })
 }
 
@@ -100,6 +112,7 @@ pub fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
         size,
         children,
         expanded: false,
+        hidden: name.starts_with('.'),
     })
 }
 

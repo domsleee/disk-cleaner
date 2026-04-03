@@ -368,7 +368,7 @@ pub fn build_treemap_cache(
         .children()
         .iter()
         .filter(|c| c.size() > 0)
-        .filter(|c| show_hidden || !c.name().starts_with('.'))
+        .filter(|c| show_hidden || !c.is_hidden())
         .filter(|c| {
             category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
         })

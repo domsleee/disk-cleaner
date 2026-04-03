@@ -184,6 +184,33 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
     }
 }
 
+/// Check if a file/directory is hidden at the OS level (macOS UF_HIDDEN flag)
+/// or by naming convention (dotfile).
+#[cfg(target_os = "macos")]
+fn is_os_hidden(name: &str, path: &Path) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    // macOS UF_HIDDEN flag (0x8000) in st_flags via libc::stat
+    const UF_HIDDEN: u32 = 0x8000;
+    let c_path = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::lstat(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    stat.st_flags & UF_HIDDEN != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_os_hidden(name: &str, _path: &Path) -> bool {
+    name.starts_with('.')
+}
+
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
@@ -191,11 +218,14 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
+    let dir_hidden = is_os_hidden(&dir_name, dir);
+
     let empty_dir = FileNode::Dir(DirNode {
         name: dir_name.clone(),
         size: 0,
         children: Vec::new(),
         expanded: false,
+        hidden: dir_hidden,
     });
 
     // Bail out early if scan was cancelled
@@ -233,7 +263,8 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
-                Some(FileNode::File(FileLeaf { name, size: len }))
+                let hidden = is_os_hidden(&name, &path);
+                Some(FileNode::File(FileLeaf { name, size: len, hidden }))
             } else {
                 None
             }
@@ -248,6 +279,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         size,
         children,
         expanded: false,
+        hidden: dir_hidden,
     })
 }
 

@@ -100,6 +100,20 @@ pub struct SuggestionReport {
     pub total_reclaimable: u64,
 }
 
+impl SuggestionReport {
+    /// Remove deleted paths from the report and recalculate sizes.
+    pub fn remove_paths(&mut self, deleted: &[std::path::PathBuf]) {
+        for group in &mut self.groups {
+            group.items.retain(|item| {
+                !deleted.iter().any(|d| item.path == *d || item.path.starts_with(d))
+            });
+            group.total_size = group.items.iter().map(|i| i.size).sum();
+        }
+        self.groups.retain(|g| !g.items.is_empty());
+        self.total_reclaimable = self.groups.iter().map(|g| g.total_size).sum();
+    }
+}
+
 /// Directory names that indicate build artifacts.
 const BUILD_DIRS: &[&str] = &[
     "target",

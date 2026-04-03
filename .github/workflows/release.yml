@@ -58,10 +58,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Generate app icon
+        run: |
+          cargo build --bin gen_icon --release
+          ./target/release/gen_icon icon_1024.png
+
+          # Create iconset with all required sizes
+          mkdir AppIcon.iconset
+          sips -z 16 16 icon_1024.png --out AppIcon.iconset/icon_16x16.png
+          sips -z 32 32 icon_1024.png --out AppIcon.iconset/icon_16x16@2x.png
+          sips -z 32 32 icon_1024.png --out AppIcon.iconset/icon_32x32.png
+          sips -z 64 64 icon_1024.png --out AppIcon.iconset/icon_32x32@2x.png
+          sips -z 128 128 icon_1024.png --out AppIcon.iconset/icon_128x128.png
+          sips -z 256 256 icon_1024.png --out AppIcon.iconset/icon_128x128@2x.png
+          sips -z 256 256 icon_1024.png --out AppIcon.iconset/icon_256x256.png
+          sips -z 512 512 icon_1024.png --out AppIcon.iconset/icon_256x256@2x.png
+          sips -z 512 512 icon_1024.png --out AppIcon.iconset/icon_512x512.png
+          cp icon_1024.png AppIcon.iconset/icon_512x512@2x.png
+
+          iconutil --convert icns AppIcon.iconset --output AppIcon.icns
 
       - name: Create macOS universal binary and .app bundle
         run: |
@@ -77,6 +100,7 @@ jobs:
           APP="Disk Cleaner.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp disk-cleaner-universal "$APP/Contents/MacOS/disk-cleaner"
+          cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
           cat > "$APP/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -97,6 +121,8 @@ jobs:
             <string>disk-cleaner</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
             <key>NSHighResolutionCapable</key>
             <true/>
             <key>LSMinimumSystemVersion</key>
@@ -107,12 +133,26 @@ jobs:
 
           codesign --force --deep -s - "$APP"
 
-          # DMG
+      - name: Create DMG
+        run: |
+          brew install create-dmg
           mkdir dmg-contents
-          cp -R "$APP" dmg-contents/
-          ln -s /Applications dmg-contents/Applications
-          hdiutil create -volname "Disk Cleaner" -srcfolder dmg-contents \
-            -ov -format UDZO "Disk-Cleaner-${GITHUB_REF_NAME}-mac.dmg"
+          cp -R "Disk Cleaner.app" dmg-contents/
+          # create-dmg returns exit code 2 if it can't set the background (not fatal)
+          create-dmg \
+            --volname "Disk Cleaner" \
+            --volicon "AppIcon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "Disk Cleaner.app" 175 190 \
+            --hide-extension "Disk Cleaner.app" \
+            --app-drop-link 425 190 \
+            "Disk-Cleaner-${GITHUB_REF_NAME}-mac.dmg" \
+            dmg-contents/ \
+            || true
+          # Verify DMG was created
+          ls -la Disk-Cleaner-*.dmg
 
       - name: Package Linux
         run: |

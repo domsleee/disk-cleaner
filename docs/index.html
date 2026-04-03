@@ -338,6 +338,40 @@
     border-top: 1px solid var(--border-subtle);
   }
 
+  /* ---- Lightbox ---- */
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-out;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.25s ease, visibility 0.25s ease;
+  }
+  .lightbox.active {
+    opacity: 1;
+    visibility: visible;
+  }
+  .lightbox img {
+    max-width: 92vw;
+    max-height: 92vh;
+    border-radius: var(--radius);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+    transform: scale(0.95);
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .lightbox.active img {
+    transform: scale(1);
+  }
+  .screenshot-card img,
+  .hero-window img {
+    cursor: zoom-in;
+  }
+
   /* ---- Responsive ---- */
   @media (max-width: 768px) {
     .hero { padding: 80px 20px 56px; }
@@ -464,6 +498,11 @@
 </section>
 
 </main>
+<!-- ============ Lightbox ============ -->
+<div class="lightbox" id="lightbox">
+  <img src="" alt="">
+</div>
+
 <!-- ============ Footer ============ -->
 <footer>
   <p>Open source under MIT &middot; <a href="https://github.com/domsleee/disk-cleaner">GitHub</a></p>
@@ -528,6 +567,25 @@
   } catch {
     // Network error, blocked by extension, etc.: leave default links intact
   }
+})();
+</script>
+<script>
+(() => {
+  const lb = document.getElementById('lightbox');
+  const lbImg = lb.querySelector('img');
+
+  document.querySelectorAll('.screenshot-card img, .hero-window img').forEach(img => {
+    img.addEventListener('click', () => {
+      lbImg.src = img.src;
+      lbImg.alt = img.alt;
+      lb.classList.add('active');
+    });
+  });
+
+  lb.addEventListener('click', () => lb.classList.remove('active'));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') lb.classList.remove('active');
+  });
 })();
 </script>
 </body>

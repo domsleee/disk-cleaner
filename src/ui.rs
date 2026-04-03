@@ -210,6 +210,50 @@ pub fn collect_cached_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_file_group(
+    result: &mut Vec<CachedRow>,
+    current_path: &mut PathBuf,
+    file_count: usize,
+    file_size: u64,
+    group_expanded: bool,
+    depth: usize,
+    parent_size: u64,
+    files: &[&crate::tree::FileNode],
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
+) {
+    result.push(CachedRow {
+        path: current_path.join("__file_group__"),
+        name: format!("[{file_count} files]").into(),
+        size: file_size,
+        is_dir: false,
+        expanded: group_expanded,
+        depth: depth + 1,
+        parent_size,
+        children_count: file_count,
+        category: crate::categories::FileCategory::Other,
+        is_hidden: false,
+        is_file_group: true,
+    });
+
+    if group_expanded {
+        for child in files {
+            current_path.push(child.name());
+            collect_cached_rows_inner(
+                child, depth + 2, file_size, current_path,
+                filter, category_filter, show_hidden,
+                text_cache, cat_cache, expanded_file_groups, result,
+            );
+            current_path.pop();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_cached_rows_inner(
     node: &FileNode,
     depth: usize,
@@ -277,85 +321,57 @@ fn collect_cached_rows_inner(
             && filter.is_empty()
             && category_filter.is_none();
 
-        // File group goes at the top of the folder's children
         if should_group_files {
-            // Emit a synthetic file group summary row
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
             let group_expanded = expanded_file_groups
                 .is_some_and(|s| s.contains(current_path.as_path()));
             let file_count = files.len();
-            result.push(CachedRow {
-                path: current_path.join("__file_group__"),
-                name: format!("{file_count} files").into(),
-                size: file_size,
-                is_dir: false,
-                expanded: group_expanded,
-                depth: depth + 1,
-                parent_size: node.size(),
-                children_count: file_count,
-                category: crate::categories::FileCategory::Other,
-                is_hidden: false,
-                is_file_group: true,
-            });
+            let mut file_group_emitted = false;
 
-            // Only emit individual file rows if the group is expanded
-            if group_expanded {
-                for child in &files {
-                    current_path.push(child.name());
-                    collect_cached_rows_inner(
-                        child,
-                        depth + 2,
-                        file_size,
-                        current_path,
-                        filter,
-                        category_filter,
-                        show_hidden,
-                        text_cache,
-                        cat_cache,
-                        expanded_file_groups,
-                        result,
+            // Interleave dirs and file group sorted by size (children are
+            // already size-sorted from the scanner).
+            for child in &dirs {
+                // Emit file group before the first dir that is smaller
+                if !file_group_emitted && child.size() < file_size {
+                    emit_file_group(
+                        result, current_path, file_count, file_size,
+                        group_expanded, depth, node.size(), &files,
+                        filter, category_filter, show_hidden,
+                        text_cache, cat_cache, expanded_file_groups,
                     );
-                    current_path.pop();
+                    file_group_emitted = true;
                 }
-            }
-        } else {
-            // Few files or filtered view — emit files normally
-            for child in &files {
                 current_path.push(child.name());
                 collect_cached_rows_inner(
-                    child,
-                    depth + 1,
-                    node.size(),
-                    current_path,
-                    filter,
-                    category_filter,
-                    show_hidden,
-                    text_cache,
-                    cat_cache,
-                    expanded_file_groups,
-                    result,
+                    child, depth + 1, node.size(), current_path,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups, result,
                 );
                 current_path.pop();
             }
-        }
-
-        // Emit directory children after the file group
-        for child in &dirs {
-            current_path.push(child.name());
-            collect_cached_rows_inner(
-                child,
-                depth + 1,
-                node.size(),
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                text_cache,
-                cat_cache,
-                expanded_file_groups,
-                result,
-            );
-            current_path.pop();
+            // If all dirs were larger, emit file group at the end
+            if !file_group_emitted {
+                emit_file_group(
+                    result, current_path, file_count, file_size,
+                    group_expanded, depth, node.size(), &files,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups,
+                );
+            }
+        } else {
+            // No grouping — emit all children in original order
+            for child in node.children() {
+                if !show_hidden && child.name().starts_with('.') {
+                    continue;
+                }
+                current_path.push(child.name());
+                collect_cached_rows_inner(
+                    child, depth + 1, node.size(), current_path,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups, result,
+                );
+                current_path.pop();
+            }
         }
     }
 }
@@ -427,10 +443,9 @@ pub fn render_tree(
                     rect.right()
                 };
 
-                // Icon (file groups have no icon)
+                // Icon (file groups have no icon — flush left)
                 if row.is_file_group {
-                    // No icon — just allocate equivalent space for alignment
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    // No icon, no gap
                 } else if let Some(icons) = icon_cache {
                     let tex = if row.is_dir {
                         &icons.folder
@@ -949,7 +964,7 @@ mod tests {
         // Root + "2 files" group (both files visible → grouped)
         assert_eq!(rows_all.len(), 2);
         assert!(rows_all[1].is_file_group);
-        assert_eq!(&*rows_all[1].name, "2 files");
+        assert_eq!(&*rows_all[1].name, "[2 files]");
     }
 
     #[test]

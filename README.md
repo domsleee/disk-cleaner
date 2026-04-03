@@ -4,7 +4,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/domsleee/disk-cleaner)](https://github.com/domsleee/disk-cleaner/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and [egui](https://github.com/emilk/egui).
+A fast, native cross-platform desktop app to visualize disk usage and clean up large files. Built with Rust and [egui](https://github.com/emilk/egui).
 
 **[Website](https://domsleee.github.io/disk-cleaner/)** | **[Download](https://github.com/domsleee/disk-cleaner/releases/latest)**
 
@@ -12,13 +12,13 @@ A fast, native desktop app to visualize disk usage and clean up large files. Bui
 
 ## Features
 
+- Cross-platform desktop releases for macOS, Linux, and Windows
 - Scan any directory or volume with parallel traversal
 - Tree view sorted by size with proportional size bars
 - File type breakdown sidebar (archives, images, documents, etc.)
 - Filter files by name
 - Treemap visualization
 - Trash or delete files directly from the UI
-- Smart cleanup suggestions (node_modules, build artifacts, caches)
 - Resume previous scans
 - macOS native file icons
 

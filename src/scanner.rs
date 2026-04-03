@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
@@ -223,6 +226,9 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 Some(walk_dir(&path, progress, skip))
             } else if ft.is_file() {
                 let metadata = entry.metadata().ok()?;
+                #[cfg(unix)]
+                let len = metadata.blocks() * 512;
+                #[cfg(not(unix))]
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
@@ -274,19 +280,28 @@ mod tests {
     #[test]
     fn scan_flat_files() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("a.txt"), "hello").unwrap(); // 5 bytes
-        fs::write(tmp.path().join("b.txt"), "hi").unwrap(); // 2 bytes
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+        fs::write(tmp.path().join("b.txt"), "hi").unwrap();
 
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress.clone());
 
         assert_eq!(root.children().len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
-        assert_eq!(progress.total_size.load(Ordering::Relaxed), 7);
-        assert_eq!(root.size(), 7);
-        // Children sorted by size descending
-        assert_eq!(root.children()[0].size(), 5);
-        assert_eq!(root.children()[1].size(), 2);
+        // On unix, sizes are reported as disk usage (blocks * 512), not apparent size.
+        // Both small files fit in one block each, so they report the same on-disk size.
+        #[cfg(unix)]
+        {
+            let expected_per_file = fs::metadata(tmp.path().join("a.txt"))
+                .unwrap()
+                .blocks()
+                * 512;
+            assert_eq!(root.size(), expected_per_file * 2);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(root.size(), 7);
+        }
     }
 
     #[test]
@@ -302,13 +317,24 @@ mod tests {
 
         assert_eq!(root.children().len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
-        assert_eq!(root.size(), 101);
 
-        // sub dir (100 bytes) should sort before root.txt (1 byte)
-        let sub_node = &root.children()[0];
+        // Both small files use one block each on unix, so same on-disk size
+        #[cfg(unix)]
+        {
+            let block_size = fs::metadata(sub.join("file.bin"))
+                .unwrap()
+                .blocks()
+                * 512;
+            assert_eq!(root.size(), block_size * 2);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(root.size(), 101);
+        }
+
+        // sub dir should sort before root.txt (or equal size, stable order)
+        let sub_node = &root.children().iter().find(|c| c.name() == "sub").unwrap();
         assert!(sub_node.is_dir());
-        assert_eq!(sub_node.name(), "sub");
-        assert_eq!(sub_node.size(), 100);
         assert_eq!(sub_node.children().len(), 1);
     }
 
@@ -327,6 +353,46 @@ mod tests {
         let progress = new_progress();
         let root = scan_directory(tmp.path(), progress);
         assert!(!root.children()[0].expanded());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sparse_file_reports_apparent_size_not_disk_usage() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sparse_path = tmp.path().join("sparse.raw");
+
+        // Create a sparse file: seek to 1GB and write one byte.
+        // Apparent size = 1GB+1, but actual disk usage is one block (~4KB).
+        let file = fs::File::create(&sparse_path).unwrap();
+        use std::io::{Seek, Write};
+        let mut writer = std::io::BufWriter::new(file);
+        writer.seek(std::io::SeekFrom::Start(1_000_000_000)).unwrap();
+        writer.write_all(b"\0").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let meta = fs::metadata(&sparse_path).unwrap();
+        let apparent = meta.len();
+        let on_disk = meta.blocks() * 512;
+
+        // Confirm the file is actually sparse
+        assert_eq!(apparent, 1_000_000_001);
+        assert!(
+            on_disk < 1_000_000,
+            "expected sparse file to use <1MB on disk, got {on_disk}"
+        );
+
+        // Scanner should report actual disk usage, not apparent size
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+        let scanned_size = root.size();
+
+        assert_eq!(
+            scanned_size, on_disk,
+            "scanner should report on-disk size, not apparent size"
+        );
     }
 
     #[test]

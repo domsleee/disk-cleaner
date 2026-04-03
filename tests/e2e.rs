@@ -163,7 +163,7 @@ fn auto_expand_works_on_scanned_tree() {
     let root = tmp.path();
 
     fs::create_dir(root.join("big")).unwrap();
-    create_file(&root.join("big"), "large.bin", 10000);
+    create_file(&root.join("big"), "large.bin", 100_000);
 
     fs::create_dir(root.join("tiny")).unwrap();
     create_file(&root.join("tiny"), "small.txt", 10);

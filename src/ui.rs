@@ -461,33 +461,48 @@ pub fn render_tree(
                     ui.label(icon);
                 }
 
-                // Name (hidden files and file groups use weak/greyed-out text)
-                if row.is_hidden || row.is_file_group {
-                    ui.label(egui::RichText::new(&*row.name).monospace().weak());
-                } else {
-                    ui.label(egui::RichText::new(&*row.name).monospace());
-                }
-
-                // Size bar + label (painted at fixed right-edge positions for alignment)
-                // Use max_rect for horizontal extent (right edge) but min_rect for
-                // vertical centering.  Inside show_rows, max_rect extends to the
-                // bottom of the remaining scroll area, so its center().y drifts with
-                // scroll position.  min_rect is bounded by set_min_height(row_height)
-                // and gives a stable per-row center.
-                let row_max = ui.max_rect();
-                let row_center_y = ui.min_rect().center().y;
-                let painter = ui.painter();
+                // Size bar + label dimensions (computed first to reserve space
+                // for name truncation).
                 let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
                 let text_margin = 8.0_f32;
+                let bar_gap = 4.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
                 let font_id =
                     egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
-                let text_galley =
-                    painter.layout_no_wrap(size_text, font_id, ui.visuals().text_color());
+                let text_galley = ui.painter().layout_no_wrap(
+                    size_text,
+                    font_id,
+                    ui.visuals().text_color(),
+                );
                 let text_width = text_galley.size().x;
-                let text_x = row_max.right() - text_margin - text_width;
+                let right_reserved = text_margin + text_width + bar_gap + bar_width;
+
+                // Name — truncate so it never overlaps the size bar area.
+                let name_max_w =
+                    (ui.available_width() - right_reserved - 4.0).max(20.0);
+                let name_text = if row.is_hidden || row.is_file_group {
+                    egui::RichText::new(&*row.name).monospace().weak()
+                } else {
+                    egui::RichText::new(&*row.name).monospace()
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_max_w, row_height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(name_text).truncate());
+                    },
+                );
+
+                // Paint size bar + label at fixed positions anchored to the
+                // outer scroll-area rect (`full_width`) for a stable right
+                // edge across all rows.  Use min_rect for vertical centering
+                // (max_rect extends to the bottom of the scroll area and its
+                // center().y drifts with scroll position).
+                let row_center_y = ui.min_rect().center().y;
+                let painter = ui.painter();
+                let text_x = full_width.right() - text_margin - text_width;
                 let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
@@ -495,7 +510,6 @@ pub fn render_tree(
                     ui.visuals().text_color(),
                 );
 
-                let bar_gap = 4.0_f32;
                 let bar_x = text_x - bar_gap - bar_width;
                 let bar_y = row_center_y - bar_h / 2.0;
                 let bar_rect = egui::Rect::from_min_size(
@@ -504,7 +518,8 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect =
+                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right

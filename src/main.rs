@@ -497,6 +497,9 @@ fn save_screenshot_png(
 }
 
 impl eframe::App for App {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
 

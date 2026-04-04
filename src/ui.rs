@@ -140,6 +140,7 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
 /// Actions produced by tree rendering, applied after the frame.
 pub enum TreeAction {
     ToggleExpand(PathBuf),
+    ToggleFileGroup(PathBuf),
     Click {
         path: PathBuf,
         shift: bool,
@@ -153,6 +154,9 @@ pub enum TreeAction {
     RevealInFinder(PathBuf),
     CopyPath(PathBuf),
 }
+
+/// Minimum number of loose files in a folder to trigger grouping.
+const FILE_GROUP_THRESHOLD: usize = 2;
 
 /// Cached row data for the visible tree. Rebuilt only when the tree state changes.
 /// Owns all data so it can outlive a single frame.
@@ -168,6 +172,8 @@ pub struct CachedRow {
     pub category: crate::categories::FileCategory,
     /// True when the file/folder name starts with `.` or has OS-level hidden flag.
     pub is_hidden: bool,
+    /// True for synthetic "N files" summary rows that group loose files.
+    pub is_file_group: bool,
 }
 
 /// Collect all visible rows into owned `CachedRow` structs. This replaces both
@@ -183,6 +189,7 @@ pub fn collect_cached_rows(
     show_hidden: bool,
     text_cache: Option<&HashSet<PathBuf>>,
     cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
     let mut path_buf = PathBuf::from(node.name());
@@ -196,9 +203,54 @@ pub fn collect_cached_rows(
         show_hidden,
         text_cache,
         cat_cache,
+        expanded_file_groups,
         &mut result,
     );
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_file_group(
+    result: &mut Vec<CachedRow>,
+    current_path: &mut PathBuf,
+    file_count: usize,
+    file_size: u64,
+    group_expanded: bool,
+    depth: usize,
+    parent_size: u64,
+    files: &[&crate::tree::FileNode],
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
+) {
+    result.push(CachedRow {
+        path: current_path.join("__file_group__"),
+        name: format!("[{file_count} files]").into(),
+        size: file_size,
+        is_dir: false,
+        expanded: group_expanded,
+        depth: depth + 1,
+        parent_size,
+        children_count: file_count,
+        category: crate::categories::FileCategory::Other,
+        is_hidden: false,
+        is_file_group: true,
+    });
+
+    if group_expanded {
+        for child in files {
+            current_path.push(child.name());
+            collect_cached_rows_inner(
+                child, depth + 2, file_size, current_path,
+                filter, category_filter, show_hidden,
+                text_cache, cat_cache, expanded_file_groups, result,
+            );
+            current_path.pop();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +264,7 @@ fn collect_cached_rows_inner(
     show_hidden: bool,
     text_cache: Option<&HashSet<PathBuf>>,
     cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.is_hidden() {
@@ -251,25 +304,74 @@ fn collect_cached_rows_inner(
             crate::categories::categorize(node.name())
         },
         is_hidden: node.is_hidden(),
+        is_file_group: false,
     });
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
     if show_children {
-        for child in node.children() {
-            current_path.push(child.name());
-            collect_cached_rows_inner(
-                child,
-                depth + 1,
-                node.size(),
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                text_cache,
-                cat_cache,
-                result,
-            );
-            current_path.pop();
+        // Separate children into dirs and files for grouping.
+        // Only consider visible files (respecting show_hidden).
+        let dirs: Vec<_> = node.children().iter().filter(|c| c.is_dir()).collect();
+        let files: Vec<_> = node
+            .children()
+            .iter()
+            .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
+            .collect();
+        let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
+            && filter.is_empty()
+            && category_filter.is_none();
+
+        if should_group_files {
+            let file_size: u64 = files.iter().map(|f| f.size()).sum();
+            let group_expanded = expanded_file_groups
+                .is_some_and(|s| s.contains(current_path.as_path()));
+            let file_count = files.len();
+            let mut file_group_emitted = false;
+
+            // Interleave dirs and file group sorted by size (children are
+            // already size-sorted from the scanner).
+            for child in &dirs {
+                // Emit file group before the first dir that is smaller
+                if !file_group_emitted && child.size() < file_size {
+                    emit_file_group(
+                        result, current_path, file_count, file_size,
+                        group_expanded, depth, node.size(), &files,
+                        filter, category_filter, show_hidden,
+                        text_cache, cat_cache, expanded_file_groups,
+                    );
+                    file_group_emitted = true;
+                }
+                current_path.push(child.name());
+                collect_cached_rows_inner(
+                    child, depth + 1, node.size(), current_path,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups, result,
+                );
+                current_path.pop();
+            }
+            // If all dirs were larger, emit file group at the end
+            if !file_group_emitted {
+                emit_file_group(
+                    result, current_path, file_count, file_size,
+                    group_expanded, depth, node.size(), &files,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups,
+                );
+            }
+        } else {
+            // No grouping — emit all children in original order
+            for child in node.children() {
+                if !show_hidden && child.name().starts_with('.') {
+                    continue;
+                }
+                current_path.push(child.name());
+                collect_cached_rows_inner(
+                    child, depth + 1, node.size(), current_path,
+                    filter, category_filter, show_hidden,
+                    text_cache, cat_cache, expanded_file_groups, result,
+                );
+                current_path.pop();
+            }
         }
     }
 }
@@ -333,7 +435,7 @@ pub fn render_tree(
                 ui.add_space(indent);
 
                 // Disclosure toggle (visual only — click handled by row interaction)
-                let toggle_right = if row.is_dir {
+                let toggle_right = if row.is_dir || row.is_file_group {
                     paint_disclosure(ui, row.expanded).right()
                 } else {
                     let (rect, _) =
@@ -341,8 +443,10 @@ pub fn render_tree(
                     rect.right()
                 };
 
-                // Icon
-                if let Some(icons) = icon_cache {
+                // Icon (file groups have no icon — flush left)
+                if row.is_file_group {
+                    // No icon, no gap
+                } else if let Some(icons) = icon_cache {
                     let tex = if row.is_dir {
                         &icons.folder
                     } else {
@@ -357,33 +461,48 @@ pub fn render_tree(
                     ui.label(icon);
                 }
 
-                // Name (hidden files use weak/greyed-out text)
-                if row.is_hidden {
-                    ui.label(egui::RichText::new(&*row.name).monospace().weak());
-                } else {
-                    ui.label(egui::RichText::new(&*row.name).monospace());
-                }
-
-                // Size bar + label (painted at fixed right-edge positions for alignment)
-                // Use max_rect for horizontal extent (right edge) but min_rect for
-                // vertical centering.  Inside show_rows, max_rect extends to the
-                // bottom of the remaining scroll area, so its center().y drifts with
-                // scroll position.  min_rect is bounded by set_min_height(row_height)
-                // and gives a stable per-row center.
-                let row_max = ui.max_rect();
-                let row_center_y = ui.min_rect().center().y;
-                let painter = ui.painter();
+                // Size bar + label dimensions (computed first to reserve space
+                // for name truncation).
                 let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
                 let text_margin = 8.0_f32;
+                let bar_gap = 4.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
                 let font_id =
                     egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
-                let text_galley =
-                    painter.layout_no_wrap(size_text, font_id, ui.visuals().text_color());
+                let text_galley = ui.painter().layout_no_wrap(
+                    size_text,
+                    font_id,
+                    ui.visuals().text_color(),
+                );
                 let text_width = text_galley.size().x;
-                let text_x = row_max.right() - text_margin - text_width;
+                let right_reserved = text_margin + text_width + bar_gap + bar_width;
+
+                // Name — truncate so it never overlaps the size bar area.
+                let name_max_w =
+                    (ui.available_width() - right_reserved - 4.0).max(20.0);
+                let name_text = if row.is_hidden || row.is_file_group {
+                    egui::RichText::new(&*row.name).monospace().weak()
+                } else {
+                    egui::RichText::new(&*row.name).monospace()
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_max_w, row_height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(name_text).truncate());
+                    },
+                );
+
+                // Paint size bar + label at fixed positions anchored to the
+                // outer scroll-area rect (`full_width`) for a stable right
+                // edge across all rows.  Use min_rect for vertical centering
+                // (max_rect extends to the bottom of the scroll area and its
+                // center().y drifts with scroll position).
+                let row_center_y = ui.min_rect().center().y;
+                let painter = ui.painter();
+                let text_x = full_width.right() - text_margin - text_width;
                 let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
@@ -391,7 +510,6 @@ pub fn render_tree(
                     ui.visuals().text_color(),
                 );
 
-                let bar_gap = 4.0_f32;
                 let bar_x = text_x - bar_gap - bar_width;
                 let bar_y = row_center_y - bar_h / 2.0;
                 let bar_rect = egui::Rect::from_min_size(
@@ -400,7 +518,8 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect =
+                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
@@ -419,7 +538,7 @@ pub fn render_tree(
             // Use PointingHand only when hovering over the disclosure triangle area
             if row_interact.hovered() {
                 if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    if row.is_dir && pos.x <= toggle_right {
+                    if (row.is_dir || row.is_file_group) && pos.x <= toggle_right {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
@@ -427,7 +546,11 @@ pub fn render_tree(
 
             if row_interact.clicked() {
                 if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    if row.is_dir && pos.x <= toggle_right {
+                    if row.is_file_group {
+                        // Any click on file group row → toggle expand
+                        actions.push(TreeAction::ToggleFileGroup(row.path.clone()));
+                        actions.push(TreeAction::Focus(row.path.clone()));
+                    } else if row.is_dir && pos.x <= toggle_right {
                         // Click on disclosure triangle area → toggle expand + focus
                         actions.push(TreeAction::ToggleExpand(row.path.clone()));
                         actions.push(TreeAction::Focus(row.path.clone()));
@@ -826,8 +949,8 @@ mod tests {
         // Expand "src" so its children are visible
         tree.as_dir_mut().unwrap().children[0].set_expanded(true);
 
-        let rows_a = collect_cached_rows(&tree, "", None, true, None, None);
-        let rows_b = collect_cached_rows(&tree, "", None, true, None, None);
+        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None);
 
         assert_eq!(rows_a.len(), rows_b.len());
         for (a, b) in rows_a.iter().zip(rows_b.iter()) {
@@ -847,14 +970,16 @@ mod tests {
         let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
 
-        let rows = collect_cached_rows(&tree, "", None, false, None, None);
-        // Root + visible.txt (hidden file excluded)
+        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        // Root + visible.txt (hidden file excluded, 1 file = no grouping)
         assert_eq!(rows.len(), 2);
         assert_eq!(&*rows[1].name, "visible.txt");
 
-        let rows_all = collect_cached_rows(&tree, "", None, true, None, None);
-        // Root + .hidden + visible.txt
-        assert_eq!(rows_all.len(), 3);
+        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None);
+        // Root + "2 files" group (both files visible → grouped)
+        assert_eq!(rows_all.len(), 2);
+        assert!(rows_all[1].is_file_group);
+        assert_eq!(&*rows_all[1].name, "[2 files]");
     }
 
     #[test]
@@ -936,8 +1061,8 @@ mod tests {
         let query = "main";
         let cache = build_text_match_cache(&tree, query);
 
-        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None);
-        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None);
+        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None);
+        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
@@ -958,8 +1083,8 @@ mod tests {
         let cat = crate::categories::FileCategory::Video;
         let cache = build_category_match_cache(&tree, cat);
 
-        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None);
-        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache));
+        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None);
+        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {

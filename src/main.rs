@@ -222,6 +222,8 @@ struct App {
     selected_paths: HashSet<PathBuf>,
     /// Anchor path for shift+click range selection.
     selection_anchor: Option<PathBuf>,
+    /// Tracks which file groups in the tree view are expanded.
+    expanded_file_groups: HashSet<PathBuf>,
     /// Smart cleanup suggestions computed after scan.
     suggestion_report: Option<suggestions::SuggestionReport>,
     /// Process start time for measuring startup latency.
@@ -285,6 +287,7 @@ impl Default for App {
             treemap_dirty: true,
             selected_paths: HashSet::new(),
             selection_anchor: None,
+            expanded_file_groups: HashSet::new(),
             suggestion_report: None,
             process_start: None,
             scan_frame_times: Vec::new(),
@@ -380,6 +383,7 @@ impl App {
                 self.show_hidden,
                 text_cache.as_ref(),
                 cat_cache.as_ref(),
+                Some(&self.expanded_file_groups),
             );
         }
         self.rows_dirty = false;
@@ -1493,15 +1497,24 @@ impl eframe::App for App {
                     // Apply expand/collapse changes to tree
                     if let Some(ref mut tree) = self.tree {
                         for action in &actions {
-                            if let ui::TreeAction::ToggleExpand(path) = action {
-                                ui::toggle_expand(tree, path);
-                                self.rows_dirty = true;
-                                // Clear selection and anchor so only the focused row is
-                                // highlighted, and a subsequent shift-click starts fresh
-                                // rather than selecting a stale range.
-                                self.selected_paths.clear();
-                                self.selection_anchor = None;
-                                // Note: treemap doesn't use expand state, so no treemap_dirty
+                            match action {
+                                ui::TreeAction::ToggleExpand(path) => {
+                                    ui::toggle_expand(tree, path);
+                                    self.rows_dirty = true;
+                                    self.selected_paths.clear();
+                                    self.selection_anchor = None;
+                                }
+                                ui::TreeAction::ToggleFileGroup(path) => {
+                                    // path is parent_dir/__file_group__; extract parent
+                                    if let Some(parent) = path.parent() {
+                                        let p = parent.to_path_buf();
+                                        if !self.expanded_file_groups.remove(&p) {
+                                            self.expanded_file_groups.insert(p);
+                                        }
+                                    }
+                                    self.rows_dirty = true;
+                                }
+                                _ => {}
                             }
                         }
                     }

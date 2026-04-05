@@ -224,22 +224,31 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let dir_hidden = is_os_hidden(&dir_name, dir);
 
-    let empty_dir = FileNode::Dir(DirNode {
-        name: dir_name.clone(),
-        size: 0,
-        children: Vec::new(),
-        expanded: false,
-        hidden: dir_hidden,
-    });
+    // Build the empty fallback only in early-return paths to avoid cloning
+    // dir_name and allocating a Vec on every directory visit.
 
     // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
-        return empty_dir;
+        return FileNode::Dir(DirNode {
+            name: dir_name,
+            size: 0,
+            children: Vec::new(),
+            expanded: false,
+            hidden: dir_hidden,
+        });
     }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return empty_dir,
+        Err(_) => {
+            return FileNode::Dir(DirNode {
+                name: dir_name,
+                size: 0,
+                children: Vec::new(),
+                expanded: false,
+                hidden: dir_hidden,
+            });
+        }
     };
 
     let mut children: Vec<FileNode> = entries

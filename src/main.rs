@@ -1,6 +1,7 @@
 mod app_icon;
 mod categories;
 mod icons;
+mod permissions;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -341,6 +342,8 @@ impl App {
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
+            // Trigger TCC permission dialogs upfront so they don't interrupt mid-scan.
+            permissions::preflight_tcc_probe(&path);
             let tree = scanner::scan_directory(&path, progress);
             let stats = categories::compute_stats(&tree);
             let suggestions = suggestions::analyze(&tree);

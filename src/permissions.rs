@@ -41,6 +41,52 @@ pub fn has_full_disk_access() -> bool {
     true
 }
 
+/// Pre-probe TCC-protected directories that fall under `scan_root` to trigger
+/// macOS permission dialogs upfront, before the real scan begins.
+///
+/// macOS TCC prompts are lazy — they fire only when the app first attempts to
+/// access a protected directory. Without this pre-flight, prompts appear
+/// mid-scan, blocking the scanner thread and surprising the user.
+///
+/// If the app already has Full Disk Access, this is a no-op (no prompts fire).
+/// On non-macOS platforms this does nothing.
+#[cfg(target_os = "macos")]
+pub fn preflight_tcc_probe(scan_root: &std::path::Path) {
+    use std::fs;
+
+    // If we already have FDA, all folders are accessible — skip probing.
+    if has_full_disk_access() {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+
+    // TCC-protected directories under the user's home.
+    let protected = [
+        home.join("Desktop"),
+        home.join("Documents"),
+        home.join("Downloads"),
+        home.join("Library/Mail"),
+        home.join("Library/Messages"),
+        home.join("Library/Safari"),
+    ];
+
+    for dir in &protected {
+        // Only probe if this directory falls under the scan root.
+        if dir.starts_with(scan_root) || scan_root.starts_with(dir) {
+            // Attempt read_dir to trigger the TCC prompt. We don't care
+            // about the result — the side effect (the macOS dialog) is
+            // what matters.
+            let _ = fs::read_dir(dir);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn preflight_tcc_probe(_scan_root: &std::path::Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

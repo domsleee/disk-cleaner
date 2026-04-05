@@ -33,7 +33,9 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     }
     let stat = unsafe { stat.assume_init() };
     let block_size = stat.f_frsize;
+    #[allow(clippy::unnecessary_cast)]
     let total = stat.f_blocks as u64 * block_size;
+    #[allow(clippy::unnecessary_cast)]
     let available = stat.f_bavail as u64 * block_size;
     Some((total, available))
 }
@@ -109,6 +111,7 @@ pub struct ScanProgress {
 /// Scanning from `/` without skipping Data counts everything twice.
 /// Mount points under `/Volumes/` also cause inflation when scanning root.
 fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
+    #[allow(unused_mut)]
     let mut skip = HashSet::new();
 
     #[cfg(target_os = "macos")]

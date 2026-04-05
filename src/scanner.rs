@@ -427,6 +427,81 @@ mod tests {
         );
     }
 
+    /// Set the macOS UF_HIDDEN flag on a path using chflags(2).
+    #[cfg(target_os = "macos")]
+    fn set_uf_hidden(path: &Path) {
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe { libc::lstat(c_path.as_ptr(), stat.as_mut_ptr()) };
+        assert_eq!(rc, 0, "lstat failed");
+        let stat = unsafe { stat.assume_init() };
+        let rc = unsafe { libc::chflags(c_path.as_ptr(), stat.st_flags | 0x8000) };
+        assert_eq!(rc, 0, "chflags failed");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn uf_hidden_file_detected_as_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Non-dot file with UF_HIDDEN flag
+        let hidden_file = tmp.path().join("visible_name.txt");
+        fs::write(&hidden_file, "secret").unwrap();
+        set_uf_hidden(&hidden_file);
+
+        // Normal non-dot file for comparison
+        fs::write(tmp.path().join("normal.txt"), "hello").unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        let hidden_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "visible_name.txt")
+            .expect("hidden file should appear in scan");
+        assert!(hidden_node.is_hidden(), "UF_HIDDEN file should be marked hidden");
+
+        let normal_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "normal.txt")
+            .expect("normal file should appear in scan");
+        assert!(!normal_node.is_hidden(), "normal file should not be hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn uf_hidden_dir_detected_as_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Non-dot directory with UF_HIDDEN flag
+        let hidden_dir = tmp.path().join("secret_dir");
+        fs::create_dir(&hidden_dir).unwrap();
+        fs::write(hidden_dir.join("child.txt"), "data").unwrap();
+        set_uf_hidden(&hidden_dir);
+
+        // Normal directory for comparison
+        let normal_dir = tmp.path().join("normal_dir");
+        fs::create_dir(&normal_dir).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        let hidden_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "secret_dir")
+            .expect("hidden dir should appear in scan");
+        assert!(hidden_node.is_hidden(), "UF_HIDDEN dir should be marked hidden");
+        assert_eq!(hidden_node.children().len(), 1, "hidden dir contents should still be scanned");
+
+        let normal_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "normal_dir")
+            .expect("normal dir should appear in scan");
+        assert!(!normal_node.is_hidden(), "normal dir should not be hidden");
+    }
+
     #[test]
     fn cancelled_scan_returns_empty_tree() {
         let tmp = tempfile::tempdir().unwrap();

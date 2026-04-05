@@ -157,6 +157,9 @@ fn main() -> eframe::Result {
                 },
                 ..Default::default()
             };
+            if app.screenshot_prefix.is_some() {
+                app.show_hidden = true;
+            }
             if let Some(path) = initial_path {
                 app.start_scan(path);
             }

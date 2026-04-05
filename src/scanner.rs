@@ -198,34 +198,21 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
     }
 }
 
-/// Check if a file/directory is hidden at the OS level (macOS UF_HIDDEN flag)
-/// or by naming convention (dotfile).
+/// macOS UF_HIDDEN flag constant.
 #[cfg(target_os = "macos")]
-fn is_os_hidden(name: &str, path: &Path) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
-    // macOS UF_HIDDEN flag (0x8000) in st_flags via lstat.
-    // Use OsStr::as_bytes() to build the CString directly from the OS path
-    // representation, avoiding the to_string_lossy() allocation on every entry.
-    use std::os::unix::ffi::OsStrExt;
-    const UF_HIDDEN: u32 = 0x8000;
-    let path_bytes = path.as_os_str().as_bytes();
-    let c_path = match std::ffi::CString::new(path_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let result = unsafe { libc::lstat(c_path.as_ptr(), stat.as_mut_ptr()) };
-    if result != 0 {
-        return false;
-    }
-    let stat = unsafe { stat.assume_init() };
-    stat.st_flags & UF_HIDDEN != 0
+const UF_HIDDEN: u32 = 0x8000;
+
+/// Check the hidden bit from metadata already fetched by the caller.
+/// On macOS this checks both the dotfile convention and the UF_HIDDEN flag
+/// via `st_flags()`, avoiding a second `lstat` per entry.
+#[cfg(target_os = "macos")]
+fn is_hidden_from_metadata(name: &str, metadata: &std::fs::Metadata) -> bool {
+    use std::os::darwin::fs::MetadataExt;
+    name.starts_with('.') || metadata.st_flags() & UF_HIDDEN != 0
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_os_hidden(name: &str, _path: &Path) -> bool {
+fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
@@ -236,7 +223,9 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
-    let dir_hidden = is_os_hidden(&dir_name, dir);
+    let dir_hidden = std::fs::symlink_metadata(dir)
+        .map(|m| is_hidden_from_metadata(&dir_name, &m))
+        .unwrap_or_else(|_| dir_name.starts_with('.'));
 
     // Build the empty fallback only in early-return paths to avoid cloning
     // dir_name and allocating a Vec on every directory visit.
@@ -274,9 +263,9 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
             }
             let entry = entry.ok()?;
             let ft = entry.file_type().ok()?;
-            let path = entry.path();
 
             if ft.is_dir() {
+                let path = entry.path();
                 if skip.contains(&path) {
                     return None;
                 }
@@ -290,7 +279,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
-                let hidden = is_os_hidden(&name, &path);
+                let hidden = is_hidden_from_metadata(&name, &metadata);
                 Some(FileNode::File(FileLeaf { name, size: len, hidden }))
             } else {
                 None

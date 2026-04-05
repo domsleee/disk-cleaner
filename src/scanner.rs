@@ -191,9 +191,13 @@ fn is_os_hidden(name: &str, path: &Path) -> bool {
     if name.starts_with('.') {
         return true;
     }
-    // macOS UF_HIDDEN flag (0x8000) in st_flags via libc::stat
+    // macOS UF_HIDDEN flag (0x8000) in st_flags via lstat.
+    // Use OsStr::as_bytes() to build the CString directly from the OS path
+    // representation, avoiding the to_string_lossy() allocation on every entry.
+    use std::os::unix::ffi::OsStrExt;
     const UF_HIDDEN: u32 = 0x8000;
-    let c_path = match std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+    let path_bytes = path.as_os_str().as_bytes();
+    let c_path = match std::ffi::CString::new(path_bytes) {
         Ok(p) => p,
         Err(_) => return false,
     };

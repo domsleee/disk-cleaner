@@ -12,6 +12,7 @@ fn make_leaf(name: &str, size: u64) -> FileNode {
     FileNode::File(FileLeaf {
         name: name.into(),
         size,
+        hidden: false,
     })
 }
 
@@ -22,6 +23,7 @@ fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
         size,
         children,
         expanded: false,
+        hidden: false,
     })
 }
 

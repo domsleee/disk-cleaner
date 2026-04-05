@@ -1,7 +1,6 @@
 mod app_icon;
 mod categories;
 mod icons;
-mod permissions;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;

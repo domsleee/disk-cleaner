@@ -281,7 +281,11 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
                 let hidden = is_os_hidden(&name, &path);
-                Some(FileNode::File(FileLeaf { name, size: len, hidden }))
+                Some(FileNode::File(FileLeaf {
+                    name,
+                    size: len,
+                    hidden,
+                }))
             } else {
                 None
             }
@@ -342,10 +346,7 @@ mod tests {
         // Both small files fit in one block each, so they report the same on-disk size.
         #[cfg(unix)]
         {
-            let expected_per_file = fs::metadata(tmp.path().join("a.txt"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let expected_per_file = fs::metadata(tmp.path().join("a.txt")).unwrap().blocks() * 512;
             assert_eq!(root.size(), expected_per_file * 2);
         }
         #[cfg(not(unix))]
@@ -371,10 +372,7 @@ mod tests {
         // Both small files use one block each on unix, so same on-disk size
         #[cfg(unix)]
         {
-            let block_size = fs::metadata(sub.join("file.bin"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let block_size = fs::metadata(sub.join("file.bin")).unwrap().blocks() * 512;
             assert_eq!(root.size(), block_size * 2);
         }
         #[cfg(not(unix))]
@@ -418,7 +416,9 @@ mod tests {
         let file = fs::File::create(&sparse_path).unwrap();
         use std::io::{Seek, Write};
         let mut writer = std::io::BufWriter::new(file);
-        writer.seek(std::io::SeekFrom::Start(1_000_000_000)).unwrap();
+        writer
+            .seek(std::io::SeekFrom::Start(1_000_000_000))
+            .unwrap();
         writer.write_all(b"\0").unwrap();
         writer.flush().unwrap();
         drop(writer);

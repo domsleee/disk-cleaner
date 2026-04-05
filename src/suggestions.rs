@@ -105,7 +105,9 @@ impl SuggestionReport {
     pub fn remove_paths(&mut self, deleted: &[std::path::PathBuf]) {
         for group in &mut self.groups {
             group.items.retain(|item| {
-                !deleted.iter().any(|d| item.path == *d || item.path.starts_with(d))
+                !deleted
+                    .iter()
+                    .any(|d| item.path == *d || item.path.starts_with(d))
             });
             group.total_size = group.items.iter().map(|i| i.size).sum();
         }

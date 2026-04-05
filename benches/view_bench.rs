@@ -11,6 +11,7 @@ fn make_leaf(name: &str, size: u64) -> FileNode {
     FileNode::File(FileLeaf {
         name: name.into(),
         size,
+        hidden: false,
     })
 }
 
@@ -21,6 +22,7 @@ fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
         size,
         children,
         expanded: false,
+        hidden: false,
     })
 }
 
@@ -79,7 +81,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
         });
     }
 
@@ -90,7 +92,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
         });
     }
 
@@ -100,24 +102,24 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("filter_hit_uncached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None, None))
         });
 
         let text_cache = ui::build_text_match_cache(&tree, "file_5");
         group.bench_with_input(BenchmarkId::new("filter_hit_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
         });
 
         group.bench_with_input(
             BenchmarkId::new("filter_miss_uncached", n),
             &tree,
-            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None)),
+            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None, None)),
         );
 
         let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz");
         group.bench_with_input(BenchmarkId::new("filter_miss_cached", n), &tree, |b, t| {
             b.iter(|| {
-                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None)
+                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None, None)
             })
         });
     }
@@ -139,6 +141,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
                         true,
                         None,
                         None,
+                        None,
                     )
                 })
             },
@@ -157,6 +160,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
                         true,
                         None,
                         Some(&cat_cache),
+                        None,
                     )
                 })
             },
@@ -332,7 +336,7 @@ fn bench_full_filter_pipeline(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("text_search_e2e", n), &tree, |b, t| {
             b.iter(|| {
                 let cache = ui::build_text_match_cache(t, "file_5");
-                ui::collect_cached_rows(t, "file_5", None, true, Some(&cache), None)
+                ui::collect_cached_rows(t, "file_5", None, true, Some(&cache), None, None)
             })
         });
 
@@ -347,6 +351,7 @@ fn bench_full_filter_pipeline(c: &mut Criterion) {
                     true,
                     None,
                     Some(&cache),
+                    None,
                 )
             })
         });
@@ -369,7 +374,7 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
         });
     }
 
@@ -380,7 +385,7 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
         });
     }
 
@@ -391,7 +396,7 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let text_cache = ui::build_text_match_cache(&tree, "file_5");
 
         group.bench_with_input(BenchmarkId::new("filter_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
         });
     }
 

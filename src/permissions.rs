@@ -23,7 +23,7 @@ pub fn has_full_disk_access() -> bool {
     // Fallback probes: TCC-protected user files.
     if let Some(home) = dirs::home_dir() {
         let safari_bookmarks = home.join("Library/Safari/Bookmarks.plist");
-        if safari_bookmarks.exists() && fs::metadata(&safari_bookmarks).is_ok() {
+        if fs::metadata(&safari_bookmarks).is_ok() {
             return true;
         }
     }

@@ -60,6 +60,7 @@ fn bench_startup() {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            permission_denied: AtomicU64::new(0),
         });
 
         let elapsed = start.elapsed();
@@ -94,6 +95,7 @@ fn bench_frame_time(scan_path: &Path) {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
+        permission_denied: AtomicU64::new(0),
     });
 
     let (tx, rx) = mpsc::channel();

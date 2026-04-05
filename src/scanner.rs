@@ -109,6 +109,7 @@ pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
     pub cancelled: AtomicBool,
+    pub permission_denied: AtomicU64,
 }
 
 /// Build a set of paths to skip during scanning to avoid double-counting.
@@ -243,7 +244,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => {
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                progress.permission_denied.fetch_add(1, Ordering::Relaxed);
+            }
             return FileNode::Dir(DirNode {
                 name: dir_name,
                 size: 0,
@@ -309,6 +313,7 @@ mod tests {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            permission_denied: AtomicU64::new(0),
         })
     }
 

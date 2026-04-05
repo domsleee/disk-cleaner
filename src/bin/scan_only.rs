@@ -24,6 +24,7 @@ fn main() {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
+        permission_denied: AtomicU64::new(0),
     });
 
     let tree = scanner::scan_directory(&path, progress.clone());

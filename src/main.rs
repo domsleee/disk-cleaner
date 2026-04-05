@@ -1,6 +1,7 @@
 mod app_icon;
 mod categories;
 mod icons;
+mod permissions;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -161,11 +162,21 @@ fn main() -> eframe::Result {
                 app.show_hidden = true;
             }
             if let Some(path) = initial_path {
-                app.start_scan(path);
+                app.request_scan(path);
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+/// State for the macOS Full Disk Access permission prompt shown before scanning.
+enum FdaPromptState {
+    /// No prompt active — either FDA is granted or user hasn't requested a scan yet.
+    Inactive,
+    /// Showing the permission prompt, waiting for user to choose.
+    Prompting { pending_path: PathBuf },
+    /// User clicked "Open System Settings"; polling for FDA grant.
+    WaitingForGrant { pending_path: PathBuf },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -246,6 +257,8 @@ struct App {
     delete_progress: Arc<AtomicUsize>,
     delete_total: usize,
     delete_receiver: Option<mpsc::Receiver<DeleteResults>>,
+    /// FDA permission prompt state (macOS only, inactive on other platforms).
+    fda_prompt: FdaPromptState,
 }
 
 impl Default for App {
@@ -259,6 +272,7 @@ impl Default for App {
                 file_count: 0.into(),
                 total_size: 0.into(),
                 cancelled: false.into(),
+                permission_denied: 0.into(),
             }),
             receiver: None,
             error: None,
@@ -302,6 +316,7 @@ impl Default for App {
             delete_progress: Arc::new(AtomicUsize::new(0)),
             delete_total: 0,
             delete_receiver: None,
+            fda_prompt: FdaPromptState::Inactive,
         }
     }
 }
@@ -313,10 +328,21 @@ impl App {
         self.receiver = None;
     }
 
+    /// Request a scan: check FDA first, show prompt if needed, or scan directly.
+    fn request_scan(&mut self, path: PathBuf) {
+        if permissions::has_full_disk_access() {
+            self.fda_prompt = FdaPromptState::Inactive;
+            self.start_scan(path);
+        } else {
+            self.fda_prompt = FdaPromptState::Prompting { pending_path: path };
+        }
+    }
+
     fn start_scan(&mut self, path: PathBuf) {
         // Cancel any in-progress scan so its threads release the rayon pool
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
 
+        self.fda_prompt = FdaPromptState::Inactive;
         save_config(&path, self.show_hidden);
         self.last_scan_path = Some(path.clone());
         self.scanning = true;
@@ -332,6 +358,7 @@ impl App {
             file_count: 0.into(),
             total_size: 0.into(),
             cancelled: false.into(),
+            permission_denied: 0.into(),
         });
         self.scan_progress = progress.clone();
 
@@ -893,13 +920,13 @@ impl eframe::App for App {
 
                     if ui.button("Open Directory...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 
                     if self.tree.is_some() && ui.button("Re-scan").clicked() {
                         if let Some(path) = self.scan_path.clone() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 
@@ -1195,6 +1222,129 @@ impl eframe::App for App {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
+            // FDA permission prompt (macOS)
+            if !matches!(self.fda_prompt, FdaPromptState::Inactive) {
+                // Poll for FDA grant when waiting
+                if let FdaPromptState::WaitingForGrant { .. } = &self.fda_prompt {
+                    if permissions::has_full_disk_access() {
+                        // FDA granted — extract path and start scan
+                        let path = match std::mem::replace(&mut self.fda_prompt, FdaPromptState::Inactive) {
+                            FdaPromptState::WaitingForGrant { pending_path } => pending_path,
+                            _ => unreachable!(),
+                        };
+                        self.start_scan(path);
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(500));
+                    }
+                }
+
+                // Render the prompt (if still active after poll)
+                if !matches!(self.fda_prompt, FdaPromptState::Inactive) {
+                    ui.vertical_centered(|ui| {
+                        let available = ui.available_height();
+                        ui.add_space(available * 0.25);
+
+                        ui.heading("\u{1F6E1}\u{FE0F} Full Disk Access Required");
+                        ui.add_space(8.0);
+
+                        let path_str = match &self.fda_prompt {
+                            FdaPromptState::Prompting { pending_path }
+                            | FdaPromptState::WaitingForGrant { pending_path } => {
+                                pending_path.display().to_string()
+                            }
+                            FdaPromptState::Inactive => String::new(),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Scanning: {path_str}"))
+                                .weak()
+                                .size(13.0),
+                        );
+                        ui.add_space(16.0);
+
+                        ui.label(
+                            egui::RichText::new(
+                                "This app needs Full Disk Access to accurately scan all folders.\n\
+                                 Without it, some directories will be skipped and sizes will be incomplete."
+                            )
+                            .size(13.0),
+                        );
+                        ui.add_space(20.0);
+
+                        let is_waiting = matches!(self.fda_prompt, FdaPromptState::WaitingForGrant { .. });
+
+                        if is_waiting {
+                            ui.spinner();
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("Waiting for permission to be granted...")
+                                    .weak()
+                                    .italics(),
+                            );
+                            ui.add_space(16.0);
+                        }
+
+                        ui.horizontal(|ui| {
+                            // Center the buttons
+                            let button_width = 200.0;
+                            let total = button_width * 2.0 + 12.0;
+                            let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
+                            ui.add_space(left_pad);
+
+                            let settings_label = if is_waiting {
+                                "Open System Settings Again"
+                            } else {
+                                "Open System Settings"
+                            };
+                            let settings_btn = egui::Button::new(
+                                egui::RichText::new(settings_label).size(14.0),
+                            )
+                            .min_size(egui::vec2(button_width, 32.0));
+
+                            if ui.add(settings_btn).clicked() {
+                                permissions::open_fda_settings();
+                                // Transition to waiting state
+                                if let FdaPromptState::Prompting { pending_path } =
+                                    std::mem::replace(&mut self.fda_prompt, FdaPromptState::Inactive)
+                                {
+                                    self.fda_prompt = FdaPromptState::WaitingForGrant { pending_path };
+                                }
+                                // If already WaitingForGrant, just re-opened settings — stays in same state
+                            }
+
+                            ui.add_space(12.0);
+
+                            let scan_btn = egui::Button::new(
+                                egui::RichText::new("Scan Anyway").size(14.0),
+                            )
+                            .min_size(egui::vec2(button_width, 32.0));
+
+                            if ui.add(scan_btn).clicked() {
+                                let path = match std::mem::replace(&mut self.fda_prompt, FdaPromptState::Inactive) {
+                                    FdaPromptState::Prompting { pending_path }
+                                    | FdaPromptState::WaitingForGrant { pending_path } => pending_path,
+                                    FdaPromptState::Inactive => unreachable!(),
+                                };
+                                self.start_scan(path);
+                            }
+                        });
+
+                        ui.add_space(12.0);
+
+                        // Cancel link
+                        if ui
+                            .add(egui::Label::new(
+                                egui::RichText::new("Cancel").weak().underline(),
+                            ).sense(egui::Sense::click()))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.fda_prompt = FdaPromptState::Inactive;
+                        }
+                    });
+                    return;
+                }
+            }
+
             // Full-page scanning UI
             if self.scanning {
                 ui.vertical_centered(|ui| {
@@ -1361,7 +1511,7 @@ impl eframe::App for App {
                         }
 
                         if let Some(path) = scan_path {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
 
                         ui.add_space(12.0);
@@ -1371,7 +1521,7 @@ impl eframe::App for App {
                     if let Some(ref last) = self.last_scan_path.clone() {
                         let label = format!("Resume: {}", last.display());
                         if ui.button(label).clicked() {
-                            self.start_scan(last.clone());
+                            self.request_scan(last.clone());
                         }
                         ui.add_space(8.0);
                     }
@@ -1379,7 +1529,7 @@ impl eframe::App for App {
                     // Open Directory — primary action on home page
                     if ui.button("Open Directory...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 

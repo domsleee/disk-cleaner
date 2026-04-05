@@ -13,31 +13,32 @@
 #[cfg(target_os = "macos")]
 pub fn has_full_disk_access() -> bool {
     use std::fs;
+    use std::io::Read;
     use std::path::Path;
 
-    // Primary probe: the TCC database is only readable with FDA.
+    // Primary probe: read the TCC database. `stat()` succeeds without FDA,
+    // but actually reading the file requires Full Disk Access.
     let tcc_db = Path::new("/Library/Application Support/com.apple.TCC/TCC.db");
-    if fs::metadata(tcc_db).is_ok() {
-        return true;
-    }
-
-    // Fallback probes: TCC-protected user files that are very likely to exist.
-    if let Some(home) = dirs::home_dir() {
-        let probes = [
-            home.join("Library/Safari/Bookmarks.plist"),
-            home.join("Library/Cookies"),
-            home.join("Library/Mail"),
-        ];
-        for path in &probes {
-            if path.exists() && fs::metadata(path).is_ok() {
-                return true;
-            }
+    if let Ok(mut f) = fs::File::open(tcc_db) {
+        let mut buf = [0u8; 1];
+        if f.read_exact(&mut buf).is_ok() {
+            return true;
         }
     }
 
-    let time_machine = std::path::Path::new("/Library/Preferences/com.apple.TimeMachine.plist");
-    if fs::metadata(time_machine).is_ok() {
-        return true;
+    // Fallback probes: try to list TCC-protected directories.
+    // `stat()` / `.exists()` bypass TCC — only `read_dir` / file reads are gated.
+    if let Some(home) = dirs::home_dir() {
+        let dir_probes = [
+            home.join("Library/Safari"),
+            home.join("Library/Cookies"),
+            home.join("Library/Mail"),
+        ];
+        for path in &dir_probes {
+            if fs::read_dir(path).is_ok() {
+                return true;
+            }
+        }
     }
 
     false

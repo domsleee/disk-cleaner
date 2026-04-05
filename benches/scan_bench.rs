@@ -71,6 +71,28 @@ fn bench_scan_large_synthetic(c: &mut Criterion) {
     });
 }
 
+/// Benchmark scanning a 20k-file tree to measure hidden-detection overhead.
+/// This is the target benchmark for the lstat-elimination optimization:
+/// before the fix, every non-dot file triggered a second lstat via is_os_hidden();
+/// after, st_flags() is read from the already-fetched Metadata.
+fn bench_scan_20k_files(c: &mut Criterion) {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 0..200 {
+        let dir = tmp.path().join(format!("dir_{i:04}"));
+        fs::create_dir(&dir).unwrap();
+        for j in 0..100 {
+            fs::write(dir.join(format!("file_{j:03}.dat")), vec![0u8; 256]).unwrap();
+        }
+    }
+
+    c.bench_function("scan_20k_files_200_dirs", |b| {
+        b.iter(|| {
+            let progress = new_progress();
+            scanner::scan_directory(tmp.path(), progress)
+        })
+    });
+}
+
 /// Benchmark scanning the project's own directory (real-world data)
 fn bench_scan_self(c: &mut Criterion) {
     let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -106,6 +128,7 @@ criterion_group!(
     bench_scan_synthetic,
     bench_scan_deep,
     bench_scan_large_synthetic,
+    bench_scan_20k_files,
     bench_scan_self,
     bench_scan_home_git,
 );

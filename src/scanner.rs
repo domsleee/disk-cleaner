@@ -190,11 +190,13 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     root_node
 }
 
-/// Convert an OsString to Box<str>, avoiding intermediate String for ASCII names.
+/// Convert an OsString to Box<str>, reusing the OsString allocation when
+/// the name is valid UTF-8 (the common case on macOS/Linux). `into_string()`
+/// transfers ownership of the inner buffer instead of copying the bytes.
 fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
-    match name.to_str() {
-        Some(s) => s.into(),
-        None => name.to_string_lossy().into_owned().into_boxed_str(),
+    match name.into_string() {
+        Ok(s) => s.into_boxed_str(),
+        Err(os) => os.to_string_lossy().into_owned().into_boxed_str(),
     }
 }
 

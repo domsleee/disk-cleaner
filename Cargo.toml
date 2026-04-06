@@ -53,6 +53,10 @@ harness = false
 name = "regression_bench"
 harness = false
 
+[[bench]]
+name = "stat_bench"
+harness = false
+
 [profile.release]
 lto = "thin"
 strip = true

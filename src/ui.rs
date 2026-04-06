@@ -176,36 +176,7 @@ pub struct CachedRow {
     pub is_file_group: bool,
 }
 
-/// Collect all visible rows into owned `CachedRow` structs. This replaces both
-/// `collect_visible_rows` (rendering data) and `collect_visible_paths` (keyboard
-/// nav), producing a single flat list that can be cached across frames.
-///
-/// When `text_cache` / `cat_cache` are provided, filter checks are O(1) lookups
-/// instead of O(N) recursive descents, bringing overall cost from O(N^2) to O(N).
-pub fn collect_cached_rows(
-    node: &FileNode,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
-) -> Vec<CachedRow> {
-    let mut result = Vec::new();
-    collect_cached_rows_into(
-        &mut result,
-        node,
-        filter,
-        category_filter,
-        show_hidden,
-        text_cache,
-        cat_cache,
-        expanded_file_groups,
-    );
-    result
-}
-
-/// Like [`collect_cached_rows`] but clears and refills `result` in-place,
+/// Clears and refills `result` with visible `CachedRow` structs in-place,
 /// reusing its heap allocation across frames.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_cached_rows_into(
@@ -303,9 +274,17 @@ fn emit_file_group(
         for child in files {
             current_path.push(child.name());
             collect_cached_rows_inner(
-                child, depth + 2, file_size, current_path,
-                filter, category_filter, show_hidden,
-                text_cache, cat_cache, expanded_file_groups, result,
+                child,
+                depth + 2,
+                file_size,
+                current_path,
+                filter,
+                category_filter,
+                show_hidden,
+                text_cache,
+                cat_cache,
+                expanded_file_groups,
+                result,
             );
             current_path.pop();
         }
@@ -376,14 +355,13 @@ fn collect_cached_rows_inner(
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
             .collect();
-        let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
-            && filter.is_empty()
-            && category_filter.is_none();
+        let should_group_files =
+            files.len() >= FILE_GROUP_THRESHOLD && filter.is_empty() && category_filter.is_none();
 
         if should_group_files {
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
-            let group_expanded = expanded_file_groups
-                .is_some_and(|s| s.contains(current_path.as_path()));
+            let group_expanded =
+                expanded_file_groups.is_some_and(|s| s.contains(current_path.as_path()));
             let file_count = files.len();
             let mut file_group_emitted = false;
 
@@ -393,28 +371,56 @@ fn collect_cached_rows_inner(
                 // Emit file group before the first dir that is smaller
                 if !file_group_emitted && child.size() < file_size {
                     emit_file_group(
-                        result, current_path, file_count, file_size,
-                        group_expanded, depth, node.size(), &files,
-                        filter, category_filter, show_hidden,
-                        text_cache, cat_cache, expanded_file_groups,
+                        result,
+                        current_path,
+                        file_count,
+                        file_size,
+                        group_expanded,
+                        depth,
+                        node.size(),
+                        &files,
+                        filter,
+                        category_filter,
+                        show_hidden,
+                        text_cache,
+                        cat_cache,
+                        expanded_file_groups,
                     );
                     file_group_emitted = true;
                 }
                 current_path.push(child.name());
                 collect_cached_rows_inner(
-                    child, depth + 1, node.size(), current_path,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups, result,
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
                 );
                 current_path.pop();
             }
             // If all dirs were larger, emit file group at the end
             if !file_group_emitted {
                 emit_file_group(
-                    result, current_path, file_count, file_size,
-                    group_expanded, depth, node.size(), &files,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups,
+                    result,
+                    current_path,
+                    file_count,
+                    file_size,
+                    group_expanded,
+                    depth,
+                    node.size(),
+                    &files,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
                 );
             }
         } else {
@@ -425,9 +431,17 @@ fn collect_cached_rows_inner(
                 }
                 current_path.push(child.name());
                 collect_cached_rows_inner(
-                    child, depth + 1, node.size(), current_path,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups, result,
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
                 );
                 current_path.pop();
             }
@@ -530,17 +544,14 @@ pub fn render_tree(
                 let size_text = format!("{:>10}", size_str);
                 let font_id =
                     egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
-                let text_galley = ui.painter().layout_no_wrap(
-                    size_text,
-                    font_id,
-                    ui.visuals().text_color(),
-                );
+                let text_galley =
+                    ui.painter()
+                        .layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
                 let right_reserved = text_margin + text_width + bar_gap + bar_width;
 
                 // Name — truncate so it never overlaps the size bar area.
-                let name_max_w =
-                    (ui.available_width() - right_reserved - 4.0).max(20.0);
+                let name_max_w = (ui.available_width() - right_reserved - 4.0).max(20.0);
                 let name_text = if row.is_hidden || row.is_file_group {
                     egui::RichText::new(&*row.name).monospace().weak()
                 } else {
@@ -577,8 +588,7 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect =
-                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
@@ -1008,8 +1018,10 @@ mod tests {
         // Expand "src" so its children are visible
         tree.as_dir_mut().unwrap().children[0].set_expanded(true);
 
-        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None);
-        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let mut rows_a = Vec::new();
+        collect_cached_rows_into(&mut rows_a, &tree, "", None, true, None, None, None);
+        let mut rows_b = Vec::new();
+        collect_cached_rows_into(&mut rows_b, &tree, "", None, true, None, None, None);
 
         assert_eq!(rows_a.len(), rows_b.len());
         for (a, b) in rows_a.iter().zip(rows_b.iter()) {
@@ -1029,12 +1041,14 @@ mod tests {
         let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
 
-        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        let mut rows = Vec::new();
+        collect_cached_rows_into(&mut rows, &tree, "", None, false, None, None, None);
         // Root + visible.txt (hidden file excluded, 1 file = no grouping)
         assert_eq!(rows.len(), 2);
         assert_eq!(&*rows[1].name, "visible.txt");
 
-        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let mut rows_all = Vec::new();
+        collect_cached_rows_into(&mut rows_all, &tree, "", None, true, None, None, None);
         // Root + "2 files" group (both files visible → grouped)
         assert_eq!(rows_all.len(), 2);
         assert!(rows_all[1].is_file_group);
@@ -1120,8 +1134,28 @@ mod tests {
         let query = "main";
         let cache = build_text_match_cache(&tree, query);
 
-        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None);
+        let mut rows_uncached = Vec::new();
+        collect_cached_rows_into(
+            &mut rows_uncached,
+            &tree,
+            query,
+            None,
+            true,
+            None,
+            None,
+            None,
+        );
+        let mut rows_cached = Vec::new();
+        collect_cached_rows_into(
+            &mut rows_cached,
+            &tree,
+            query,
+            None,
+            true,
+            Some(&cache),
+            None,
+            None,
+        );
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
@@ -1142,8 +1176,28 @@ mod tests {
         let cat = crate::categories::FileCategory::Video;
         let cache = build_category_match_cache(&tree, cat);
 
-        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None);
+        let mut rows_uncached = Vec::new();
+        collect_cached_rows_into(
+            &mut rows_uncached,
+            &tree,
+            "",
+            Some(cat),
+            true,
+            None,
+            None,
+            None,
+        );
+        let mut rows_cached = Vec::new();
+        collect_cached_rows_into(
+            &mut rows_cached,
+            &tree,
+            "",
+            Some(cat),
+            true,
+            None,
+            Some(&cache),
+            None,
+        );
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {

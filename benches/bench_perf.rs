@@ -8,6 +8,30 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
+/// Convenience wrapper for benchmarks — allocates a fresh Vec via `_into`.
+fn collect_rows(
+    node: &FileNode,
+    filter: &str,
+    category_filter: Option<disk_cleaner::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
+) -> Vec<ui::CachedRow> {
+    let mut result = Vec::with_capacity(4096);
+    ui::collect_cached_rows_into(
+        &mut result,
+        node,
+        filter,
+        category_filter,
+        show_hidden,
+        text_cache,
+        cat_cache,
+        expanded_file_groups,
+    );
+    result
+}
+
 fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
@@ -27,23 +51,15 @@ fn bench_hidden_flag_lookup(c: &mut Criterion) {
     for count in [500, 2000, 5000] {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..count {
-            fs::write(
-                tmp.path().join(format!("file_{i:05}.dat")),
-                vec![0u8; 64],
-            )
-            .unwrap();
+            fs::write(tmp.path().join(format!("file_{i:05}.dat")), vec![0u8; 64]).unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("non_dot_files", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let progress = new_progress();
-                    scanner::scan_directory(tmp.path(), progress)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("non_dot_files", count), &count, |b, _| {
+            b.iter(|| {
+                let progress = new_progress();
+                scanner::scan_directory(tmp.path(), progress)
+            })
+        });
     }
     group.finish();
 }
@@ -61,16 +77,12 @@ fn bench_many_empty_dirs(c: &mut Criterion) {
             fs::create_dir(tmp.path().join(format!("dir_{i:05}"))).unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("empty_dirs", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let progress = new_progress();
-                    scanner::scan_directory(tmp.path(), progress)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("empty_dirs", count), &count, |b, _| {
+            b.iter(|| {
+                let progress = new_progress();
+                scanner::scan_directory(tmp.path(), progress)
+            })
+        });
     }
     group.finish();
 }
@@ -158,7 +170,7 @@ fn bench_filter_cache_reuse(c: &mut Criterion) {
     group.bench_function("cold_build_50k", |b| {
         b.iter(|| {
             let cache = ui::build_text_match_cache(&tree, query);
-            ui::collect_cached_rows(
+            collect_rows(
                 &tree,
                 query,
                 None,
@@ -172,7 +184,7 @@ fn bench_filter_cache_reuse(c: &mut Criterion) {
 
     group.bench_function("warm_reuse_50k", |b| {
         b.iter(|| {
-            ui::collect_cached_rows(
+            collect_rows(
                 &tree,
                 query,
                 None,

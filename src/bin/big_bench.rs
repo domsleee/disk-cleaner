@@ -98,10 +98,19 @@ fn main() {
     let iterations = 10;
 
     // Warm-up: one throw-away call to prime caches / page in memory
-    let warmup_rows =
-        ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded_groups));
-    let row_count = warmup_rows.len();
-    std::hint::black_box(warmup_rows);
+    let mut warmup_buf: Vec<ui::CachedRow> = Vec::new();
+    ui::collect_cached_rows_into(
+        &mut warmup_buf,
+        &tree,
+        "",
+        None,
+        true,
+        None,
+        None,
+        Some(&expanded_groups),
+    );
+    let row_count = warmup_buf.len();
+    std::hint::black_box(&warmup_buf);
 
     eprintln!("Visible rows (3-level expand): {row_count}");
 
@@ -109,10 +118,19 @@ fn main() {
     let mut fresh_times = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let rows =
-            ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded_groups));
+        let mut buf: Vec<ui::CachedRow> = Vec::new();
+        ui::collect_cached_rows_into(
+            &mut buf,
+            &tree,
+            "",
+            None,
+            true,
+            None,
+            None,
+            Some(&expanded_groups),
+        );
         fresh_times.push(start.elapsed());
-        std::hint::black_box(rows);
+        std::hint::black_box(&buf);
     }
     fresh_times.sort();
 
@@ -182,8 +200,5 @@ fn main() {
         "collect_rows_reuse_median_ms={:.3}",
         reuse_median.as_secs_f64() * 1000.0
     );
-    println!(
-        "peak_rss_mb={:.1}",
-        rss_after_rows as f64 / 1_048_576.0
-    );
+    println!("peak_rss_mb={:.1}", rss_after_rows as f64 / 1_048_576.0);
 }

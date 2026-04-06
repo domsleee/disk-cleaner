@@ -3,6 +3,7 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
+#[derive(Clone)]
 pub struct FileLeaf {
     pub name: Box<str>,
     pub size: u64,
@@ -10,6 +11,7 @@ pub struct FileLeaf {
     pub hidden: bool,
 }
 
+#[derive(Clone)]
 pub struct DirNode {
     pub name: Box<str>,
     pub size: u64,
@@ -19,6 +21,7 @@ pub struct DirNode {
     pub hidden: bool,
 }
 
+#[derive(Clone)]
 pub enum FileNode {
     File(FileLeaf),
     Dir(Box<DirNode>),

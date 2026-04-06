@@ -11,7 +11,7 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -26,6 +26,14 @@ struct ScanResult {
     stats: categories::CategoryStats,
     suggestions: suggestions::SuggestionReport,
 }
+/// Result from the background filter thread.
+struct FilterResult {
+    rows: Vec<ui::CachedRow>,
+    text_cache: Option<(String, HashSet<PathBuf>)>,
+    cat_cache: Option<(categories::FileCategory, HashSet<PathBuf>)>,
+    key: RowCacheKey,
+}
+
 use tree::FileNode;
 use treemap::TreemapAction;
 
@@ -196,7 +204,7 @@ struct RowCacheKey {
 }
 
 struct App {
-    tree: Option<FileNode>,
+    tree: Option<Arc<FileNode>>,
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
@@ -261,6 +269,10 @@ struct App {
     screenshot_state: ScreenshotState,
     /// Number of screenshots saved (for tracking completion).
     screenshots_saved: u8,
+    /// Background filter computation state.
+    filter_receiver: Option<mpsc::Receiver<FilterResult>>,
+    filter_cancelled: Arc<AtomicBool>,
+    filtering: bool,
     /// Background deletion state.
     deleting: bool,
     delete_progress: Arc<AtomicUsize>,
@@ -322,6 +334,9 @@ impl Default for App {
             screenshot_prefix: None,
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
+            filter_receiver: None,
+            filter_cancelled: Arc::new(AtomicBool::new(false)),
+            filtering: false,
             deleting: false,
             delete_progress: Arc::new(AtomicUsize::new(0)),
             delete_total: 0,
@@ -331,6 +346,25 @@ impl Default for App {
 }
 
 impl App {
+    /// Get a mutable reference to the tree, cancelling any in-flight background
+    /// filter (since it holds an Arc clone of the tree and `Arc::make_mut` would
+    /// need to deep-clone if references exist).
+    fn tree_mut(&mut self) -> Option<&mut FileNode> {
+        if self.filtering {
+            self.cancel_filter();
+        }
+        self.tree.as_mut().map(Arc::make_mut)
+    }
+
+    /// Cancel any in-flight background filter computation.
+    fn cancel_filter(&mut self) {
+        self.filter_cancelled.store(true, Ordering::Relaxed);
+        self.filter_receiver = None;
+        self.filtering = false;
+        // Reset the cancelled flag for the next spawn.
+        self.filter_cancelled = Arc::new(AtomicBool::new(false));
+    }
+
     fn cancel_scan(&mut self) {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
@@ -340,6 +374,7 @@ impl App {
     fn start_scan(&mut self, path: PathBuf) {
         // Cancel any in-progress scan so its threads release the rayon pool
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
+        self.cancel_filter();
 
         save_config(&path, self.show_hidden);
         self.last_scan_path = Some(path.clone());
@@ -451,6 +486,84 @@ impl App {
         self.rows_dirty = false;
     }
 
+    /// Spawn a background thread to rebuild filter caches and row collection.
+    /// The UI keeps rendering stale rows while the computation runs.
+    fn spawn_filter_rebuild(&mut self) {
+        self.cancel_filter();
+
+        let tree = match self.tree {
+            Some(ref t) => Arc::clone(t),
+            None => {
+                self.cached_rows.clear();
+                self.text_match_cache = None;
+                self.cat_match_cache = None;
+                self.rows_dirty = false;
+                return;
+            }
+        };
+
+        let search = self.applied_search.clone();
+        let cat_filter = self.category_filter;
+        let show_hidden = self.show_hidden;
+        let expanded = self.expanded_file_groups.clone();
+        let cancelled = Arc::clone(&self.filter_cancelled);
+        let tree_version = self.tree_version;
+
+        let (tx, rx) = mpsc::channel();
+        self.filter_receiver = Some(rx);
+        self.filtering = true;
+        // Mark not-dirty so the sync path doesn't also try to rebuild.
+        self.rows_dirty = false;
+
+        thread::spawn(move || {
+            let text_cache = if !search.is_empty() {
+                Some((search.clone(), ui::build_text_match_cache(&tree, &search)))
+            } else {
+                None
+            };
+
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let cat_cache =
+                cat_filter.map(|cat| (cat, ui::build_category_match_cache(&tree, cat)));
+
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let rows = ui::collect_cached_rows(
+                &tree,
+                &search,
+                cat_filter,
+                show_hidden,
+                text_cache.as_ref().map(|(_, c)| c),
+                cat_cache.as_ref().map(|(_, c)| c),
+                Some(&expanded),
+            );
+
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let key = RowCacheKey {
+                tree_version,
+                applied_search: search,
+                category_filter: cat_filter,
+                show_hidden,
+                expanded_file_groups: expanded,
+            };
+
+            let _ = tx.send(FilterResult {
+                rows,
+                text_cache,
+                cat_cache,
+                key,
+            });
+        });
+    }
+
     /// Mark both tree-view and treemap caches as needing rebuild.
     fn mark_dirty(&mut self) {
         self.rows_dirty = true;
@@ -514,7 +627,7 @@ impl App {
                     if let Some(msg) = err {
                         self.error = Some(format!("Delete failed: {msg}"));
                     } else {
-                        if let Some(ref mut tree) = self.tree {
+                        if let Some(tree) = self.tree_mut() {
                             ui::remove_node(tree, &path);
                             // Tree mutated — invalidate filter caches.
                             self.text_match_cache = None;
@@ -578,18 +691,33 @@ impl eframe::App for App {
             eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
         }
 
-        // Apply debounced search query after 300ms of no typing.
-        // 300ms lets a normal typist finish short queries like "log" in one
-        // batch, avoiding multiple expensive full-tree cache rebuilds.
+        // Apply debounced search query after 150ms of no typing, then spawn
+        // a background thread to rebuild the filter caches + rows.
         if let Some(changed_at) = self.search_changed_at {
-            if changed_at.elapsed() >= Duration::from_millis(300) {
+            if changed_at.elapsed() >= Duration::from_millis(150) {
                 self.applied_search = self.search_query.clone();
                 self.search_changed_at = None;
-                self.rows_dirty = true;
+                self.spawn_filter_rebuild();
                 // Treemap doesn't filter by search text, so no treemap_dirty
             } else {
-                let remaining = Duration::from_millis(300).saturating_sub(changed_at.elapsed());
+                let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
                 ctx.request_repaint_after(remaining);
+            }
+        }
+
+        // Poll background filter completion.
+        if let Some(ref rx) = self.filter_receiver {
+            if let Ok(result) = rx.try_recv() {
+                self.cached_rows = result.rows;
+                self.text_match_cache = result.text_cache;
+                self.cat_match_cache = result.cat_cache;
+                self.row_cache_key = Some(result.key);
+                self.rows_dirty = false;
+                self.filtering = false;
+                self.filter_receiver = None;
+            } else {
+                // Keep polling until the filter thread finishes.
+                ctx.request_repaint();
             }
         }
 
@@ -603,10 +731,9 @@ impl eframe::App for App {
             if let Ok(result) = rx.try_recv() {
                 self.category_stats = Some(result.stats);
                 self.suggestion_report = Some(result.suggestions);
-                self.tree = Some(result.tree);
-                if let Some(ref mut t) = self.tree {
-                    tree::auto_expand(t, 0, 2);
-                }
+                let mut t = result.tree;
+                tree::auto_expand(&mut t, 0, 2);
+                self.tree = Some(Arc::new(t));
                 self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
                 self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
                 self.scanning = false;
@@ -797,7 +924,7 @@ impl eframe::App for App {
 
             if left || right {
                 if let Some(ref focused) = self.focused_path.clone() {
-                    if let Some(ref mut tree) = self.tree {
+                    if let Some(tree) = self.tree_mut() {
                         if let Some((is_dir, expanded, has_children)) =
                             ui::find_node_info(tree, focused)
                         {
@@ -840,7 +967,7 @@ impl eframe::App for App {
                     )
                 });
                 if space {
-                    if let Some(ref mut tree) = self.tree {
+                    if let Some(tree) = self.tree_mut() {
                         ui::toggle_expand(tree, focused);
                         self.mark_dirty();
                     }
@@ -935,7 +1062,7 @@ impl eframe::App for App {
 
             match result {
                 Ok(()) => {
-                    if let Some(ref mut tree) = self.tree {
+                    if let Some(tree) = self.tree_mut() {
                         ui::remove_node(tree, &path);
                         self.text_match_cache = None;
                         self.cat_match_cache = None;
@@ -1032,8 +1159,10 @@ impl eframe::App for App {
                             self.search_query.clear();
                             self.applied_search.clear();
                             self.search_changed_at = None;
-                            self.rows_dirty = true;
-                            // Treemap doesn't filter by search text, so no treemap_dirty
+                            self.spawn_filter_rebuild();
+                        }
+                        if self.filtering {
+                            ui.spinner();
                         }
                     }
 
@@ -1067,7 +1196,8 @@ impl eframe::App for App {
                             self.show_categories = !self.show_categories;
                             if !self.show_categories {
                                 self.category_filter = None;
-                                self.mark_dirty();
+                                self.spawn_filter_rebuild();
+                                self.treemap_dirty = true;
                             }
                         }
                     }
@@ -1094,6 +1224,7 @@ impl eframe::App for App {
                     ui.heading("File Types");
                     ui.add_space(4.0);
 
+                    let mut cat_filter_changed = false;
                     if let Some(ref stats) = self.category_stats {
                         let total_size: u64 = stats.entries.iter().map(|e| e.1).sum();
 
@@ -1107,8 +1238,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.category_filter = None;
-                            self.rows_dirty = true;
-                            self.treemap_dirty = true;
+                            cat_filter_changed = true;
                         }
 
                         ui.add_space(4.0);
@@ -1172,12 +1302,15 @@ impl eframe::App for App {
                                 } else {
                                     self.category_filter = Some(cat);
                                 }
-                                self.rows_dirty = true;
-                                self.treemap_dirty = true;
+                                cat_filter_changed = true;
                             }
 
                             ui.add_space(2.0);
                         }
+                    }
+                    if cat_filter_changed {
+                        self.spawn_filter_rebuild();
+                        self.treemap_dirty = true;
                     }
                 });
         }
@@ -1532,7 +1665,7 @@ impl eframe::App for App {
                                 if let Err(e) = trash::delete(path) {
                                     self.error = Some(format!("Trash failed: {e}"));
                                 } else {
-                                    if let Some(ref mut tree) = self.tree {
+                                    if let Some(tree) = self.tree_mut() {
                                         ui::remove_node(tree, path);
                                         self.text_match_cache = None;
                                         self.cat_match_cache = None;
@@ -1569,32 +1702,34 @@ impl eframe::App for App {
                             _ => {}
                         }
                     }
-                    // Apply expand/collapse changes to tree
-                    if let Some(ref mut tree) = self.tree {
+                    // Apply expand/collapse changes to tree.
+                    // Scope the &mut tree borrow so we can mutate other fields after.
+                    {
+                        let mut tree_changed = false;
                         for action in &actions {
                             match action {
                                 ui::TreeAction::ToggleExpand(path) => {
-                                    ui::toggle_expand(tree, path);
-                                    self.rows_dirty = true;
-                                    self.tree_version = self.tree_version.wrapping_add(1);
-                                    self.treemap_dirty = true;
+                                    if let Some(tree) = self.tree.as_mut().map(Arc::make_mut) {
+                                        ui::toggle_expand(tree, path);
+                                    }
+                                    tree_changed = true;
                                     self.selected_paths.clear();
                                     self.selection_anchor = None;
                                 }
                                 ui::TreeAction::ToggleFileGroup(path) => {
-                                    // path is parent_dir/__file_group__; extract parent
                                     if let Some(parent) = path.parent() {
                                         let p = parent.to_path_buf();
                                         if !self.expanded_file_groups.remove(&p) {
                                             self.expanded_file_groups.insert(p);
                                         }
                                     }
-                                    self.rows_dirty = true;
-                                    self.tree_version = self.tree_version.wrapping_add(1);
-                                    self.treemap_dirty = true;
+                                    tree_changed = true;
                                 }
                                 _ => {}
                             }
+                        }
+                        if tree_changed {
+                            self.mark_dirty();
                         }
                     }
                 }

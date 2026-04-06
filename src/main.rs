@@ -184,6 +184,17 @@ enum ScreenshotState {
     Done,
 }
 
+/// Fingerprint of the inputs that determine `collect_cached_rows` output.
+/// When the current inputs match the stored key, we skip the O(N) rebuild.
+#[derive(Clone, PartialEq)]
+struct RowCacheKey {
+    tree_version: u64,
+    applied_search: String,
+    category_filter: Option<categories::FileCategory>,
+    show_hidden: bool,
+    expanded_file_groups: HashSet<PathBuf>,
+}
+
 struct App {
     tree: Option<FileNode>,
     scanning: bool,
@@ -218,6 +229,10 @@ struct App {
     /// Cached visible row list for rendering; rebuilt when dirty.
     cached_rows: Vec<ui::CachedRow>,
     rows_dirty: bool,
+    /// Monotonic counter incremented on every tree mutation (scan, delete, expand/collapse).
+    tree_version: u64,
+    /// Inputs that produced the current `cached_rows`, used to skip redundant rebuilds.
+    row_cache_key: Option<RowCacheKey>,
     /// Cached text-match filter result, keyed by the search string that produced it.
     /// Avoids full-tree traversal on every `rows_dirty` when the filter hasn't changed.
     text_match_cache: Option<(String, HashSet<PathBuf>)>,
@@ -291,6 +306,8 @@ impl Default for App {
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
             rows_dirty: true,
+            tree_version: 0,
+            row_cache_key: None,
             text_match_cache: None,
             cat_match_cache: None,
             treemap_cache: None,
@@ -367,6 +384,20 @@ impl App {
             return;
         }
 
+        // Fast path: if the inputs that determine the row output haven't
+        // changed since the last build, skip the O(N) traversal entirely.
+        let current_key = RowCacheKey {
+            tree_version: self.tree_version,
+            applied_search: self.applied_search.clone(),
+            category_filter: self.category_filter,
+            show_hidden: self.show_hidden,
+            expanded_file_groups: self.expanded_file_groups.clone(),
+        };
+        if self.row_cache_key.as_ref() == Some(&current_key) {
+            self.rows_dirty = false;
+            return;
+        }
+
         // Only rebuild the text-match cache when the search string actually changed.
         if !self.applied_search.is_empty() {
             let needs_rebuild = match &self.text_match_cache {
@@ -399,12 +430,11 @@ impl App {
             self.cat_match_cache = None;
         }
 
-        // Drop old rows before building new ones to avoid holding two full
-        // Vec<CachedRow> in memory simultaneously (OOM risk on large trees).
-        self.cached_rows = Vec::new();
-
+        // Reuse the existing Vec allocation — clear() keeps capacity, avoiding
+        // 50K+ CachedRow re-allocations on every rebuild.
         if let Some(ref tree) = self.tree {
-            self.cached_rows = ui::collect_cached_rows(
+            ui::collect_cached_rows_into(
+                &mut self.cached_rows,
                 tree,
                 &self.applied_search,
                 self.category_filter,
@@ -413,13 +443,18 @@ impl App {
                 self.cat_match_cache.as_ref().map(|(_, c)| c),
                 Some(&self.expanded_file_groups),
             );
+        } else {
+            self.cached_rows.clear();
         }
+
+        self.row_cache_key = Some(current_key);
         self.rows_dirty = false;
     }
 
     /// Mark both tree-view and treemap caches as needing rebuild.
     fn mark_dirty(&mut self) {
         self.rows_dirty = true;
+        self.tree_version = self.tree_version.wrapping_add(1);
         self.treemap_dirty = true;
     }
 
@@ -1539,6 +1574,8 @@ impl eframe::App for App {
                                 ui::TreeAction::ToggleExpand(path) => {
                                     ui::toggle_expand(tree, path);
                                     self.rows_dirty = true;
+                                    self.tree_version = self.tree_version.wrapping_add(1);
+                                    self.treemap_dirty = true;
                                     self.selected_paths.clear();
                                     self.selection_anchor = None;
                                 }
@@ -1551,6 +1588,8 @@ impl eframe::App for App {
                                         }
                                     }
                                     self.rows_dirty = true;
+                                    self.tree_version = self.tree_version.wrapping_add(1);
+                                    self.treemap_dirty = true;
                                 }
                                 _ => {}
                             }

@@ -192,6 +192,33 @@ pub fn collect_cached_rows(
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
+    collect_cached_rows_into(
+        &mut result,
+        node,
+        filter,
+        category_filter,
+        show_hidden,
+        text_cache,
+        cat_cache,
+        expanded_file_groups,
+    );
+    result
+}
+
+/// Like [`collect_cached_rows`] but clears and refills `result` in-place,
+/// reusing its heap allocation across frames.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_cached_rows_into(
+    result: &mut Vec<CachedRow>,
+    node: &FileNode,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
+) {
+    result.clear();
     let mut path_buf = PathBuf::from(node.name());
     collect_cached_rows_inner(
         node,
@@ -204,9 +231,8 @@ pub fn collect_cached_rows(
         text_cache,
         cat_cache,
         expanded_file_groups,
-        &mut result,
+        result,
     );
-    result
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -280,7 +280,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
                 let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf { name, size: len, hidden }))
+                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
             } else {
                 None
             }

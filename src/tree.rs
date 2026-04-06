@@ -3,11 +3,35 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
+/// Bit 63 of the size field stores the hidden flag.
+/// Max representable size: 2^63 − 1 ≈ 9.2 EB (more than enough).
+const HIDDEN_BIT: u64 = 1 << 63;
+
+#[derive(Clone)]
 pub struct FileLeaf {
     pub name: Box<str>,
-    pub size: u64,
-    /// True when the file is hidden (dotfile or OS-level UF_HIDDEN flag).
-    pub hidden: bool,
+    /// Lower 63 bits: file size in bytes. Bit 63: hidden flag.
+    size_hidden: u64,
+}
+
+impl FileLeaf {
+    #[inline]
+    pub fn new(name: Box<str>, size: u64, hidden: bool) -> Self {
+        Self {
+            name,
+            size_hidden: size | if hidden { HIDDEN_BIT } else { 0 },
+        }
+    }
+
+    #[inline]
+    pub fn size(&self) -> u64 {
+        self.size_hidden & !HIDDEN_BIT
+    }
+
+    #[inline]
+    pub fn is_hidden(&self) -> bool {
+        self.size_hidden & HIDDEN_BIT != 0
+    }
 }
 
 pub struct DirNode {
@@ -34,7 +58,7 @@ impl FileNode {
 
     pub fn size(&self) -> u64 {
         match self {
-            FileNode::File(f) => f.size,
+            FileNode::File(f) => f.size(),
             FileNode::Dir(d) => d.size,
         }
     }
@@ -45,7 +69,7 @@ impl FileNode {
 
     pub fn is_hidden(&self) -> bool {
         match self {
-            FileNode::File(f) => f.hidden,
+            FileNode::File(f) => f.is_hidden(),
             FileNode::Dir(d) => d.hidden,
         }
     }
@@ -97,11 +121,11 @@ pub fn auto_expand(node: &mut FileNode, depth: usize, max_depth: usize) {
 
 #[cfg(test)]
 pub fn leaf(name: &str, size: u64) -> FileNode {
-    FileNode::File(FileLeaf {
-        name: name.into(),
+    FileNode::File(FileLeaf::new(
+        name.into(),
         size,
-        hidden: name.starts_with('.'),
-    })
+        name.starts_with('.'),
+    ))
 }
 
 #[cfg(test)]

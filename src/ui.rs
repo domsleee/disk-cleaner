@@ -235,6 +235,39 @@ pub fn collect_cached_rows_into(
     );
 }
 
+/// Collect rows for a single subtree rooted at `child`, appending to `result`.
+/// Used by the streaming filter to emit per-child chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_cached_rows_subtree(
+    result: &mut Vec<CachedRow>,
+    child: &FileNode,
+    depth: usize,
+    parent_size: u64,
+    parent_path: &mut PathBuf,
+    filter: &str,
+    category_filter: Option<crate::categories::FileCategory>,
+    show_hidden: bool,
+    text_cache: Option<&HashSet<PathBuf>>,
+    cat_cache: Option<&HashSet<PathBuf>>,
+    expanded_file_groups: Option<&HashSet<PathBuf>>,
+) {
+    parent_path.push(child.name());
+    collect_cached_rows_inner(
+        child,
+        depth,
+        parent_size,
+        parent_path,
+        filter,
+        category_filter,
+        show_hidden,
+        text_cache,
+        cat_cache,
+        expanded_file_groups,
+        result,
+    );
+    parent_path.pop();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_file_group(
     result: &mut Vec<CachedRow>,

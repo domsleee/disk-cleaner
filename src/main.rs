@@ -26,12 +26,16 @@ struct ScanResult {
     stats: categories::CategoryStats,
     suggestions: suggestions::SuggestionReport,
 }
-/// Result from the background filter thread.
-struct FilterResult {
-    rows: Vec<ui::CachedRow>,
-    text_cache: Option<(String, HashSet<PathBuf>)>,
-    cat_cache: Option<(categories::FileCategory, HashSet<PathBuf>)>,
-    key: RowCacheKey,
+/// Messages from the background filter thread.
+enum FilterMsg {
+    /// A batch of rows from one top-level subtree. UI appends these as they arrive.
+    Chunk(Vec<ui::CachedRow>),
+    /// Final message — filter is complete. Carries the caches and key for memoization.
+    Done {
+        text_cache: Option<(String, HashSet<PathBuf>)>,
+        cat_cache: Option<(categories::FileCategory, HashSet<PathBuf>)>,
+        key: RowCacheKey,
+    },
 }
 
 use tree::FileNode;
@@ -270,7 +274,7 @@ struct App {
     /// Number of screenshots saved (for tracking completion).
     screenshots_saved: u8,
     /// Background filter computation state.
-    filter_receiver: Option<mpsc::Receiver<FilterResult>>,
+    filter_receiver: Option<mpsc::Receiver<FilterMsg>>,
     filter_cancelled: Arc<AtomicBool>,
     filtering: bool,
     /// Background deletion state.
@@ -486,8 +490,8 @@ impl App {
         self.rows_dirty = false;
     }
 
-    /// Spawn a background thread to rebuild filter caches and row collection.
-    /// The UI keeps rendering stale rows while the computation runs.
+    /// Spawn a background thread to rebuild filter caches and stream row chunks.
+    /// The UI appends rows as they arrive, giving a progressive reveal.
     fn spawn_filter_rebuild(&mut self) {
         self.cancel_filter();
 
@@ -512,10 +516,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.filter_receiver = Some(rx);
         self.filtering = true;
-        // Mark not-dirty so the sync path doesn't also try to rebuild.
+        // Clear stale rows so chunks stream into a clean slate.
+        self.cached_rows.clear();
         self.rows_dirty = false;
 
         thread::spawn(move || {
+            // Phase 1: build filter caches (the expensive part).
             let text_cache = if !search.is_empty() {
                 Some((search.clone(), ui::build_text_match_cache(&tree, &search)))
             } else {
@@ -533,15 +539,51 @@ impl App {
                 return;
             }
 
-            let rows = ui::collect_cached_rows(
-                &tree,
-                &search,
-                cat_filter,
-                show_hidden,
-                text_cache.as_ref().map(|(_, c)| c),
-                cat_cache.as_ref().map(|(_, c)| c),
-                Some(&expanded),
-            );
+            let tc_ref = text_cache.as_ref().map(|(_, c)| c);
+            let cc_ref = cat_cache.as_ref().map(|(_, c)| c);
+
+            // Phase 2: stream rows per top-level child.
+            // Emit the root row first, then each child subtree as a separate chunk.
+            let mut path_buf = PathBuf::from(tree.name());
+            let root_chunk = vec![ui::CachedRow {
+                path: path_buf.clone(),
+                name: tree.name().into(),
+                size: tree.size(),
+                is_dir: tree.is_dir(),
+                expanded: tree.expanded(),
+                depth: 0,
+                parent_size: tree.size(),
+                children_count: tree.children().len(),
+                category: categories::FileCategory::Other,
+                is_hidden: tree.is_hidden(),
+                is_file_group: false,
+            }];
+            let _ = tx.send(FilterMsg::Chunk(root_chunk));
+
+            for child in tree.children() {
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let mut chunk = Vec::new();
+                ui::collect_cached_rows_subtree(
+                    &mut chunk,
+                    child,
+                    1,
+                    tree.size(),
+                    &mut path_buf,
+                    &search,
+                    cat_filter,
+                    show_hidden,
+                    tc_ref,
+                    cc_ref,
+                    Some(&expanded),
+                );
+
+                if !chunk.is_empty() {
+                    let _ = tx.send(FilterMsg::Chunk(chunk));
+                }
+            }
 
             if cancelled.load(Ordering::Relaxed) {
                 return;
@@ -555,8 +597,7 @@ impl App {
                 expanded_file_groups: expanded,
             };
 
-            let _ = tx.send(FilterResult {
-                rows,
+            let _ = tx.send(FilterMsg::Done {
                 text_cache,
                 cat_cache,
                 key,
@@ -705,18 +746,34 @@ impl eframe::App for App {
             }
         }
 
-        // Poll background filter completion.
+        // Poll background filter — drain all available chunks this frame.
         if let Some(ref rx) = self.filter_receiver {
-            if let Ok(result) = rx.try_recv() {
-                self.cached_rows = result.rows;
-                self.text_match_cache = result.text_cache;
-                self.cat_match_cache = result.cat_cache;
-                self.row_cache_key = Some(result.key);
-                self.rows_dirty = false;
-                self.filtering = false;
+            let mut got_msg = false;
+            let mut done = false;
+            while let Ok(msg) = rx.try_recv() {
+                got_msg = true;
+                match msg {
+                    FilterMsg::Chunk(rows) => {
+                        self.cached_rows.extend(rows);
+                    }
+                    FilterMsg::Done {
+                        text_cache,
+                        cat_cache,
+                        key,
+                    } => {
+                        self.text_match_cache = text_cache;
+                        self.cat_match_cache = cat_cache;
+                        self.row_cache_key = Some(key);
+                        self.rows_dirty = false;
+                        self.filtering = false;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if done {
                 self.filter_receiver = None;
-            } else {
-                // Keep polling until the filter thread finishes.
+            } else if got_msg || self.filtering {
                 ctx.request_repaint();
             }
         }
@@ -1162,7 +1219,11 @@ impl eframe::App for App {
                             self.spawn_filter_rebuild();
                         }
                         if self.filtering {
-                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("filtering...")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
                         }
                     }
 

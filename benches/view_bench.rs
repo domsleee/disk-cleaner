@@ -17,13 +17,13 @@ fn make_leaf(name: &str, size: u64) -> FileNode {
 
 fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
     let size = children.iter().map(|c| c.size()).sum();
-    FileNode::Dir(DirNode {
+    FileNode::Dir(Box::new(DirNode {
         name: name.into(),
         size,
         children,
         expanded: false,
         hidden: false,
-    })
+    }))
 }
 
 /// Wide tree with realistic file extensions for category benchmarks.

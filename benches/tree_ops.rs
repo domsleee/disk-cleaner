@@ -18,13 +18,13 @@ fn make_leaf(name: &str, size: u64) -> FileNode {
 
 fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
     let size = children.iter().map(|c| c.size()).sum();
-    FileNode::Dir(DirNode {
+    FileNode::Dir(Box::new(DirNode {
         name: name.into(),
         size,
         children,
         expanded: false,
         hidden: false,
-    })
+    }))
 }
 
 /// Wide tree: one root with `n_dirs` directories, each holding `files_per_dir` files.

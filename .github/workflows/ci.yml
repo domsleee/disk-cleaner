@@ -106,21 +106,3 @@ jobs:
 
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Verify all benchmarks compile — only need one platform
-  bench-compile:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libgtk-3-dev
-
-      - run: cargo check --benches --locked

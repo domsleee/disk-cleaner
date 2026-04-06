@@ -578,15 +578,17 @@ impl eframe::App for App {
             eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
         }
 
-        // Apply debounced search query after 150ms of no typing
+        // Apply debounced search query after 300ms of no typing.
+        // 300ms lets a normal typist finish short queries like "log" in one
+        // batch, avoiding multiple expensive full-tree cache rebuilds.
         if let Some(changed_at) = self.search_changed_at {
-            if changed_at.elapsed() >= Duration::from_millis(150) {
+            if changed_at.elapsed() >= Duration::from_millis(300) {
                 self.applied_search = self.search_query.clone();
                 self.search_changed_at = None;
                 self.rows_dirty = true;
                 // Treemap doesn't filter by search text, so no treemap_dirty
             } else {
-                let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
+                let remaining = Duration::from_millis(300).saturating_sub(changed_at.elapsed());
                 ctx.request_repaint_after(remaining);
             }
         }

@@ -288,6 +288,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         .collect();
 
     children.sort_by_key(|b| std::cmp::Reverse(b.size()));
+    children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(DirNode {

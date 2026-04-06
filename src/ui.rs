@@ -388,7 +388,7 @@ fn collect_cached_rows_inner(
             let mut file_group_emitted = false;
 
             // Interleave dirs and file group sorted by size (children are
-            // already size-sorted from the scanner).
+            // size-sorted by the post-scan sort pass).
             for child in &dirs {
                 // Emit file group before the first dir that is smaller
                 if !file_group_emitted && child.size() < file_size {

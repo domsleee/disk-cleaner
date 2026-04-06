@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::{DirNode, FileLeaf, FileNode};
+use crate::tree::{self, DirNode, FileLeaf, FileNode};
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -182,6 +182,9 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
     let mut root_node = walk_dir(root, &progress, &skip);
+    // Sort children by size descending in a single post-scan pass
+    // (removed from walk_dir to keep the I/O-bound scan path sort-free).
+    tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
     if let FileNode::Dir(d) = &mut root_node {
@@ -287,7 +290,6 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         })
         .collect();
 
-    children.sort_by_key(|b| std::cmp::Reverse(b.size()));
     children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 

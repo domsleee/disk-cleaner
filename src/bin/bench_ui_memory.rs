@@ -130,68 +130,30 @@ fn main() {
     );
     eprintln!();
 
-    // --- Phase 2: Expand all + build CachedRows (no filters) ---
+    // --- Phase 2: Expand all ---
     tree::auto_expand(&mut tree, 0, 2);
     expand_all(&mut tree);
 
     let mut interner = PathInterner::new();
 
+    // --- Phase 3: Text filter cache ("a" — broad, matches most paths) ---
     let start = Instant::now();
-    let rows = ui::collect_cached_rows(
-        &tree, "", None, true, None, None, None, &mut interner,
-    );
-    let rows_time = start.elapsed();
-    let row_count = rows.len();
-    let rss_after_rows = current_rss_bytes();
-
-    eprintln!("--- Phase 2: CachedRows (all expanded, no filter) ---");
-    eprintln!("  Rows:      {row_count}");
-    eprintln!("  Time:      {rows_time:?}");
-    eprintln!(
-        "  RSS:       {:.1} MB (Δ {:.1} MB from scan)",
-        mb(rss_after_rows),
-        mb(rss_after_rows.saturating_sub(rss_after_scan)),
-    );
-    eprintln!();
-    drop(rows);
-
-    // --- Phase 3: Text filter cache ("log") ---
-    let start = Instant::now();
-    let text_cache = ui::build_text_match_cache(&tree, "log", &mut interner);
+    let text_cache = ui::build_text_match_cache(&tree, "a", &mut interner);
     let tc_time = start.elapsed();
     let tc_size = text_cache.len();
     let rss_after_tc = current_rss_bytes();
 
-    eprintln!("--- Phase 3: Text filter cache (\"log\") ---");
+    eprintln!("--- Phase 2: Text filter cache (\"a\") ---");
     eprintln!("  Matching paths: {tc_size}");
     eprintln!("  Time:      {tc_time:?}");
     eprintln!(
-        "  RSS:       {:.1} MB (Δ {:.1} MB from rows)",
+        "  RSS:       {:.1} MB (Δ {:.1} MB from scan)",
         mb(rss_after_tc),
-        mb(rss_after_tc.saturating_sub(rss_after_rows)),
+        mb(rss_after_tc.saturating_sub(rss_after_scan)),
     );
     eprintln!();
 
-    // --- Phase 4: CachedRows with text filter ---
-    let start = Instant::now();
-    let rows_filtered = ui::collect_cached_rows(
-        &tree, "log", None, true, Some(&text_cache), None, None, &mut interner,
-    );
-    let rf_time = start.elapsed();
-    let rf_count = rows_filtered.len();
-    let rss_after_filtered = current_rss_bytes();
-
-    eprintln!("--- Phase 4: CachedRows with text filter ---");
-    eprintln!("  Rows:      {rf_count}");
-    eprintln!("  Time:      {rf_time:?}");
-    eprintln!(
-        "  RSS:       {:.1} MB (Δ {:.1} MB from text cache)",
-        mb(rss_after_filtered),
-        mb(rss_after_filtered.saturating_sub(rss_after_tc)),
-    );
-    eprintln!();
-
-    // --- Phase 5: Category filter cache (Code) ---
+    // --- Phase 4: Category filter cache (Code) ---
     let start = Instant::now();
     let cat_cache = ui::build_category_match_cache(
         &tree, FileCategory::Code, &mut interner,
@@ -200,27 +162,27 @@ fn main() {
     let cc_size = cat_cache.len();
     let rss_after_cc = current_rss_bytes();
 
-    eprintln!("--- Phase 5: Category filter cache (Code) ---");
+    eprintln!("--- Phase 3: Category filter cache (Code) ---");
     eprintln!("  Matching paths: {cc_size}");
     eprintln!("  Time:      {cc_time:?}");
     eprintln!(
-        "  RSS:       {:.1} MB (Δ {:.1} MB from filtered rows)",
+        "  RSS:       {:.1} MB (Δ {:.1} MB from text cache)",
         mb(rss_after_cc),
-        mb(rss_after_cc.saturating_sub(rss_after_filtered)),
+        mb(rss_after_cc.saturating_sub(rss_after_tc)),
     );
     eprintln!();
 
-    // --- Phase 6: CachedRows with both filters ---
+    // --- Phase 5: CachedRows with both filters (the real-app scenario) ---
     let start = Instant::now();
     let rows_both = ui::collect_cached_rows(
-        &tree, "log", Some(FileCategory::Code), true,
+        &tree, "a", Some(FileCategory::Code), true,
         Some(&text_cache), Some(&cat_cache), None, &mut interner,
     );
     let rb_time = start.elapsed();
     let rb_count = rows_both.len();
     let rss_after_both = current_rss_bytes();
 
-    eprintln!("--- Phase 6: CachedRows with both filters ---");
+    eprintln!("--- Phase 4: CachedRows with both filters ---");
     eprintln!("  Rows:      {rb_count}");
     eprintln!("  Time:      {rb_time:?}");
     eprintln!(
@@ -246,5 +208,5 @@ fn main() {
     eprintln!("===============");
 
     // Keep everything alive for accurate RSS
-    std::hint::black_box((&tree, &text_cache, &cat_cache, &rows_filtered, &rows_both, &interner));
+    std::hint::black_box((&tree, &text_cache, &cat_cache, &rows_both, &interner));
 }

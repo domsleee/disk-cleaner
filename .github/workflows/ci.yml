@@ -123,4 +123,4 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libgtk-3-dev
 
-      - run: cargo bench --locked --no-run
+      - run: cargo check --benches --locked

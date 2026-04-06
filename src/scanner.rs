@@ -232,25 +232,25 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
-        return FileNode::Dir(DirNode {
+        return FileNode::Dir(Box::new(DirNode {
             name: dir_name,
             size: 0,
             children: Vec::new(),
             expanded: false,
             hidden: dir_hidden,
-        });
+        }));
     }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
-            return FileNode::Dir(DirNode {
+            return FileNode::Dir(Box::new(DirNode {
                 name: dir_name,
                 size: 0,
                 children: Vec::new(),
                 expanded: false,
                 hidden: dir_hidden,
-            });
+            }));
         }
     };
 
@@ -290,13 +290,13 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
     children.sort_by_key(|b| std::cmp::Reverse(b.size()));
     let size = children.iter().map(|c| c.size()).sum();
 
-    FileNode::Dir(DirNode {
+    FileNode::Dir(Box::new(DirNode {
         name: dir_name,
         size,
         children,
         expanded: false,
         hidden: dir_hidden,
-    })
+    }))
 }
 
 #[cfg(test)]

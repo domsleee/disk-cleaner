@@ -21,7 +21,7 @@ pub struct DirNode {
 
 pub enum FileNode {
     File(FileLeaf),
-    Dir(DirNode),
+    Dir(Box<DirNode>),
 }
 
 impl FileNode {
@@ -107,13 +107,13 @@ pub fn leaf(name: &str, size: u64) -> FileNode {
 #[cfg(test)]
 pub fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
     let size = children.iter().map(|c| c.size()).sum();
-    FileNode::Dir(DirNode {
+    FileNode::Dir(Box::new(DirNode {
         name: name.into(),
         size,
         children,
         expanded: false,
         hidden: name.starts_with('.'),
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -27,12 +27,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Global defaults: use bash everywhere (including Windows) for consistency
+defaults:
+  run:
+    shell: bash
+
+# Environment for reproducible, fast builds
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
 jobs:
   # Quick sanity check — compiles everything, runs on one machine
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -45,16 +56,17 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libgtk-3-dev
 
-      - run: cargo check --all-targets
+      - run: cargo check --all-targets --locked
 
   # Tests on all three platforms — this is where OS differences matter
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -68,13 +80,16 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libgtk-3-dev
 
-      - run: cargo test
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - run: cargo nextest run --locked --no-fail-fast --status-level fail
 
   # Clippy only needs one platform — warnings are OS-agnostic for pure Rust
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,13 +104,13 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libgtk-3-dev
 
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Verify all 8 benchmarks compile — only need one platform
+  # Verify all benchmarks compile — only need one platform
   bench-compile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -108,4 +123,4 @@ jobs:
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libgtk-3-dev
 
-      - run: cargo bench --no-run
+      - run: cargo bench --locked --no-run

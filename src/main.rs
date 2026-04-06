@@ -218,6 +218,11 @@ struct App {
     /// Cached visible row list for rendering; rebuilt when dirty.
     cached_rows: Vec<ui::CachedRow>,
     rows_dirty: bool,
+    /// Cached text-match filter result, keyed by the search string that produced it.
+    /// Avoids full-tree traversal on every `rows_dirty` when the filter hasn't changed.
+    text_match_cache: Option<(String, HashSet<PathBuf>)>,
+    /// Cached category-match filter result, keyed by the category that produced it.
+    cat_match_cache: Option<(categories::FileCategory, HashSet<PathBuf>)>,
     /// Cached treemap layout; rebuilt when treemap_dirty.
     treemap_cache: Option<treemap::TreemapCache>,
     treemap_dirty: bool,
@@ -286,6 +291,8 @@ impl Default for App {
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
             rows_dirty: true,
+            text_match_cache: None,
+            cat_match_cache: None,
             treemap_cache: None,
             treemap_dirty: true,
             selected_paths: HashSet::new(),
@@ -322,6 +329,8 @@ impl App {
         self.scanning = true;
         self.error = None;
         self.tree = None;
+        self.text_match_cache = None;
+        self.cat_match_cache = None;
         self.selected_paths.clear();
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
@@ -358,21 +367,37 @@ impl App {
             return;
         }
 
-        let text_cache = if !self.applied_search.is_empty() {
-            self.tree
-                .as_ref()
-                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
+        // Only rebuild the text-match cache when the search string actually changed.
+        if !self.applied_search.is_empty() {
+            let needs_rebuild = match &self.text_match_cache {
+                Some((prev, _)) => *prev != self.applied_search,
+                None => true,
+            };
+            if needs_rebuild {
+                if let Some(ref t) = self.tree {
+                    let cache = ui::build_text_match_cache(t, &self.applied_search);
+                    self.text_match_cache = Some((self.applied_search.clone(), cache));
+                }
+            }
         } else {
-            None
-        };
+            self.text_match_cache = None;
+        }
 
-        let cat_cache = if let Some(cat) = self.category_filter {
-            self.tree
-                .as_ref()
-                .map(|t| ui::build_category_match_cache(t, cat))
+        // Only rebuild the category-match cache when the category filter changed.
+        if let Some(cat) = self.category_filter {
+            let needs_rebuild = match &self.cat_match_cache {
+                Some((prev, _)) => *prev != cat,
+                None => true,
+            };
+            if needs_rebuild {
+                if let Some(ref t) = self.tree {
+                    let cache = ui::build_category_match_cache(t, cat);
+                    self.cat_match_cache = Some((cat, cache));
+                }
+            }
         } else {
-            None
-        };
+            self.cat_match_cache = None;
+        }
 
         // Drop old rows before building new ones to avoid holding two full
         // Vec<CachedRow> in memory simultaneously (OOM risk on large trees).
@@ -384,8 +409,8 @@ impl App {
                 &self.applied_search,
                 self.category_filter,
                 self.show_hidden,
-                text_cache.as_ref(),
-                cat_cache.as_ref(),
+                self.text_match_cache.as_ref().map(|(_, c)| c),
+                self.cat_match_cache.as_ref().map(|(_, c)| c),
                 Some(&self.expanded_file_groups),
             );
         }
@@ -456,6 +481,9 @@ impl App {
                     } else {
                         if let Some(ref mut tree) = self.tree {
                             ui::remove_node(tree, &path);
+                            // Tree mutated — invalidate filter caches.
+                            self.text_match_cache = None;
+                            self.cat_match_cache = None;
                             self.mark_dirty();
                         }
                         deleted_paths.push(path);
@@ -547,6 +575,9 @@ impl eframe::App for App {
                 self.scanning = false;
                 self.receiver = None;
                 self.category_filter = None;
+                // New tree invalidates filter caches — force rebuild on next dirty pass.
+                self.text_match_cache = None;
+                self.cat_match_cache = None;
                 self.mark_dirty();
 
                 // Report frame-time stats for the scan
@@ -869,6 +900,8 @@ impl eframe::App for App {
                 Ok(()) => {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
+                        self.text_match_cache = None;
+                        self.cat_match_cache = None;
                         self.mark_dirty();
                     }
                     if let Some(ref mut report) = self.suggestion_report {
@@ -1464,6 +1497,8 @@ impl eframe::App for App {
                                 } else {
                                     if let Some(ref mut tree) = self.tree {
                                         ui::remove_node(tree, path);
+                                        self.text_match_cache = None;
+                                        self.cat_match_cache = None;
                                         self.mark_dirty();
                                     }
                                     if let Some(ref mut report) = self.suggestion_report {

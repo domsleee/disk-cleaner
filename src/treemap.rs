@@ -1,3 +1,4 @@
+use crate::intern::{InternedPath, PathInterner};
 use crate::tree::FileNode;
 use bytesize::ByteSize;
 use eframe::egui;
@@ -224,17 +225,21 @@ fn find_node_inner<'a>(
 }
 
 /// Build breadcrumb trail from root to `target`.
-pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
+pub fn breadcrumbs(
+    root: &FileNode,
+    target: &Path,
+    interner: &mut PathInterner,
+) -> Vec<(String, InternedPath)> {
     let root_path = PathBuf::from(root.name());
-    let mut trail = vec![(root.name().to_string(), root_path.clone())];
+    let mut trail = vec![(root.name().to_string(), interner.intern(&root_path))];
     if root_path.as_path() == target {
         return trail;
     }
     let mut buf = root_path;
-    if breadcrumbs_walk(root, target, &mut buf, &mut trail) {
+    if breadcrumbs_walk(root, target, &mut buf, &mut trail, interner) {
         trail
     } else {
-        vec![(root.name().to_string(), PathBuf::from(root.name()))]
+        vec![(root.name().to_string(), interner.intern(&PathBuf::from(root.name())))]
     }
 }
 
@@ -242,19 +247,19 @@ fn breadcrumbs_walk(
     node: &FileNode,
     target: &Path,
     buf: &mut PathBuf,
-    trail: &mut Vec<(String, PathBuf)>,
+    trail: &mut Vec<(String, InternedPath)>,
+    interner: &mut PathInterner,
 ) -> bool {
     for child in node.children() {
         buf.push(child.name());
-        let child_path = buf.clone();
-        if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
+        if buf.as_path() == target {
+            trail.push((child.name().to_string(), interner.intern(buf)));
             buf.pop();
             return true;
         }
         if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
+            trail.push((child.name().to_string(), interner.intern(buf)));
+            if breadcrumbs_walk(child, target, buf, trail, interner) {
                 buf.pop();
                 return true;
             }
@@ -270,7 +275,7 @@ fn breadcrumbs_walk(
 pub struct TreemapCache {
     pub tiles: Vec<TreemapTile>,
     pub other: Option<OtherBucket>,
-    pub breadcrumbs: Vec<(String, PathBuf)>,
+    pub breadcrumbs: Vec<(String, InternedPath)>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub view_size: u64,
     /// Pre-formatted view size string for breadcrumb display.
@@ -280,7 +285,7 @@ pub struct TreemapCache {
 
 pub struct TreemapTile {
     pub rect: egui::Rect,
-    pub path: PathBuf,
+    pub path: InternedPath,
     pub name: Box<str>,
     pub size: u64,
     pub is_dir: bool,
@@ -301,7 +306,7 @@ pub struct TreemapTile {
 
 pub struct NestedTile {
     pub rect: egui::Rect,
-    pub path: PathBuf,
+    pub path: InternedPath,
     pub name: Box<str>,
     #[allow(dead_code)]
     pub is_dir: bool,
@@ -325,17 +330,18 @@ pub struct OtherBucket {
 /// pure function whose result can be stored and reused across frames.
 pub fn build_treemap_cache(
     root: &FileNode,
-    zoom_path: &Option<PathBuf>,
+    zoom_path: &Option<InternedPath>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
     full_rect: egui::Rect,
+    interner: &mut PathInterner,
 ) -> TreemapCache {
     let root_path = PathBuf::from(root.name());
 
     // Resolve the node we're viewing and its full path
     let (view_node, view_path) = if let Some(ref zp) = zoom_path {
-        match find_node(root, zp) {
-            Some(n) => (n, zp.clone()),
+        match find_node(root, Path::new(&**zp)) {
+            Some(n) => (n, PathBuf::from(&**zp)),
             None => (root, root_path.clone()),
         }
     } else {
@@ -348,8 +354,8 @@ pub fn build_treemap_cache(
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
     let cached_breadcrumbs = zoom_path
         .as_ref()
-        .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+        .map(|p| breadcrumbs(root, Path::new(&**p), interner))
+        .unwrap_or_else(|| vec![(root.name().to_string(), interner.intern(&root_path))]);
 
     // Empty directory — return empty cache
     if view_node.children().is_empty() {
@@ -446,7 +452,8 @@ pub fn build_treemap_cache(
         if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
             continue;
         }
-        let child_path = view_path.join(child.name());
+        let child_path_buf = view_path.join(child.name());
+        let child_path = interner.intern(&child_path_buf);
         let is_dir = child.is_dir();
         let color = extension_color(child.name(), is_dir);
         let child_count = if is_dir {
@@ -461,7 +468,7 @@ pub fn build_treemap_cache(
             && r.width() > 40.0
             && r.height() > DIR_HEADER_H + 16.0
         {
-            let tiles = build_nested_tiles(child, &child_path, r, nested_budget);
+            let tiles = build_nested_tiles(child, &child_path_buf, r, nested_budget, interner);
             nested_budget = nested_budget.saturating_sub(tiles.len());
             tiles
         } else {
@@ -532,6 +539,7 @@ fn build_nested_tiles(
     node_path: &Path,
     rect: egui::Rect,
     budget: usize,
+    interner: &mut PathInterner,
 ) -> Vec<NestedTile> {
     let content_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + 1.0, rect.min.y + DIR_HEADER_H),
@@ -567,7 +575,7 @@ fn build_nested_tiles(
         if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
             continue;
         }
-        let child_path = node_path.join(child.name());
+        let child_path = interner.intern(&node_path.join(child.name()));
         let is_dir = child.is_dir();
         let color = extension_color(child.name(), is_dir);
         result.push(NestedTile {
@@ -584,8 +592,8 @@ fn build_nested_tiles(
 // ─── Treemap actions ────────────────────────────────────────────
 
 pub enum TreemapAction {
-    ZoomTo(PathBuf),
-    Focus(PathBuf),
+    ZoomTo(InternedPath),
+    Focus(InternedPath),
 }
 
 // ─── Rendering ──────────────────────────────────────────────────
@@ -611,11 +619,12 @@ pub fn render_treemap(
     cache: &mut Option<TreemapCache>,
     cache_dirty: &mut bool,
     root: &FileNode,
-    zoom_path: &Option<PathBuf>,
-    focused_path: &Option<PathBuf>,
+    zoom_path: &Option<InternedPath>,
+    focused_path: &Option<InternedPath>,
     zoom_anim_start: Option<f64>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
+    interner: &mut PathInterner,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
     let root_path = PathBuf::from(root.name());
@@ -625,13 +634,13 @@ pub fn render_treemap(
     // On first frame (cache not yet built), compute inline.
     let have_cached_crumbs = cache.is_some();
     let inline_crumbs;
-    let crumbs: &[(String, PathBuf)] = if have_cached_crumbs {
+    let crumbs: &[(String, InternedPath)] = if have_cached_crumbs {
         &cache.as_ref().unwrap().breadcrumbs
     } else {
         inline_crumbs = zoom_path
             .as_ref()
-            .map(|p| breadcrumbs(root, p))
-            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+            .map(|p| breadcrumbs(root, Path::new(&**p), interner))
+            .unwrap_or_else(|| vec![(root.name().to_string(), interner.intern(&root_path))]);
         &inline_crumbs
     };
     let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
@@ -640,7 +649,7 @@ pub fn render_treemap(
         l
     } else {
         let view_size = if let Some(ref zp) = zoom_path {
-            find_node(root, zp).map_or(root.size(), |n| n.size())
+            find_node(root, Path::new(&**zp)).map_or(root.size(), |n| n.size())
         } else {
             root.size()
         };
@@ -706,6 +715,7 @@ pub fn render_treemap(
             category_filter,
             show_hidden,
             full_rect,
+            interner,
         ));
         *cache_dirty = false;
     }
@@ -786,7 +796,7 @@ pub fn render_treemap(
             if let Some(count) = tile.child_count {
                 ui.label(format!("{} items", count));
             }
-            ui.label(tile.path.display().to_string());
+            ui.label(tile.path.as_ref());
         });
     } else if hovered_other {
         if let Some(ref other) = cache.other {
@@ -909,7 +919,7 @@ fn paint_cached_directory(
     painter: &egui::Painter,
     tile: &TreemapTile,
     is_focused: bool,
-    focused_path: &Option<PathBuf>,
+    focused_path: &Option<InternedPath>,
     alpha: f32,
     font_header: &egui::FontId,
     font_nested: &egui::FontId,
@@ -990,6 +1000,7 @@ fn paint_cached_directory(
 mod tests {
     use super::*;
     use crate::tree::{dir, leaf};
+    use std::sync::Arc;
 
     #[test]
     fn squarify_single_item() {
@@ -1086,7 +1097,8 @@ mod tests {
     #[test]
     fn breadcrumbs_root() {
         let tree = dir("root", vec![]);
-        let bc = breadcrumbs(&tree, Path::new("root"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("root"), &mut interner);
         assert_eq!(bc.len(), 1);
         assert_eq!(bc[0].0, "root");
     }
@@ -1094,7 +1106,8 @@ mod tests {
     #[test]
     fn breadcrumbs_nested() {
         let tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 10)])]);
-        let bc = breadcrumbs(&tree, Path::new("root/sub"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("root/sub"), &mut interner);
         assert_eq!(bc.len(), 2);
         assert_eq!(bc[0].0, "root");
         assert_eq!(bc[1].0, "sub");
@@ -1106,7 +1119,8 @@ mod tests {
             "root",
             vec![dir("a", vec![dir("b", vec![leaf("c.txt", 1)])])],
         );
-        let bc = breadcrumbs(&tree, Path::new("root/a/b"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("root/a/b"), &mut interner);
         assert_eq!(bc.len(), 3);
         assert_eq!(bc[2].0, "b");
     }
@@ -1114,7 +1128,8 @@ mod tests {
     #[test]
     fn breadcrumbs_missing_returns_root() {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
-        let bc = breadcrumbs(&tree, Path::new("missing"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("missing"), &mut interner);
         assert_eq!(bc.len(), 1);
     }
 
@@ -1425,7 +1440,8 @@ mod tests {
                 vec![dir("b", vec![dir("c", vec![leaf("d.txt", 1)])])],
             )],
         );
-        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"), &mut interner);
         assert_eq!(bc.len(), 4);
         assert_eq!(bc[0].0, "root");
         assert_eq!(bc[1].0, "a");
@@ -1436,7 +1452,8 @@ mod tests {
     #[test]
     fn breadcrumbs_to_file() {
         let tree = dir("root", vec![dir("sub", vec![leaf("file.txt", 10)])]);
-        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
+        let mut interner = PathInterner::new();
+        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"), &mut interner);
         assert_eq!(bc.len(), 3);
         assert_eq!(bc[2].0, "file.txt");
     }
@@ -1453,7 +1470,8 @@ mod tests {
             ],
         );
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let mut interner = PathInterner::new();
+        let cache = build_treemap_cache(&tree, &None, None, true, rect, &mut interner);
         assert_eq!(cache.tiles.len(), 2);
         assert!(cache.other.is_none());
         assert_eq!(cache.view_size, 1000);
@@ -1470,8 +1488,9 @@ mod tests {
             ],
         );
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let zoom = Some(std::path::PathBuf::from("root/sub"));
-        let cache = build_treemap_cache(&tree, &zoom, None, true, rect);
+        let mut interner = PathInterner::new();
+        let zoom: Option<InternedPath> = Some(Arc::from("root/sub"));
+        let cache = build_treemap_cache(&tree, &zoom, None, true, rect, &mut interner);
         assert_eq!(cache.tiles.len(), 2);
         assert_eq!(cache.view_size, 300);
     }
@@ -1484,7 +1503,8 @@ mod tests {
         }
         let tree = dir("root", children);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let mut interner = PathInterner::new();
+        let cache = build_treemap_cache(&tree, &None, None, true, rect, &mut interner);
         assert_eq!(cache.tiles.len(), 1);
         assert!(cache.other.is_some());
         let other = cache.other.as_ref().unwrap();
@@ -1502,7 +1522,8 @@ mod tests {
             )],
         );
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let mut interner = PathInterner::new();
+        let cache = build_treemap_cache(&tree, &None, None, true, rect, &mut interner);
         assert_eq!(cache.tiles.len(), 1);
         let tile = &cache.tiles[0];
         assert!(tile.is_dir);
@@ -1514,7 +1535,8 @@ mod tests {
     fn build_cache_hidden_filtered() {
         let tree = dir("root", vec![leaf(".hidden", 500), leaf("visible.txt", 500)]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, false, rect);
+        let mut interner = PathInterner::new();
+        let cache = build_treemap_cache(&tree, &None, None, false, rect, &mut interner);
         assert_eq!(cache.tiles.len(), 1);
         assert_eq!(&*cache.tiles[0].name, "visible.txt");
     }
@@ -1523,10 +1545,11 @@ mod tests {
     fn build_cache_tile_colors_and_paths() {
         let tree = dir("root", vec![leaf("movie.mp4", 100)]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let mut interner = PathInterner::new();
+        let cache = build_treemap_cache(&tree, &None, None, true, rect, &mut interner);
         let tile = &cache.tiles[0];
         assert_eq!(&*tile.name, "movie.mp4");
-        assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
+        assert_eq!(&*tile.path, "root/movie.mp4");
         assert_eq!(tile.color, extension_color("movie.mp4", false));
         assert!(!tile.is_dir);
         assert_eq!(tile.child_count, None);

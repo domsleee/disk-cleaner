@@ -4,6 +4,7 @@
 //! → tree building → UI logic (selection, filtering, removal, categories).
 
 use disk_cleaner::categories::{compute_stats, FileCategory};
+use disk_cleaner::intern::PathInterner;
 use disk_cleaner::scanner::{scan_directory, ScanProgress};
 use disk_cleaner::tree::auto_expand;
 use disk_cleaner::ui;
@@ -315,21 +316,20 @@ fn toggle_expand_reveals_children_in_visible_paths() {
     // Root is already expanded by scanner
 
     // Before expanding folder, inner.txt should not be visible
-    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
-    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
-    let inner_path = root.join("folder").join("inner.txt");
+    let mut interner = PathInterner::new();
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
+    let inner_str = root.join("folder").join("inner.txt").to_string_lossy().into_owned();
     assert!(
-        !paths.contains(&&inner_path),
+        !rows.iter().any(|r| *r.path == *inner_str),
         "inner.txt should not be visible when folder is collapsed"
     );
 
     // Expand the folder
     ui::toggle_expand(&mut tree, &root.join("folder"));
 
-    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
-    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
     assert!(
-        paths.contains(&&inner_path),
+        rows.iter().any(|r| *r.path == *inner_str),
         "inner.txt should be visible after expanding folder"
     );
 }
@@ -351,16 +351,16 @@ fn category_filter_shows_only_matching_files() {
     // Root is already expanded by scanner
 
     // Filter to videos only
-    let rows = ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true, None, None, None);
-    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
+    let mut interner = PathInterner::new();
+    let rows = ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true, None, None, None, &mut interner);
 
-    let video_path = root.join("video.mp4");
-    let code_path = root.join("code.rs");
-    let photo_path = root.join("photo.jpg");
+    let video_str = root.join("video.mp4").to_string_lossy().into_owned();
+    let code_str = root.join("code.rs").to_string_lossy().into_owned();
+    let photo_str = root.join("photo.jpg").to_string_lossy().into_owned();
 
-    assert!(paths.contains(&&video_path));
-    assert!(!paths.contains(&&code_path));
-    assert!(!paths.contains(&&photo_path));
+    assert!(rows.iter().any(|r| *r.path == *video_str));
+    assert!(!rows.iter().any(|r| *r.path == *code_str));
+    assert!(!rows.iter().any(|r| *r.path == *photo_str));
 }
 
 // ---------------------------------------------------------------------------
@@ -379,23 +379,24 @@ fn hidden_files_excluded_by_default() {
     // Root is already expanded by scanner
 
     // Without show_hidden, .hidden should be excluded
-    let rows = ui::collect_cached_rows(&tree, "", None, false, None, None, None);
-    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
-    assert!(!paths.contains(&&root.join(".hidden")));
-    assert!(paths.contains(&&root.join("visible.txt")));
+    let mut interner = PathInterner::new();
+    let rows = ui::collect_cached_rows(&tree, "", None, false, None, None, None, &mut interner);
+    let hidden_str = root.join(".hidden").to_string_lossy().into_owned();
+    let visible_str = root.join("visible.txt").to_string_lossy().into_owned();
+    assert!(!rows.iter().any(|r| *r.path == *hidden_str));
+    assert!(rows.iter().any(|r| *r.path == *visible_str));
 
     // With show_hidden, both files are visible but grouped into "[2 files]"
-    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
     // Root + "[2 files]" group (both files visible → grouped since ≥ threshold)
     assert!(rows.iter().any(|r| r.is_file_group && r.name.as_ref() == "[2 files]"));
 
     // When file group is expanded, individual files become visible
     let mut expanded = std::collections::HashSet::new();
-    expanded.insert(root.to_path_buf());
-    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded));
-    let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
-    assert!(paths.contains(&&root.join(".hidden")));
-    assert!(paths.contains(&&root.join("visible.txt")));
+    expanded.insert(interner.intern(root));
+    let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded), &mut interner);
+    assert!(rows.iter().any(|r| *r.path == *hidden_str));
+    assert!(rows.iter().any(|r| *r.path == *visible_str));
 }
 
 // ---------------------------------------------------------------------------

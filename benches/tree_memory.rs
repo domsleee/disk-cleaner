@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
+use disk_cleaner::intern::PathInterner;
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
 use disk_cleaner::treemap;
@@ -218,7 +219,90 @@ fn bench_tree_navigation(c: &mut Criterion) {
 
     let dir_path = tmp.path().join("dir_050");
     c.bench_function("breadcrumbs_1100_nodes", |b| {
-        b.iter(|| treemap::breadcrumbs(&tree, &dir_path))
+        b.iter(|| treemap::breadcrumbs(&tree, &dir_path, &mut PathInterner::new()))
+    });
+}
+
+/// Memory benchmark for CachedRow + filter caches with path interning.
+/// Measures peak memory of building cached rows for a large expanded tree
+/// to show the benefit of Arc<str> deduplication over PathBuf cloning.
+fn bench_cached_rows_memory(c: &mut Criterion) {
+    use disk_cleaner::intern::PathInterner;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // Build a tree with deep, repeating prefix paths to maximize dedup benefit.
+    // 200 dirs × 20 files = 4,000 files; each path shares a long common prefix.
+    for i in 0..200 {
+        let dir = tmp.path().join(format!("project/src/module_{i:03}"));
+        fs::create_dir_all(&dir).unwrap();
+        for j in 0..20 {
+            fs::write(dir.join(format!("file_{j}.rs")), vec![0u8; 1024]).unwrap();
+        }
+    }
+
+    let progress = new_progress();
+    let mut tree = scanner::scan_directory(tmp.path(), progress);
+    // Expand everything so collect_cached_rows visits every node.
+    fn expand_all(node: &mut FileNode) {
+        node.set_expanded(true);
+        if let Some(d) = node.as_dir_mut() {
+            for child in &mut d.children {
+                expand_all(child);
+            }
+        }
+    }
+    expand_all(&mut tree);
+    let nodes = count_nodes(&tree);
+
+    c.bench_function("cached_rows_memory_4000_files", |b| {
+        b.iter(|| {
+            let mut interner = PathInterner::new();
+            let rows = ui::collect_cached_rows(
+                &tree, "", None, true, None, None, None, &mut interner,
+            );
+            std::hint::black_box(rows);
+        })
+    });
+
+    // Print memory report: build rows with interner
+    {
+        reset_tracking();
+        let before = ALLOCATED.load(Ordering::SeqCst);
+        let mut interner = PathInterner::new();
+        let rows = ui::collect_cached_rows(
+            &tree, "", None, true, None, None, None, &mut interner,
+        );
+        let after = ALLOCATED.load(Ordering::SeqCst);
+        let peak = PEAK.load(Ordering::SeqCst);
+        eprintln!("\n=== Interned CachedRow Memory: {nodes} nodes, {} rows ===", rows.len());
+        eprintln!(
+            "Memory delta: {} bytes ({:.1} KB)",
+            after.saturating_sub(before),
+            after.saturating_sub(before) as f64 / 1024.0
+        );
+        eprintln!(
+            "Bytes per row: {:.0}",
+            after.saturating_sub(before) as f64 / rows.len() as f64
+        );
+        eprintln!(
+            "Peak allocation: {} bytes ({:.1} KB)",
+            peak,
+            peak as f64 / 1024.0
+        );
+        eprintln!("===================================================\n");
+        std::hint::black_box(rows);
+    }
+
+    // Memory for text filter cache + rows
+    c.bench_function("text_filter_cache_memory_4000_files", |b| {
+        b.iter(|| {
+            let mut interner = PathInterner::new();
+            let text_cache = ui::build_text_match_cache(&tree, "file_5", &mut interner);
+            let rows = ui::collect_cached_rows(
+                &tree, "file_5", None, true, Some(&text_cache), None, None, &mut interner,
+            );
+            std::hint::black_box((text_cache, rows));
+        })
     });
 }
 
@@ -229,5 +313,6 @@ criterion_group!(
     bench_tree_ops,
     bench_squarify,
     bench_tree_navigation,
+    bench_cached_rows_memory,
 );
 criterion_main!(benches);

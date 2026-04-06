@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use disk_cleaner::categories;
+use disk_cleaner::intern::PathInterner;
 use disk_cleaner::tree::{self, DirNode, FileLeaf, FileNode};
 use disk_cleaner::ui;
 
@@ -81,7 +82,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None, &mut PathInterner::new()))
         });
     }
 
@@ -92,7 +93,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None, &mut PathInterner::new()))
         });
     }
 
@@ -102,24 +103,24 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("filter_hit_uncached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, None, None, None, &mut PathInterner::new()))
         });
 
-        let text_cache = ui::build_text_match_cache(&tree, "file_5");
+        let text_cache = ui::build_text_match_cache(&tree, "file_5", &mut PathInterner::new());
         group.bench_with_input(BenchmarkId::new("filter_hit_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None, &mut PathInterner::new()))
         });
 
         group.bench_with_input(
             BenchmarkId::new("filter_miss_uncached", n),
             &tree,
-            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None, None)),
+            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None, None, &mut PathInterner::new())),
         );
 
-        let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz");
+        let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz", &mut PathInterner::new());
         group.bench_with_input(BenchmarkId::new("filter_miss_cached", n), &tree, |b, t| {
             b.iter(|| {
-                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None, None)
+                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None, None, &mut PathInterner::new())
             })
         });
     }
@@ -142,12 +143,14 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
                         None,
                         None,
                         None,
+                        &mut PathInterner::new(),
                     )
                 })
             },
         );
 
-        let cat_cache = ui::build_category_match_cache(&tree, categories::FileCategory::Video);
+        let mut interner = PathInterner::new();
+        let cat_cache = ui::build_category_match_cache(&tree, categories::FileCategory::Video, &mut interner);
         group.bench_with_input(
             BenchmarkId::new("category_video_cached", n),
             &tree,
@@ -161,6 +164,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
                         None,
                         Some(&cat_cache),
                         None,
+                        &mut PathInterner::new(),
                     )
                 })
             },
@@ -295,24 +299,24 @@ fn bench_build_filter_caches(c: &mut Criterion) {
 
         // Text cache — hit (query matches many nodes)
         group.bench_with_input(BenchmarkId::new("text_cache_hit", n), &tree, |b, t| {
-            b.iter(|| ui::build_text_match_cache(t, "file_5"))
+            b.iter(|| ui::build_text_match_cache(t, "file_5", &mut PathInterner::new()))
         });
 
         // Text cache — miss (query matches nothing)
         group.bench_with_input(BenchmarkId::new("text_cache_miss", n), &tree, |b, t| {
-            b.iter(|| ui::build_text_match_cache(t, "nonexistent_zzz"))
+            b.iter(|| ui::build_text_match_cache(t, "nonexistent_zzz", &mut PathInterner::new()))
         });
 
         // Category cache — Video
         group.bench_with_input(
             BenchmarkId::new("category_cache_video", n),
             &tree,
-            |b, t| b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Video)),
+            |b, t| b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Video, &mut PathInterner::new())),
         );
 
         // Category cache — Code
         group.bench_with_input(BenchmarkId::new("category_cache_code", n), &tree, |b, t| {
-            b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Code))
+            b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Code, &mut PathInterner::new()))
         });
     }
 
@@ -335,15 +339,17 @@ fn bench_full_filter_pipeline(c: &mut Criterion) {
         // Full text search pipeline: build cache + collect rows
         group.bench_with_input(BenchmarkId::new("text_search_e2e", n), &tree, |b, t| {
             b.iter(|| {
-                let cache = ui::build_text_match_cache(t, "file_5");
-                ui::collect_cached_rows(t, "file_5", None, true, Some(&cache), None, None)
+                let mut interner = PathInterner::new();
+                let cache = ui::build_text_match_cache(t, "file_5", &mut interner);
+                ui::collect_cached_rows(t, "file_5", None, true, Some(&cache), None, None, &mut interner)
             })
         });
 
         // Full category filter pipeline: build cache + collect rows
         group.bench_with_input(BenchmarkId::new("category_filter_e2e", n), &tree, |b, t| {
             b.iter(|| {
-                let cache = ui::build_category_match_cache(t, categories::FileCategory::Video);
+                let mut interner = PathInterner::new();
+                let cache = ui::build_category_match_cache(t, categories::FileCategory::Video, &mut interner);
                 ui::collect_cached_rows(
                     t,
                     "",
@@ -352,6 +358,7 @@ fn bench_full_filter_pipeline(c: &mut Criterion) {
                     None,
                     Some(&cache),
                     None,
+                    &mut interner,
                 )
             })
         });
@@ -374,7 +381,7 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None, &mut PathInterner::new()))
         });
     }
 
@@ -385,7 +392,7 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let n = count_nodes(&tree);
 
         group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
+            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None, &mut PathInterner::new()))
         });
     }
 
@@ -393,10 +400,10 @@ fn bench_collect_rows_large(c: &mut Criterion) {
     {
         let tree = build_expanded_tree(5000, 20);
         let n = count_nodes(&tree);
-        let text_cache = ui::build_text_match_cache(&tree, "file_5");
+        let text_cache = ui::build_text_match_cache(&tree, "file_5", &mut PathInterner::new());
 
         group.bench_with_input(BenchmarkId::new("filter_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
+            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None, &mut PathInterner::new()))
         });
     }
 

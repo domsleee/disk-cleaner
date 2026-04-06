@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytesize::ByteSize;
 use eframe::egui;
 
 use crate::icons::IconCache;
+use crate::intern::{InternedPath, PathInterner};
 use crate::tree::FileNode;
 
 /// Paint a disclosure triangle (▶ or ▼). Visual only — click detection is
@@ -57,11 +59,15 @@ pub fn node_matches(node: &FileNode, query: &str) -> bool {
 }
 
 /// Pre-compute which subtrees contain nodes matching the text query.
-/// Returns a set of paths that match or have matching descendants.
-pub fn build_text_match_cache(node: &FileNode, query: &str) -> HashSet<PathBuf> {
+/// Returns a set of interned paths that match or have matching descendants.
+pub fn build_text_match_cache(
+    node: &FileNode,
+    query: &str,
+    interner: &mut PathInterner,
+) -> HashSet<InternedPath> {
     let mut cache = HashSet::new();
     let mut buf = PathBuf::from(node.name());
-    build_text_match_inner(node, query, &mut buf, &mut cache);
+    build_text_match_inner(node, query, &mut buf, &mut cache, interner);
     cache
 }
 
@@ -69,18 +75,19 @@ fn build_text_match_inner(
     node: &FileNode,
     query: &str,
     buf: &mut PathBuf,
-    cache: &mut HashSet<PathBuf>,
+    cache: &mut HashSet<InternedPath>,
+    interner: &mut PathInterner,
 ) -> bool {
     let self_matches = contains_case_insensitive(node.name(), query);
     // Must visit ALL children (not short-circuit) so every matching subtree is cached.
     let child_matches = node.children().iter().fold(false, |acc, c| {
         buf.push(c.name());
-        let m = build_text_match_inner(c, query, buf, cache);
+        let m = build_text_match_inner(c, query, buf, cache, interner);
         buf.pop();
         acc || m
     });
     if self_matches || child_matches {
-        cache.insert(buf.clone());
+        cache.insert(interner.intern(buf));
         true
     } else {
         false
@@ -88,14 +95,15 @@ fn build_text_match_inner(
 }
 
 /// Pre-compute which subtrees contain nodes matching the given category.
-/// Returns a set of paths that match or have matching descendants.
+/// Returns a set of interned paths that match or have matching descendants.
 pub fn build_category_match_cache(
     node: &FileNode,
     cat: crate::categories::FileCategory,
-) -> HashSet<PathBuf> {
+    interner: &mut PathInterner,
+) -> HashSet<InternedPath> {
     let mut cache = HashSet::new();
     let mut buf = PathBuf::from(node.name());
-    build_cat_match_inner(node, cat, &mut buf, &mut cache);
+    build_cat_match_inner(node, cat, &mut buf, &mut cache, interner);
     cache
 }
 
@@ -103,7 +111,8 @@ fn build_cat_match_inner(
     node: &FileNode,
     cat: crate::categories::FileCategory,
     buf: &mut PathBuf,
-    cache: &mut HashSet<PathBuf>,
+    cache: &mut HashSet<InternedPath>,
+    interner: &mut PathInterner,
 ) -> bool {
     let self_matches = if node.is_dir() {
         false
@@ -113,12 +122,12 @@ fn build_cat_match_inner(
     // Must visit ALL children (not short-circuit) so every matching subtree is cached.
     let child_matches = node.children().iter().fold(false, |acc, c| {
         buf.push(c.name());
-        let m = build_cat_match_inner(c, cat, buf, cache);
+        let m = build_cat_match_inner(c, cat, buf, cache, interner);
         buf.pop();
         acc || m
     });
     if self_matches || child_matches {
-        cache.insert(buf.clone());
+        cache.insert(interner.intern(buf));
         true
     } else {
         false
@@ -139,20 +148,20 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
 
 /// Actions produced by tree rendering, applied after the frame.
 pub enum TreeAction {
-    ToggleExpand(PathBuf),
-    ToggleFileGroup(PathBuf),
+    ToggleExpand(InternedPath),
+    ToggleFileGroup(InternedPath),
     Click {
-        path: PathBuf,
+        path: InternedPath,
         shift: bool,
         toggle: bool,
     },
-    Focus(PathBuf),
-    Trash(PathBuf),
+    Focus(InternedPath),
+    Trash(InternedPath),
     TrashSelected,
-    ConfirmDelete(PathBuf),
+    ConfirmDelete(InternedPath),
     ConfirmDeleteSelected,
-    RevealInFinder(PathBuf),
-    CopyPath(PathBuf),
+    RevealInFinder(InternedPath),
+    CopyPath(InternedPath),
 }
 
 /// Minimum number of loose files in a folder to trigger grouping.
@@ -161,7 +170,7 @@ const FILE_GROUP_THRESHOLD: usize = 2;
 /// Cached row data for the visible tree. Rebuilt only when the tree state changes.
 /// Owns all data so it can outlive a single frame.
 pub struct CachedRow {
-    pub path: PathBuf,
+    pub path: InternedPath,
     pub name: Box<str>,
     pub size: u64,
     pub is_dir: bool,
@@ -182,14 +191,16 @@ pub struct CachedRow {
 ///
 /// When `text_cache` / `cat_cache` are provided, filter checks are O(1) lookups
 /// instead of O(N) recursive descents, bringing overall cost from O(N^2) to O(N).
+#[allow(clippy::too_many_arguments)]
 pub fn collect_cached_rows(
     node: &FileNode,
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&HashSet<InternedPath>>,
+    cat_cache: Option<&HashSet<InternedPath>>,
+    expanded_file_groups: Option<&HashSet<InternedPath>>,
+    interner: &mut PathInterner,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
     let mut path_buf = PathBuf::from(node.name());
@@ -205,6 +216,7 @@ pub fn collect_cached_rows(
         cat_cache,
         expanded_file_groups,
         &mut result,
+        interner,
     );
     result
 }
@@ -222,12 +234,13 @@ fn emit_file_group(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&HashSet<InternedPath>>,
+    cat_cache: Option<&HashSet<InternedPath>>,
+    expanded_file_groups: Option<&HashSet<InternedPath>>,
+    interner: &mut PathInterner,
 ) {
     result.push(CachedRow {
-        path: current_path.join("__file_group__"),
+        path: interner.intern(&current_path.join("__file_group__")),
         name: format!("[{file_count} files]").into(),
         size: file_size,
         is_dir: false,
@@ -247,6 +260,7 @@ fn emit_file_group(
                 child, depth + 2, file_size, current_path,
                 filter, category_filter, show_hidden,
                 text_cache, cat_cache, expanded_file_groups, result,
+                interner,
             );
             current_path.pop();
         }
@@ -262,25 +276,27 @@ fn collect_cached_rows_inner(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&HashSet<InternedPath>>,
+    cat_cache: Option<&HashSet<InternedPath>>,
+    expanded_file_groups: Option<&HashSet<InternedPath>>,
     result: &mut Vec<CachedRow>,
+    interner: &mut PathInterner,
 ) {
     if !show_hidden && node.is_hidden() {
         return;
     }
     // Use pre-computed caches for O(1) lookup when available,
     // fall back to recursive match for backwards compatibility.
+    let path_key = current_path.to_string_lossy();
     if let Some(tc) = text_cache {
-        if !tc.contains(current_path.as_path()) {
+        if !tc.contains(path_key.as_ref()) {
             return;
         }
     } else if !filter.is_empty() && !node_matches(node, filter) {
         return;
     }
     if let Some(cc) = cat_cache {
-        if !cc.contains(current_path.as_path()) {
+        if !cc.contains(path_key.as_ref()) {
             return;
         }
     } else if let Some(cat) = category_filter {
@@ -290,7 +306,7 @@ fn collect_cached_rows_inner(
     }
 
     result.push(CachedRow {
-        path: current_path.clone(),
+        path: interner.intern(current_path),
         name: node.name().into(),
         size: node.size(),
         is_dir: node.is_dir(),
@@ -324,7 +340,7 @@ fn collect_cached_rows_inner(
         if should_group_files {
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
             let group_expanded = expanded_file_groups
-                .is_some_and(|s| s.contains(current_path.as_path()));
+                .is_some_and(|s| s.contains(path_key.as_ref()));
             let file_count = files.len();
             let mut file_group_emitted = false;
 
@@ -338,6 +354,7 @@ fn collect_cached_rows_inner(
                         group_expanded, depth, node.size(), &files,
                         filter, category_filter, show_hidden,
                         text_cache, cat_cache, expanded_file_groups,
+                        interner,
                     );
                     file_group_emitted = true;
                 }
@@ -346,6 +363,7 @@ fn collect_cached_rows_inner(
                     child, depth + 1, node.size(), current_path,
                     filter, category_filter, show_hidden,
                     text_cache, cat_cache, expanded_file_groups, result,
+                    interner,
                 );
                 current_path.pop();
             }
@@ -356,6 +374,7 @@ fn collect_cached_rows_inner(
                     group_expanded, depth, node.size(), &files,
                     filter, category_filter, show_hidden,
                     text_cache, cat_cache, expanded_file_groups,
+                    interner,
                 );
             }
         } else {
@@ -369,6 +388,7 @@ fn collect_cached_rows_inner(
                     child, depth + 1, node.size(), current_path,
                     filter, category_filter, show_hidden,
                     text_cache, cat_cache, expanded_file_groups, result,
+                    interner,
                 );
                 current_path.pop();
             }
@@ -381,10 +401,10 @@ fn collect_cached_rows_inner(
 pub fn render_tree(
     ui: &mut egui::Ui,
     rows: &[CachedRow],
-    focused_path: &Option<PathBuf>,
+    focused_path: &Option<InternedPath>,
     icon_cache: Option<&IconCache>,
     scroll_to_focus: bool,
-    selected_paths: &HashSet<PathBuf>,
+    selected_paths: &HashSet<InternedPath>,
 ) -> Vec<TreeAction> {
     let total_rows = rows.len();
     let row_height = 20.0_f32;
@@ -532,7 +552,7 @@ pub fn render_tree(
             );
 
             // Single row interaction — toggle vs click determined by pointer position
-            let row_id = egui::Id::new(("tree_row", row.path.as_os_str()));
+            let row_id = egui::Id::new(("tree_row", row.path.as_ref()));
             let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
 
             // Use PointingHand only when hovering over the disclosure triangle area
@@ -649,20 +669,20 @@ pub fn render_tree(
             if row.is_dir {
                 let children_count = row.children_count;
                 let size = row.size;
-                let path = &row.path;
+                let path = Arc::clone(&row.path);
                 row_interact.on_hover_ui(|ui| {
                     ui.label(format!(
                         "{}\n{} \u{2014} {} items",
-                        path.display(),
+                        &*path,
                         ByteSize::b(size),
                         children_count
                     ));
                 });
             } else {
                 let size = row.size;
-                let path = &row.path;
+                let path = Arc::clone(&row.path);
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(format!("{}\n{}", path.display(), ByteSize::b(size)));
+                    ui.label(format!("{}\n{}", &*path, ByteSize::b(size)));
                 });
             }
 
@@ -946,11 +966,11 @@ mod tests {
                 leaf("Cargo.toml", 10),
             ],
         );
-        // Expand "src" so its children are visible
         tree.as_dir_mut().unwrap().children[0].set_expanded(true);
+        let mut interner = PathInterner::new();
 
-        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None);
-        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
+        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
 
         assert_eq!(rows_a.len(), rows_b.len());
         for (a, b) in rows_a.iter().zip(rows_b.iter()) {
@@ -969,14 +989,13 @@ mod tests {
     fn collect_cached_rows_filters_hidden() {
         let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
+        let mut interner = PathInterner::new();
 
-        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
-        // Root + visible.txt (hidden file excluded, 1 file = no grouping)
+        let rows = collect_cached_rows(&tree, "", None, false, None, None, None, &mut interner);
         assert_eq!(rows.len(), 2);
         assert_eq!(&*rows[1].name, "visible.txt");
 
-        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None);
-        // Root + "2 files" group (both files visible → grouped)
+        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None, &mut interner);
         assert_eq!(rows_all.len(), 2);
         assert!(rows_all[1].is_file_group);
         assert_eq!(&*rows_all[1].name, "[2 files]");
@@ -991,17 +1010,17 @@ mod tests {
                 dir("docs", vec![leaf("readme.md", 10)]),
             ],
         );
-        let cache = build_text_match_cache(&tree, "main");
-        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/src"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/src/main.rs"))); // direct match
-        assert!(!cache.contains(&PathBuf::from("root/docs"))); // no matching descendant
-        assert!(!cache.contains(&PathBuf::from("root/docs/readme.md"))); // no match
+        let mut interner = PathInterner::new();
+        let cache = build_text_match_cache(&tree, "main", &mut interner);
+        assert!(cache.contains("root")); // has matching descendant
+        assert!(cache.contains("root/src")); // has matching descendant
+        assert!(cache.contains("root/src/main.rs")); // direct match
+        assert!(!cache.contains("root/docs")); // no matching descendant
+        assert!(!cache.contains("root/docs/readme.md")); // no match
     }
 
     #[test]
     fn build_text_match_cache_visits_all_siblings() {
-        // Regression: any() short-circuits, so second matching sibling could be missed.
         let tree = dir(
             "root",
             vec![
@@ -1009,11 +1028,12 @@ mod tests {
                 dir("b", vec![leaf("main.py", 30)]),
             ],
         );
-        let cache = build_text_match_cache(&tree, "main");
-        assert!(cache.contains(&PathBuf::from("root/a")));
-        assert!(cache.contains(&PathBuf::from("root/a/main.rs")));
-        assert!(cache.contains(&PathBuf::from("root/b")));
-        assert!(cache.contains(&PathBuf::from("root/b/main.py")));
+        let mut interner = PathInterner::new();
+        let cache = build_text_match_cache(&tree, "main", &mut interner);
+        assert!(cache.contains("root/a"));
+        assert!(cache.contains("root/a/main.rs"));
+        assert!(cache.contains("root/b"));
+        assert!(cache.contains("root/b/main.py"));
     }
 
     #[test]
@@ -1025,11 +1045,12 @@ mod tests {
                 dir("b", vec![leaf("clip2.mp4", 200)]),
             ],
         );
-        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
-        assert!(cache.contains(&PathBuf::from("root/a")));
-        assert!(cache.contains(&PathBuf::from("root/a/clip1.mp4")));
-        assert!(cache.contains(&PathBuf::from("root/b")));
-        assert!(cache.contains(&PathBuf::from("root/b/clip2.mp4")));
+        let mut interner = PathInterner::new();
+        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video, &mut interner);
+        assert!(cache.contains("root/a"));
+        assert!(cache.contains("root/a/clip1.mp4"));
+        assert!(cache.contains("root/b"));
+        assert!(cache.contains("root/b/clip2.mp4"));
     }
 
     #[test]
@@ -1041,12 +1062,13 @@ mod tests {
                 dir("src", vec![leaf("main.rs", 50)]),
             ],
         );
-        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
-        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/media"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/media/movie.mp4"))); // direct match
-        assert!(!cache.contains(&PathBuf::from("root/src"))); // no matching descendant
-        assert!(!cache.contains(&PathBuf::from("root/src/main.rs"))); // wrong category
+        let mut interner = PathInterner::new();
+        let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video, &mut interner);
+        assert!(cache.contains("root")); // has matching descendant
+        assert!(cache.contains("root/media")); // has matching descendant
+        assert!(cache.contains("root/media/movie.mp4")); // direct match
+        assert!(!cache.contains("root/src")); // no matching descendant
+        assert!(!cache.contains("root/src/main.rs")); // wrong category
     }
 
     #[test]
@@ -1059,10 +1081,11 @@ mod tests {
             ],
         );
         let query = "main";
-        let cache = build_text_match_cache(&tree, query);
+        let mut interner = PathInterner::new();
+        let cache = build_text_match_cache(&tree, query, &mut interner);
 
-        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None);
+        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None, &mut interner);
+        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None, &mut interner);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
@@ -1081,10 +1104,11 @@ mod tests {
             ],
         );
         let cat = crate::categories::FileCategory::Video;
-        let cache = build_category_match_cache(&tree, cat);
+        let mut interner = PathInterner::new();
+        let cache = build_category_match_cache(&tree, cat, &mut interner);
 
-        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None);
+        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None, &mut interner);
+        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None, &mut interner);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {

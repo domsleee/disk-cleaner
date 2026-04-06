@@ -1,6 +1,7 @@
 mod app_icon;
 mod categories;
 mod icons;
+mod intern;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -10,12 +11,14 @@ mod ui;
 
 use eframe::egui;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use intern::{InternedPath, PathInterner};
 
 use scanner::ScanProgress;
 
@@ -191,17 +194,17 @@ struct App {
     scan_progress: Arc<ScanProgress>,
     receiver: Option<mpsc::Receiver<ScanResult>>,
     error: Option<String>,
-    confirm_delete: Option<PathBuf>,
+    confirm_delete: Option<InternedPath>,
     confirm_batch_delete: bool,
     search_query: String,
     /// The search query currently applied to the cached rows (debounced).
     applied_search: String,
     /// When the search text last changed (for debouncing).
     search_changed_at: Option<Instant>,
-    focused_path: Option<PathBuf>,
+    focused_path: Option<InternedPath>,
     last_scan_path: Option<PathBuf>,
     view_mode: ViewMode,
-    treemap_zoom: Option<PathBuf>,
+    treemap_zoom: Option<InternedPath>,
     treemap_zoom_anim: Option<f64>,
     volumes: Vec<scanner::VolumeInfo>,
     volumes_last_refresh: Option<std::time::Instant>,
@@ -222,11 +225,11 @@ struct App {
     treemap_cache: Option<treemap::TreemapCache>,
     treemap_dirty: bool,
     /// Selection state stored centrally for O(1) clear/select instead of O(n) tree walk.
-    selected_paths: HashSet<PathBuf>,
+    selected_paths: HashSet<InternedPath>,
     /// Anchor path for shift+click range selection.
-    selection_anchor: Option<PathBuf>,
+    selection_anchor: Option<InternedPath>,
     /// Tracks which file groups in the tree view are expanded.
-    expanded_file_groups: HashSet<PathBuf>,
+    expanded_file_groups: HashSet<InternedPath>,
     /// Smart cleanup suggestions computed after scan.
     suggestion_report: Option<suggestions::SuggestionReport>,
     /// Process start time for measuring startup latency.
@@ -241,6 +244,8 @@ struct App {
     screenshot_state: ScreenshotState,
     /// Number of screenshots saved (for tracking completion).
     screenshots_saved: u8,
+    /// Path interner for deduplicating path strings across caches and UI state.
+    path_interner: PathInterner,
     /// Background deletion state.
     deleting: bool,
     delete_progress: Arc<AtomicUsize>,
@@ -292,6 +297,7 @@ impl Default for App {
             selection_anchor: None,
             expanded_file_groups: HashSet::new(),
             suggestion_report: None,
+            path_interner: PathInterner::new(),
             process_start: None,
             scan_frame_times: Vec::new(),
             scan_start_time: None,
@@ -324,6 +330,7 @@ impl App {
         self.tree = None;
         self.selected_paths.clear();
         self.selection_anchor = None;
+        self.path_interner.clear();
         self.scan_path = Some(path.clone());
         self.scan_disk_info = scanner::disk_space(&path);
         self.scan_is_volume = self.volumes.iter().any(|v| v.path == path);
@@ -361,7 +368,7 @@ impl App {
         let text_cache = if !self.applied_search.is_empty() {
             self.tree
                 .as_ref()
-                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
+                .map(|t| ui::build_text_match_cache(t, &self.applied_search, &mut self.path_interner))
         } else {
             None
         };
@@ -369,7 +376,7 @@ impl App {
         let cat_cache = if let Some(cat) = self.category_filter {
             self.tree
                 .as_ref()
-                .map(|t| ui::build_category_match_cache(t, cat))
+                .map(|t| ui::build_category_match_cache(t, cat, &mut self.path_interner))
         } else {
             None
         };
@@ -387,6 +394,7 @@ impl App {
                 text_cache.as_ref(),
                 cat_cache.as_ref(),
                 Some(&self.expanded_file_groups),
+                &mut self.path_interner,
             );
         }
         self.rows_dirty = false;
@@ -399,12 +407,12 @@ impl App {
     }
 
     fn batch_trash_selected(&mut self) {
-        let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
+        let paths: Vec<PathBuf> = self.selected_paths.drain().map(|s| PathBuf::from(&*s)).collect();
         self.start_background_delete(paths, true);
     }
 
     fn batch_delete_selected(&mut self) {
-        let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
+        let paths: Vec<PathBuf> = self.selected_paths.drain().map(|s| PathBuf::from(&*s)).collect();
         self.start_background_delete(paths, false);
     }
 
@@ -729,26 +737,27 @@ impl eframe::App for App {
 
             if left || right {
                 if let Some(ref focused) = self.focused_path.clone() {
+                    let focused_path = Path::new(&**focused);
                     if let Some(ref mut tree) = self.tree {
                         if let Some((is_dir, expanded, has_children)) =
-                            ui::find_node_info(tree, focused)
+                            ui::find_node_info(tree, focused_path)
                         {
                             if left {
                                 if is_dir && expanded {
-                                    ui::set_expanded(tree, focused, false);
+                                    ui::set_expanded(tree, focused_path, false);
                                     self.mark_dirty();
-                                } else if let Some(parent) = ui::find_parent_path(tree, focused) {
-                                    self.focused_path = Some(parent);
+                                } else if let Some(parent) = ui::find_parent_path(tree, focused_path) {
+                                    self.focused_path = Some(self.path_interner.intern(&parent));
                                     self.selected_paths.clear();
                                     self.tree_scroll_to_focus = true;
                                 }
                             } else if right {
                                 if is_dir && !expanded && has_children {
-                                    ui::set_expanded(tree, focused, true);
+                                    ui::set_expanded(tree, focused_path, true);
                                     self.mark_dirty();
                                 } else if is_dir && expanded {
                                     let rows = &self.cached_rows;
-                                    if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                    if let Some(idx) = rows.iter().position(|r| r.path == *focused)
                                     {
                                         if idx + 1 < rows.len() {
                                             self.focused_path = Some(rows[idx + 1].path.clone());
@@ -773,14 +782,14 @@ impl eframe::App for App {
                 });
                 if space {
                     if let Some(ref mut tree) = self.tree {
-                        ui::toggle_expand(tree, focused);
+                        ui::toggle_expand(tree, Path::new(&**focused));
                         self.mark_dirty();
                     }
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
                 } else if del {
                     self.selected_paths.remove(focused);
-                    self.start_background_delete(vec![focused.clone()], true);
+                    self.start_background_delete(vec![PathBuf::from(&**focused)], true);
                     self.focused_path = None;
                 }
             }
@@ -827,7 +836,7 @@ impl eframe::App for App {
         }
 
         // Single-item delete confirmation dialog
-        let mut do_delete: Option<PathBuf> = None;
+        let mut do_delete: Option<InternedPath> = None;
         let mut close_dialog = false;
 
         if let Some(ref path) = self.confirm_delete {
@@ -837,7 +846,7 @@ impl eframe::App for App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("Permanently delete?\n{}", path.display()));
+                    ui.label(format!("Permanently delete?\n{}", &**path));
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
                             egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
@@ -858,7 +867,8 @@ impl eframe::App for App {
             self.confirm_delete = None;
         }
 
-        if let Some(path) = do_delete {
+        if let Some(ref interned) = do_delete {
+            let path = PathBuf::from(&**interned);
             let result = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {
@@ -874,7 +884,7 @@ impl eframe::App for App {
                     if let Some(ref mut report) = self.suggestion_report {
                         report.remove_paths(std::slice::from_ref(&path));
                     }
-                    self.selected_paths.remove(&path);
+                    self.selected_paths.remove(interned);
                     self.refresh_disk_info();
                 }
                 Err(e) => {
@@ -1119,10 +1129,10 @@ impl eframe::App for App {
                 if self.tree.is_some() && !self.scanning {
                     let selected_count = self.selected_paths.len();
                     if let Some(ref focused) = self.focused_path {
-                        let display = focused
+                        let display = Path::new(&**focused)
                             .file_name()
                             .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| focused.display().to_string());
+                            .unwrap_or_else(|| focused.to_string());
                         let mut status = display;
                         if selected_count > 1 {
                             status = format!("{status} ({selected_count} selected)");
@@ -1458,20 +1468,22 @@ impl eframe::App for App {
                             ui::TreeAction::Focus(path) => {
                                 self.focused_path = Some(path.clone());
                             }
-                            ui::TreeAction::Trash(path) => {
-                                if let Err(e) = trash::delete(path) {
+                            ui::TreeAction::Trash(ref interned) => {
+                                let p = Path::new(&**interned);
+                                if let Err(e) = trash::delete(p) {
                                     self.error = Some(format!("Trash failed: {e}"));
                                 } else {
                                     if let Some(ref mut tree) = self.tree {
-                                        ui::remove_node(tree, path);
+                                        ui::remove_node(tree, p);
                                         self.mark_dirty();
                                     }
+                                    let pb = PathBuf::from(&**interned);
                                     if let Some(ref mut report) = self.suggestion_report {
-                                        report.remove_paths(std::slice::from_ref(path));
+                                        report.remove_paths(std::slice::from_ref(&pb));
                                     }
                                     self.refresh_disk_info();
                                 }
-                                self.selected_paths.remove(path);
+                                self.selected_paths.remove(interned);
                             }
                             ui::TreeAction::TrashSelected => {
                                 self.batch_trash_selected();
@@ -1482,17 +1494,17 @@ impl eframe::App for App {
                             ui::TreeAction::ConfirmDeleteSelected => {
                                 self.confirm_batch_delete = true;
                             }
-                            ui::TreeAction::RevealInFinder(path) => {
+                            ui::TreeAction::RevealInFinder(ref interned) => {
                                 if let Err(e) = std::process::Command::new("open")
                                     .arg("-R")
-                                    .arg(path)
+                                    .arg(&**interned)
                                     .spawn()
                                 {
                                     self.error = Some(format!("Could not reveal in Finder: {e}"));
                                 }
                             }
-                            ui::TreeAction::CopyPath(path) => {
-                                ctx.copy_text(path.display().to_string());
+                            ui::TreeAction::CopyPath(ref interned) => {
+                                ctx.copy_text(interned.to_string());
                             }
                             _ => {}
                         }
@@ -1501,16 +1513,16 @@ impl eframe::App for App {
                     if let Some(ref mut tree) = self.tree {
                         for action in &actions {
                             match action {
-                                ui::TreeAction::ToggleExpand(path) => {
-                                    ui::toggle_expand(tree, path);
+                                ui::TreeAction::ToggleExpand(ref interned) => {
+                                    ui::toggle_expand(tree, Path::new(&**interned));
                                     self.rows_dirty = true;
                                     self.selected_paths.clear();
                                     self.selection_anchor = None;
                                 }
-                                ui::TreeAction::ToggleFileGroup(path) => {
+                                ui::TreeAction::ToggleFileGroup(ref interned) => {
                                     // path is parent_dir/__file_group__; extract parent
-                                    if let Some(parent) = path.parent() {
-                                        let p = parent.to_path_buf();
+                                    if let Some(parent) = Path::new(&**interned).parent() {
+                                        let p = self.path_interner.intern(parent);
                                         if !self.expanded_file_groups.remove(&p) {
                                             self.expanded_file_groups.insert(p);
                                         }
@@ -1534,14 +1546,14 @@ impl eframe::App for App {
                             self.treemap_zoom_anim,
                             self.category_filter,
                             self.show_hidden,
+                            &mut self.path_interner,
                         );
 
                         for action in tm_actions {
                             match action {
-                                TreemapAction::ZoomTo(path) => {
-                                    let is_root =
-                                        std::path::Path::new(tree.name()) == path.as_path();
-                                    let new_zoom = if is_root { None } else { Some(path) };
+                                TreemapAction::ZoomTo(ref path) => {
+                                    let is_root = tree.name() == &**path;
+                                    let new_zoom = if is_root { None } else { Some(path.clone()) };
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
                                         self.treemap_zoom = new_zoom;

@@ -162,7 +162,7 @@ const FILE_GROUP_THRESHOLD: usize = 2;
 /// Owns all data so it can outlive a single frame.
 pub struct CachedRow {
     pub path: PathBuf,
-    pub name: Box<str>,
+    pub name: compact_str::CompactString,
     pub size: u64,
     pub is_dir: bool,
     pub expanded: bool,

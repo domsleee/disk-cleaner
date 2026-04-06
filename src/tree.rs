@@ -3,15 +3,17 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
+use compact_str::CompactString;
+
 pub struct FileLeaf {
-    pub name: Box<str>,
+    pub name: CompactString,
     pub size: u64,
     /// True when the file is hidden (dotfile or OS-level UF_HIDDEN flag).
     pub hidden: bool,
 }
 
 pub struct DirNode {
-    pub name: Box<str>,
+    pub name: CompactString,
     pub size: u64,
     pub children: Vec<FileNode>,
     pub expanded: bool,

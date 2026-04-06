@@ -185,16 +185,16 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
     if let FileNode::Dir(d) = &mut root_node {
-        d.name = root.to_string_lossy().into_owned().into_boxed_str();
+        d.name = root.to_string_lossy().into_owned().into();
     }
     root_node
 }
 
-/// Convert an OsString to Box<str>, avoiding intermediate String for ASCII names.
-fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
+/// Convert an OsString to CompactString, avoiding intermediate String for ASCII names.
+fn os_name_to_compact(name: std::ffi::OsString) -> compact_str::CompactString {
     match name.to_str() {
         Some(s) => s.into(),
-        None => name.to_string_lossy().into_owned().into_boxed_str(),
+        None => name.to_string_lossy().into_owned().into(),
     }
 }
 
@@ -218,10 +218,10 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
 
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
-    let dir_name: Box<str> = dir
+    let dir_name: compact_str::CompactString = dir
         .file_name()
-        .map(|n| os_name_to_boxed(n.to_os_string()))
-        .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
+        .map(|n| os_name_to_compact(n.to_os_string()))
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned().into());
 
     let dir_hidden = std::fs::symlink_metadata(dir)
         .map(|m| is_hidden_from_metadata(&dir_name, &m))
@@ -278,7 +278,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.len();
                 progress.file_count.fetch_add(1, Ordering::Relaxed);
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = os_name_to_boxed(entry.file_name());
+                let name = os_name_to_compact(entry.file_name());
                 let hidden = is_hidden_from_metadata(&name, &metadata);
                 Some(FileNode::File(FileLeaf { name, size: len, hidden }))
             } else {

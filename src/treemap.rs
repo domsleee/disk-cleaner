@@ -1,5 +1,6 @@
 use crate::tree::FileNode;
 use bytesize::ByteSize;
+use compact_str::CompactString;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -274,23 +275,23 @@ pub struct TreemapCache {
     #[cfg_attr(not(test), allow(dead_code))]
     pub view_size: u64,
     /// Pre-formatted view size string for breadcrumb display.
-    pub view_size_label: Box<str>,
+    pub view_size_label: CompactString,
     pub layout_size: (f32, f32),
 }
 
 pub struct TreemapTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
-    pub name: Box<str>,
+    pub name: CompactString,
     pub size: u64,
     pub is_dir: bool,
     pub color: egui::Color32,
     pub child_count: Option<usize>,
     pub nested: Vec<NestedTile>,
     /// Pre-formatted short label (name only).
-    pub label_short: Box<str>,
+    pub label_short: CompactString,
     /// Pre-formatted tall label (name + size).
-    pub label_tall: Box<str>,
+    pub label_tall: CompactString,
     /// Pre-computed text color for this tile's background.
     pub text_color: egui::Color32,
     /// Pre-computed darkened header color (dirs only, unused for files).
@@ -302,7 +303,7 @@ pub struct TreemapTile {
 pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
-    pub name: Box<str>,
+    pub name: CompactString,
     #[allow(dead_code)]
     pub is_dir: bool,
     pub color: egui::Color32,
@@ -314,9 +315,9 @@ pub struct OtherBucket {
     pub count: usize,
     pub size: u64,
     /// Pre-formatted short label.
-    pub label_short: Box<str>,
+    pub label_short: CompactString,
     /// Pre-formatted tall label.
-    pub label_tall: Box<str>,
+    pub label_tall: CompactString,
 }
 
 /// Build a cached treemap layout from the given tree and parameters.
@@ -343,7 +344,7 @@ pub fn build_treemap_cache(
     };
 
     let view_size = view_node.size();
-    let view_size_label: Box<str> = format!("  ({})", ByteSize::b(view_size)).into();
+    let view_size_label: CompactString = format!("  ({})", ByteSize::b(view_size)).into();
 
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
     let cached_breadcrumbs = zoom_path
@@ -468,12 +469,12 @@ pub fn build_treemap_cache(
             vec![]
         };
 
-        let name: Box<str> = child.name().into();
+        let name: CompactString = child.name().into();
         let size = child.size();
         let size_str = ByteSize::b(size).to_string();
         let header_color = darken(color, 15);
-        let label_short: Box<str> = name.clone();
-        let label_tall: Box<str> = if is_dir {
+        let label_short: CompactString = name.clone();
+        let label_tall: CompactString = if is_dir {
             // For dirs: "name (size)" used in header
             format!("{} ({})", name, size_str).into()
         } else {
@@ -634,7 +635,7 @@ pub fn render_treemap(
             .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
         &inline_crumbs
     };
-    let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
+    let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_str());
     let inline_size_label;
     let size_label = if let Some(l) = view_size_label {
         l
@@ -781,7 +782,7 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
-            ui.label(egui::RichText::new(tile.name.as_ref()).strong());
+            ui.label(egui::RichText::new(tile.name.as_str()).strong());
             ui.label(ByteSize::b(tile.size).to_string());
             if let Some(count) = tile.child_count {
                 ui.label(format!("{} items", count));
@@ -798,7 +799,7 @@ pub fn render_treemap(
             )
             .gap(12.0)
             .show(|ui| {
-                ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
+                ui.label(egui::RichText::new(other.label_short.as_str()).strong());
                 ui.label(ByteSize::b(other.size).to_string());
                 ui.label("Small files collapsed into one block");
             });
@@ -941,7 +942,7 @@ fn paint_cached_directory(
         clipped.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
-            tile.label_tall.as_ref(),
+            tile.label_tall.as_str(),
             font_header.clone(),
             tc,
         );
@@ -976,7 +977,7 @@ fn paint_cached_directory(
             tile_painter.text(
                 cr.center(),
                 egui::Align2::CENTER_CENTER,
-                nested.name.as_ref(),
+                nested.name.as_str(),
                 font_nested.clone(),
                 tc,
             );

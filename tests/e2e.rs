@@ -387,7 +387,7 @@ fn hidden_files_excluded_by_default() {
     // With show_hidden, both files are visible but grouped into "[2 files]"
     let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
     // Root + "[2 files]" group (both files visible → grouped since ≥ threshold)
-    assert!(rows.iter().any(|r| r.is_file_group && r.name.as_ref() == "[2 files]"));
+    assert!(rows.iter().any(|r| r.is_file_group && r.name.as_str() == "[2 files]"));
 
     // When file group is expanded, individual files become visible
     let mut expanded = std::collections::HashSet::new();

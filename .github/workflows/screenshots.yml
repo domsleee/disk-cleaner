@@ -1,0 +1,217 @@
+name: Screenshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to screenshot'
+        required: true
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+        default: all
+      scan_path:
+        description: 'Directory to scan (leave empty for synthetic test data)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  screenshot-macos:
+    if: inputs.platforms == 'all' || inputs.platforms == 'macos'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create test directory
+        if: inputs.scan_path == ''
+        run: |
+          mkdir -p test-data/projects/rust-app/src
+          mkdir -p test-data/projects/rust-app/target/debug
+          mkdir -p test-data/documents/photos
+          mkdir -p test-data/documents/notes
+          mkdir -p test-data/.cache/old-stuff
+          dd if=/dev/zero of=test-data/projects/rust-app/target/debug/big-binary bs=1024 count=5120 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/src/main.rs bs=1 count=2048 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/Cargo.toml bs=1 count=512 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/photos/vacation.jpg bs=1024 count=3072 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/notes/todo.md bs=1 count=256 2>/dev/null
+          dd if=/dev/zero of=test-data/.cache/old-stuff/stale.tmp bs=1024 count=1024 2>/dev/null
+
+      - name: Determine scan path
+        id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
+        run: |
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=test-data" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Take screenshots
+        timeout-minutes: 5
+        run: |
+          mkdir -p screenshots
+          ./target/release/disk-cleaner "${{ steps.scan.outputs.path }}" \
+            --screenshot screenshots/macos
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots-macos
+          path: screenshots/
+          if-no-files-found: error
+
+  screenshot-linux:
+    if: inputs.platforms == 'all' || inputs.platforms == 'linux'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev xvfb mesa-utils libegl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create test directory
+        if: inputs.scan_path == ''
+        run: |
+          mkdir -p test-data/projects/rust-app/src
+          mkdir -p test-data/projects/rust-app/target/debug
+          mkdir -p test-data/documents/photos
+          mkdir -p test-data/documents/notes
+          mkdir -p test-data/.cache/old-stuff
+          dd if=/dev/zero of=test-data/projects/rust-app/target/debug/big-binary bs=1024 count=5120 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/src/main.rs bs=1 count=2048 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/Cargo.toml bs=1 count=512 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/photos/vacation.jpg bs=1024 count=3072 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/notes/todo.md bs=1 count=256 2>/dev/null
+          dd if=/dev/zero of=test-data/.cache/old-stuff/stale.tmp bs=1024 count=1024 2>/dev/null
+
+      - name: Determine scan path
+        id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
+        run: |
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=test-data" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Take screenshots
+        timeout-minutes: 5
+        run: |
+          mkdir -p screenshots
+          xvfb-run -a ./target/release/disk-cleaner "${{ steps.scan.outputs.path }}" \
+            --screenshot screenshots/linux
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots-linux
+          path: screenshots/
+          if-no-files-found: error
+
+  screenshot-windows:
+    if: inputs.platforms == 'all' || inputs.platforms == 'windows'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Mesa for software OpenGL
+        run: |
+          # Download Mesa3D software OpenGL for headless rendering
+          curl -L -o mesa.7z https://github.com/pal1000/mesa-dist-win/releases/download/24.3.2/mesa3d-24.3.2-release-msvc.7z
+          7z x mesa.7z -omesa
+          # Copy opengl32.dll next to the binary so it's found first
+          mkdir -p target/release
+          cp mesa/x64/opengl32.dll target/release/
+          cp mesa/x64/libgallium_wgl.dll target/release/
+          cp mesa/x64/libglapi.dll target/release/
+          # Set Mesa to use llvmpipe (software rasterizer)
+          echo "GALLIUM_DRIVER=llvmpipe" >> "$GITHUB_ENV"
+          echo "MESA_GL_VERSION_OVERRIDE=3.3" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create test directory
+        if: inputs.scan_path == ''
+        run: |
+          mkdir -p test-data/projects/rust-app/src
+          mkdir -p test-data/projects/rust-app/target/debug
+          mkdir -p test-data/documents/photos
+          mkdir -p test-data/documents/notes
+          mkdir -p test-data/.cache/old-stuff
+          dd if=/dev/zero of=test-data/projects/rust-app/target/debug/big-binary bs=1024 count=5120 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/src/main.rs bs=1 count=2048 2>/dev/null
+          dd if=/dev/zero of=test-data/projects/rust-app/Cargo.toml bs=1 count=512 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/photos/vacation.jpg bs=1024 count=3072 2>/dev/null
+          dd if=/dev/zero of=test-data/documents/notes/todo.md bs=1 count=256 2>/dev/null
+          dd if=/dev/zero of=test-data/.cache/old-stuff/stale.tmp bs=1024 count=1024 2>/dev/null
+
+      - name: Determine scan path
+        id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
+        run: |
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=test-data" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Take screenshots
+        timeout-minutes: 5
+        run: |
+          mkdir -p screenshots
+          # Mesa DLLs must be in same dir as binary
+          ./target/release/disk-cleaner.exe "${{ steps.scan.outputs.path }}" \
+            --screenshot screenshots/windows
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots-windows
+          path: screenshots/
+          if-no-files-found: error

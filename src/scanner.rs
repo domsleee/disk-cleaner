@@ -181,7 +181,7 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
-    let mut root_node = walk_dir(root, &progress, &skip);
+    let mut root_node = walk_dir(root, &progress, &skip, None);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
     if let FileNode::Dir(d) = &mut root_node {
@@ -218,16 +218,52 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
+/// Compute the hidden flag for a directory `DirEntry` without a full-path `lstat`.
+/// On non-macOS this is free (name check only). On macOS it calls `entry.metadata()`
+/// for `st_flags`, which uses `fstatat` on the open dirfd — cheaper than `lstat` on
+/// the reconstructed full path.
+#[cfg(target_os = "macos")]
+fn entry_is_hidden_dir(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name();
+    let name_str = name.to_string_lossy();
+    if name_str.starts_with('.') {
+        return true;
+    }
+    entry
+        .metadata()
+        .map(|m| {
+            use std::os::darwin::fs::MetadataExt;
+            m.st_flags() & UF_HIDDEN != 0
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn entry_is_hidden_dir(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name();
+    name.to_string_lossy().starts_with('.')
+}
+
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
-fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
+///
+/// `pre_hidden` allows the parent to pass a pre-computed hidden flag from its
+/// `DirEntry`, avoiding an extra `lstat` syscall in the child.
+fn walk_dir(
+    dir: &Path,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+    pre_hidden: Option<bool>,
+) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
-    let dir_hidden = std::fs::symlink_metadata(dir)
-        .map(|m| is_hidden_from_metadata(&dir_name, &m))
-        .unwrap_or_else(|_| dir_name.starts_with('.'));
+    let dir_hidden = pre_hidden.unwrap_or_else(|| {
+        std::fs::symlink_metadata(dir)
+            .map(|m| is_hidden_from_metadata(&dir_name, &m))
+            .unwrap_or_else(|_| dir_name.starts_with('.'))
+    });
 
     // Build the empty fallback only in early-return paths to avoid cloning
     // dir_name and allocating a Vec on every directory visit.
@@ -271,7 +307,8 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 if skip.contains(&path) {
                     return None;
                 }
-                Some(walk_dir(&path, progress, skip))
+                let hidden = entry_is_hidden_dir(&entry);
+                Some(walk_dir(&path, progress, skip, Some(hidden)))
             } else if ft.is_file() {
                 let metadata = entry.metadata().ok()?;
                 #[cfg(unix)]

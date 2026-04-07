@@ -3,8 +3,6 @@ mod categories;
 mod deleter;
 mod icons;
 mod scanner;
-mod suggestions;
-mod suggestions_ui;
 mod tree;
 mod treemap;
 mod ui;
@@ -31,7 +29,6 @@ fn debug_enabled() -> bool {
 struct ScanResult {
     tree: tree::FileNode,
     stats: categories::CategoryStats,
-    suggestions: suggestions::SuggestionReport,
 }
 use tree::FileNode;
 use treemap::TreemapAction;
@@ -42,7 +39,6 @@ use deleter::BackgroundDeleter;
 enum ViewMode {
     Tree,
     Treemap,
-    Suggestions,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -257,8 +253,6 @@ struct App {
     selection_anchor: Option<PathBuf>,
     /// Tracks which file groups in the tree view are expanded.
     expanded_file_groups: HashSet<PathBuf>,
-    /// Smart cleanup suggestions computed after scan.
-    suggestion_report: Option<suggestions::SuggestionReport>,
     /// Process start time for measuring startup latency.
     process_start: Option<Instant>,
     /// Frame-time tracking during scans.
@@ -318,7 +312,6 @@ impl Default for App {
             selected_paths: HashSet::new(),
             selection_anchor: None,
             expanded_file_groups: HashSet::new(),
-            suggestion_report: None,
             process_start: None,
             scan_frame_times: Vec::new(),
             scan_start_time: None,
@@ -368,12 +361,7 @@ impl App {
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
             let stats = categories::compute_stats(&tree);
-            let suggestions = suggestions::analyze(&tree);
-            let _ = tx.send(ScanResult {
-                tree,
-                stats,
-                suggestions,
-            });
+            let _ = tx.send(ScanResult { tree, stats });
         });
     }
 
@@ -448,9 +436,6 @@ impl App {
                 }
             }
             if !deleted_paths.is_empty() {
-                if let Some(ref mut report) = self.suggestion_report {
-                    report.remove_paths(&deleted_paths);
-                }
                 self.refresh_disk_info();
             }
         }
@@ -522,7 +507,6 @@ impl eframe::App for App {
         if let Some(ref rx) = self.receiver {
             if let Ok(result) = rx.try_recv() {
                 self.category_stats = Some(result.stats);
-                self.suggestion_report = Some(result.suggestions);
                 self.tree = Some(result.tree);
                 if let Some(ref mut t) = self.tree {
                     tree::auto_expand(t, 0, 2);
@@ -589,7 +573,6 @@ impl eframe::App for App {
                                 ViewMode::Tree if self.show_categories => "tree_full",
                                 ViewMode::Tree => "tree",
                                 ViewMode::Treemap => "treemap",
-                                ViewMode::Suggestions => "suggestions",
                             };
                             let label = if self.tree.is_none() && !self.scanning {
                                 "home"
@@ -644,10 +627,6 @@ impl eframe::App for App {
                                         ScreenshotState::NextView(ViewMode::Treemap);
                                 }
                                 ViewMode::Treemap => {
-                                    self.screenshot_state =
-                                        ScreenshotState::NextView(ViewMode::Suggestions);
-                                }
-                                ViewMode::Suggestions => {
                                     self.screenshot_state = ScreenshotState::Done;
                                 }
                             }
@@ -1509,32 +1488,6 @@ impl eframe::App for App {
                                 }
                             }
                         }
-                    }
-                }
-                ViewMode::Suggestions => {
-                    // Collect actions and trash paths while report is borrowed,
-                    // then apply deletions after the borrow is released.
-                    let mut trash_paths: Vec<PathBuf> = Vec::new();
-                    if let Some(ref mut report) = self.suggestion_report {
-                        let sg_actions = suggestions_ui::render_suggestions(ui, report);
-                        for action in sg_actions {
-                            match action {
-                                suggestions_ui::SuggestionAction::ToggleGroup(idx) => {
-                                    report.groups[idx].expanded = !report.groups[idx].expanded;
-                                }
-                                suggestions_ui::SuggestionAction::TrashItem(path) => {
-                                    trash_paths.push(path);
-                                }
-                                suggestions_ui::SuggestionAction::TrashGroup(idx) => {
-                                    trash_paths.extend(
-                                        report.groups[idx].items.iter().map(|i| i.path.clone()),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if !trash_paths.is_empty() {
-                        self.deleter.start(trash_paths, true);
                     }
                 }
             }

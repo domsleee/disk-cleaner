@@ -9,11 +9,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 fn make_leaf(name: &str, size: u64) -> FileNode {
-    FileNode::File(FileLeaf {
-        name: name.into(),
-        size,
-        hidden: false,
-    })
+    FileNode::File(FileLeaf::new(name.into(), size, false))
 }
 
 fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {

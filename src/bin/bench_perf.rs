@@ -10,7 +10,6 @@
 
 use disk_cleaner::categories;
 use disk_cleaner::scanner::{self, ScanProgress};
-use disk_cleaner::suggestions;
 use disk_cleaner::tree;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -146,7 +145,6 @@ fn bench_frame_time(scan_path: &Path) {
     let post_scan_start = Instant::now();
     if let Some(ref tree) = result_tree {
         let _stats = categories::compute_stats(tree);
-        let _suggestions = suggestions::analyze(tree);
     }
     if let Some(ref mut t) = result_tree {
         tree::auto_expand(t, 0, 2);
@@ -189,7 +187,7 @@ fn bench_frame_time(scan_path: &Path) {
         over_16ms as f64 / n as f64 * 100.0
     );
     eprintln!();
-    eprintln!("  Post-scan processing (categories + suggestions + auto_expand): {post_scan_dur:?}");
+    eprintln!("  Post-scan processing (categories + auto_expand): {post_scan_dur:?}");
     eprintln!("  Target: all frames < 16ms (60fps)");
     eprintln!();
 

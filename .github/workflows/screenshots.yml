@@ -64,9 +64,11 @@ jobs:
 
       - name: Determine scan path
         id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
         run: |
-          if [ -n "${{ inputs.scan_path }}" ]; then
-            echo "path=${{ inputs.scan_path }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
           else
             echo "path=test-data" >> "$GITHUB_OUTPUT"
           fi
@@ -122,9 +124,11 @@ jobs:
 
       - name: Determine scan path
         id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
         run: |
-          if [ -n "${{ inputs.scan_path }}" ]; then
-            echo "path=${{ inputs.scan_path }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
           else
             echo "path=test-data" >> "$GITHUB_OUTPUT"
           fi
@@ -188,9 +192,11 @@ jobs:
 
       - name: Determine scan path
         id: scan
+        env:
+          SCAN_PATH: ${{ inputs.scan_path }}
         run: |
-          if [ -n "${{ inputs.scan_path }}" ]; then
-            echo "path=${{ inputs.scan_path }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$SCAN_PATH" ]; then
+            echo "path=$SCAN_PATH" >> "$GITHUB_OUTPUT"
           else
             echo "path=test-data" >> "$GITHUB_OUTPUT"
           fi

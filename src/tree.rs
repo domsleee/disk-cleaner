@@ -102,6 +102,18 @@ impl FileNode {
     }
 }
 
+/// Sort children of every directory by descending size. Called once after
+/// the full tree is built so the hot `walk_dir` path does zero sorting.
+pub fn sort_children_recursive(node: &mut FileNode) {
+    if let FileNode::Dir(d) = node {
+        d.children
+            .sort_by_key(|c| std::cmp::Reverse(c.size()));
+        for child in &mut d.children {
+            sort_children_recursive(child);
+        }
+    }
+}
+
 /// Auto-expand directories that represent >25% of their parent's size,
 /// up to `max_depth` levels deep from the given node.
 pub fn auto_expand(node: &mut FileNode, depth: usize, max_depth: usize) {

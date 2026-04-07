@@ -869,28 +869,8 @@ impl eframe::App for App {
         }
 
         if let Some(path) = do_delete {
-            let result = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-
-            match result {
-                Ok(()) => {
-                    if let Some(ref mut tree) = self.tree {
-                        ui::remove_node(tree, &path);
-                        self.mark_dirty();
-                    }
-                    if let Some(ref mut report) = self.suggestion_report {
-                        report.remove_paths(std::slice::from_ref(&path));
-                    }
-                    self.selected_paths.remove(&path);
-                    self.refresh_disk_info();
-                }
-                Err(e) => {
-                    self.error = Some(format!("Delete failed: {e}"));
-                }
-            }
+            self.selected_paths.remove(&path);
+            self.start_background_delete(vec![path], false);
         }
 
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
@@ -1471,19 +1451,8 @@ impl eframe::App for App {
                                 self.focused_path = Some(path.clone());
                             }
                             ui::TreeAction::Trash(path) => {
-                                if let Err(e) = trash::delete(path) {
-                                    self.error = Some(format!("Trash failed: {e}"));
-                                } else {
-                                    if let Some(ref mut tree) = self.tree {
-                                        ui::remove_node(tree, path);
-                                        self.mark_dirty();
-                                    }
-                                    if let Some(ref mut report) = self.suggestion_report {
-                                        report.remove_paths(std::slice::from_ref(path));
-                                    }
-                                    self.refresh_disk_info();
-                                }
                                 self.selected_paths.remove(path);
+                                self.start_background_delete(vec![path.clone()], true);
                             }
                             ui::TreeAction::TrashSelected => {
                                 self.batch_trash_selected();

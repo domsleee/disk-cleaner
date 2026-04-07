@@ -279,8 +279,6 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 let len = metadata.blocks() * 512;
                 #[cfg(not(unix))]
                 let len = metadata.len();
-                progress.file_count.fetch_add(1, Ordering::Relaxed);
-                progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
                 let hidden = is_hidden_from_metadata(&name, &metadata);
                 Some(FileNode::File(FileLeaf::new(name, len, hidden)))
@@ -290,7 +288,28 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         })
         .collect();
 
-    let size = children.iter().map(|c| c.size()).sum();
+    // Batch progress update: one fetch_add pair per directory instead of per file.
+    // Subdirectory totals are already reported by their own recursive walk_dir calls.
+    let mut local_file_count: u64 = 0;
+    let mut local_file_size: u64 = 0;
+    let size = children
+        .iter()
+        .map(|c| {
+            if let FileNode::File(f) = c {
+                local_file_count += 1;
+                local_file_size += f.size();
+            }
+            c.size()
+        })
+        .sum();
+    if local_file_count > 0 {
+        progress
+            .file_count
+            .fetch_add(local_file_count, Ordering::Relaxed);
+        progress
+            .total_size
+            .fetch_add(local_file_size, Ordering::Relaxed);
+    }
 
     FileNode::Dir(Box::new(DirNode {
         name: dir_name,

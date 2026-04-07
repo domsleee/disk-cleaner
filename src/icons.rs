@@ -7,18 +7,42 @@ pub struct IconCache {
 }
 
 impl IconCache {
-    /// Load macOS system icons and cache them as egui textures.
-    /// Returns None on non-macOS or if loading fails.
+    /// Load icons and cache them as egui textures.
+    /// Uses native system icons on macOS, embedded PNGs elsewhere.
+    /// Returns None only if icon loading fails entirely.
     pub fn load(ctx: &egui::Context) -> Option<Self> {
         #[cfg(target_os = "macos")]
         {
-            macos::load_system_icons(ctx)
+            macos::load_system_icons(ctx).or_else(|| embedded::load_embedded_icons(ctx))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = ctx;
-            None
+            embedded::load_embedded_icons(ctx)
         }
+    }
+}
+
+mod embedded {
+    use super::*;
+
+    const FOLDER_PNG: &[u8] = include_bytes!("../assets/folder_icon.png");
+    const FILE_PNG: &[u8] = include_bytes!("../assets/file_icon.png");
+
+    fn load_png_texture(
+        ctx: &egui::Context,
+        name: &str,
+        png_bytes: &[u8],
+    ) -> Option<egui::TextureHandle> {
+        let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
+        let size = [img.width() as usize, img.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+        Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
+    }
+
+    pub fn load_embedded_icons(ctx: &egui::Context) -> Option<IconCache> {
+        let folder = load_png_texture(ctx, "embedded_folder_icon", FOLDER_PNG)?;
+        let file = load_png_texture(ctx, "embedded_file_icon", FILE_PNG)?;
+        Some(IconCache { folder, file })
     }
 }
 

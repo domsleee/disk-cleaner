@@ -1003,8 +1003,10 @@ impl eframe::App for App {
                     }
 
                     if self.scanning {
-                        // Full-page scanning UI is in CentralPanel; just keep repainting
-                        ctx.request_repaint();
+                        // Throttle repaints during scanning — progress counter doesn't
+                        // need 1000fps. 100ms (~10fps) keeps the UI responsive without
+                        // starving scan threads or causing frame-pacing jank.
+                        ctx.request_repaint_after(Duration::from_millis(100));
                     }
 
                     if let Some(ref err) = self.error {

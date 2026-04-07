@@ -44,9 +44,9 @@ jobs:
             platform: linux
           - os: windows-latest
             platform: windows
-    # Skip platforms not selected (unless "all")
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == matrix.platform }}
     runs-on: ${{ matrix.os }}
+    # Skip platforms not selected (unless "all")
+    if: inputs.platforms == 'all' || inputs.platforms == matrix.platform
     steps:
       - uses: actions/checkout@v6
 

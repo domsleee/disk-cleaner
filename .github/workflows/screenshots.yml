@@ -79,7 +79,7 @@ jobs:
             --screenshot screenshots/macos
 
       - name: Upload screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: screenshots-macos
           path: screenshots/
@@ -137,7 +137,7 @@ jobs:
             --screenshot screenshots/linux
 
       - name: Upload screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: screenshots-linux
           path: screenshots/
@@ -204,7 +204,7 @@ jobs:
             --screenshot screenshots/windows
 
       - name: Upload screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: screenshots-windows
           path: screenshots/

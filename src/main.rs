@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 
 use scanner::ScanProgress;
 
+fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("DISK_CLEANER_DEBUG").is_ok_and(|v| v == "1"))
+}
+
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
@@ -512,7 +518,9 @@ impl eframe::App for App {
 
         // Log startup time on first frame
         if let Some(start) = self.process_start.take() {
-            eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
+            if debug_enabled() {
+                eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
+            }
         }
 
         // Apply debounced search query after 150ms of no typing
@@ -551,29 +559,31 @@ impl eframe::App for App {
 
                 // Report frame-time stats for the scan
                 if let Some(scan_start) = self.scan_start_time.take() {
-                    let scan_dur = scan_start.elapsed();
-                    let ft = &mut self.scan_frame_times;
-                    ft.sort();
-                    let n = ft.len();
-                    if n > 0 {
-                        let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
-                        let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
-                        let over = ft
-                            .iter()
-                            .filter(|d| **d > Duration::from_millis(16))
-                            .count();
-                        eprintln!(
-                            "[perf] scan done in {scan_dur:?} ({} files)",
-                            self.last_scan_file_count
-                        );
-                        eprintln!("[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
-                            ft[0], ft[n / 2], ft[n - 1]);
-                        eprintln!(
-                            "[perf] frames >16ms: {over}/{n} ({:.1}%)",
-                            over as f64 / n as f64 * 100.0
-                        );
+                    if debug_enabled() {
+                        let scan_dur = scan_start.elapsed();
+                        let ft = &mut self.scan_frame_times;
+                        ft.sort();
+                        let n = ft.len();
+                        if n > 0 {
+                            let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
+                            let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
+                            let over = ft
+                                .iter()
+                                .filter(|d| **d > Duration::from_millis(16))
+                                .count();
+                            eprintln!(
+                                "[perf] scan done in {scan_dur:?} ({} files)",
+                                self.last_scan_file_count
+                            );
+                            eprintln!("[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
+                                ft[0], ft[n / 2], ft[n - 1]);
+                            eprintln!(
+                                "[perf] frames >16ms: {over}/{n} ({:.1}%)",
+                                over as f64 / n as f64 * 100.0
+                            );
+                        }
                     }
-                    ft.clear();
+                    self.scan_frame_times.clear();
                 }
             }
         }
@@ -1406,7 +1416,9 @@ impl eframe::App for App {
                     );
                     self.tree_scroll_to_focus = false;
                     let render_elapsed = render_start.elapsed();
-                    if render_elapsed > std::time::Duration::from_millis(16) {
+                    if debug_enabled()
+                        && render_elapsed > std::time::Duration::from_millis(16)
+                    {
                         eprintln!(
                             "[perf] tree frame: {:?} ({} rows, rebuild={})",
                             render_elapsed,
@@ -1676,8 +1688,8 @@ impl eframe::App for App {
                 });
         }
 
-        // Record frame time while scanning
-        if self.scanning {
+        // Record frame time while scanning (only when debug output is enabled)
+        if self.scanning && debug_enabled() {
             self.scan_frame_times.push(frame_start.elapsed());
         }
     }

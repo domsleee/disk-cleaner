@@ -1,4 +1,5 @@
 pub mod app_icon;
+pub mod arena_scanner;
 pub mod categories;
 pub mod icons;
 pub mod scanner;

@@ -588,6 +588,7 @@ dependencies = [
 name = "disk-cleaner"
 version = "0.2.0"
 dependencies = [
+ "bumpalo",
  "bytesize",
  "criterion",
  "dirs",

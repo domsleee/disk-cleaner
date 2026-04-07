@@ -120,6 +120,11 @@ fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
     Arc::new(platform_skip_paths(root))
 }
 
+/// Public wrapper for arena scanner prototype.
+pub fn build_skip_set_pub(root: &Path) -> Arc<HashSet<PathBuf>> {
+    build_skip_set(root)
+}
+
 #[cfg(target_os = "macos")]
 fn platform_skip_paths(root: &Path) -> HashSet<PathBuf> {
     let mut skip = HashSet::new();
@@ -343,10 +348,7 @@ mod tests {
         // Both small files fit in one block each, so they report the same on-disk size.
         #[cfg(unix)]
         {
-            let expected_per_file = fs::metadata(tmp.path().join("a.txt"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let expected_per_file = fs::metadata(tmp.path().join("a.txt")).unwrap().blocks() * 512;
             assert_eq!(root.size(), expected_per_file * 2);
         }
         #[cfg(not(unix))]
@@ -372,10 +374,7 @@ mod tests {
         // Both small files use one block each on unix, so same on-disk size
         #[cfg(unix)]
         {
-            let block_size = fs::metadata(sub.join("file.bin"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let block_size = fs::metadata(sub.join("file.bin")).unwrap().blocks() * 512;
             assert_eq!(root.size(), block_size * 2);
         }
         #[cfg(not(unix))]
@@ -419,7 +418,9 @@ mod tests {
         let file = fs::File::create(&sparse_path).unwrap();
         use std::io::{Seek, Write};
         let mut writer = std::io::BufWriter::new(file);
-        writer.seek(std::io::SeekFrom::Start(1_000_000_000)).unwrap();
+        writer
+            .seek(std::io::SeekFrom::Start(1_000_000_000))
+            .unwrap();
         writer.write_all(b"\0").unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -478,7 +479,10 @@ mod tests {
             .iter()
             .find(|c| c.name() == "visible_name.txt")
             .expect("hidden file should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN file should be marked hidden");
+        assert!(
+            hidden_node.is_hidden(),
+            "UF_HIDDEN file should be marked hidden"
+        );
 
         let normal_node = root
             .children()
@@ -510,8 +514,15 @@ mod tests {
             .iter()
             .find(|c| c.name() == "secret_dir")
             .expect("hidden dir should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN dir should be marked hidden");
-        assert_eq!(hidden_node.children().len(), 1, "hidden dir contents should still be scanned");
+        assert!(
+            hidden_node.is_hidden(),
+            "UF_HIDDEN dir should be marked hidden"
+        );
+        assert_eq!(
+            hidden_node.children().len(),
+            1,
+            "hidden dir contents should still be scanned"
+        );
 
         let normal_node = root
             .children()

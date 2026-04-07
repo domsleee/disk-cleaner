@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use disk_cleaner::scanner::{self, ScanProgress};
-use disk_cleaner::tree::FileNode;
+use disk_cleaner::tree::{FileTree, NodeId};
 use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -46,8 +46,8 @@ fn new_progress() -> Arc<ScanProgress> {
     })
 }
 
-fn count_nodes(node: &FileNode) -> usize {
-    1 + node.children().iter().map(count_nodes).sum::<usize>()
+fn count_nodes(tree: &FileTree, id: NodeId) -> usize {
+    1 + tree.children(id).iter().map(|&c| count_nodes(tree, c)).sum::<usize>()
 }
 
 /// Measure memory for building a synthetic tree (1000 files, 100 dirs)
@@ -67,7 +67,7 @@ fn bench_memory_synthetic(c: &mut Criterion) {
             let progress = new_progress();
             let tree = scanner::scan_directory(tmp.path(), progress);
             let after = ALLOCATED.load(Ordering::SeqCst);
-            let nodes = count_nodes(&tree);
+            let nodes = count_nodes(&tree, tree.root());
             // Use black_box to prevent optimization
             std::hint::black_box((after.saturating_sub(before), nodes));
             tree
@@ -80,7 +80,7 @@ fn bench_memory_synthetic(c: &mut Criterion) {
     let before = ALLOCATED.load(Ordering::SeqCst);
     let tree = scanner::scan_directory(tmp.path(), progress.clone());
     let after = ALLOCATED.load(Ordering::SeqCst);
-    let nodes = count_nodes(&tree);
+    let nodes = count_nodes(&tree, tree.root());
     let files = progress.file_count.load(Ordering::Relaxed);
     eprintln!("\n=== Memory Report: 1000 files / 100 dirs ===");
     eprintln!("Nodes: {nodes}");
@@ -117,12 +117,13 @@ fn bench_tree_ops(c: &mut Criterion) {
     let progress = new_progress();
     let tree = scanner::scan_directory(tmp.path(), progress);
 
+    let root = tree.root();
     c.bench_function("node_matches_hit_1100_nodes", |b| {
-        b.iter(|| ui::node_matches(&tree, "file_5"))
+        b.iter(|| ui::node_matches(&tree, root, "file_5"))
     });
 
     c.bench_function("node_matches_miss_1100_nodes", |b| {
-        b.iter(|| ui::node_matches(&tree, "nonexistent_zzz"))
+        b.iter(|| ui::node_matches(&tree, root, "nonexistent_zzz"))
     });
 
     // count_selected is benchmarked in tree_ops.rs with configurable selection sets
@@ -152,7 +153,7 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
     let before = ALLOCATED.load(Ordering::SeqCst);
     let tree = scanner::scan_directory(tmp.path(), progress.clone());
     let after = ALLOCATED.load(Ordering::SeqCst);
-    let nodes = count_nodes(&tree);
+    let nodes = count_nodes(&tree, tree.root());
     let files = progress.file_count.load(Ordering::Relaxed);
     eprintln!("\n=== Memory Report: 10,000 files / 500 dirs ===");
     eprintln!("Nodes: {nodes}");

@@ -149,7 +149,8 @@ fn bench_frame_time(scan_path: &Path) {
         let _suggestions = suggestions::analyze(tree);
     }
     if let Some(ref mut t) = result_tree {
-        tree::auto_expand(t, 0, 2);
+        let root = t.root();
+        tree::auto_expand(t, root, 0, 2);
     }
     let post_scan_dur = post_scan_start.elapsed();
 

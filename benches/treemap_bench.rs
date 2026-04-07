@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
+use disk_cleaner::tree::{self, build_test_tree, dir, leaf, FileTree, NodeId, TestNode};
 use disk_cleaner::treemap;
 use eframe::egui;
 
@@ -7,42 +7,27 @@ use eframe::egui;
 // Synthetic tree builders
 // ---------------------------------------------------------------------------
 
-fn make_leaf(name: &str, size: u64) -> FileNode {
-    FileNode::File(FileLeaf::new(name.into(), size, false))
-}
-
-fn make_dir(name: &str, children: Vec<FileNode>) -> FileNode {
-    let size = children.iter().map(|c| c.size()).sum();
-    FileNode::Dir(Box::new(DirNode {
-        name: name.into(),
-        size,
-        children,
-        expanded: false,
-        hidden: false,
-    }))
-}
-
 /// Build a tree mimicking /Applications: many top-level dirs with deep children.
-fn build_applications_like(n_apps: usize, files_per_app: usize) -> FileNode {
+fn build_applications_like(n_apps: usize, files_per_app: usize) -> FileTree {
     let exts = [
         "rs", "dylib", "plist", "png", "strings", "nib", "json", "dat", "xml", "js",
     ];
-    let apps: Vec<FileNode> = (0..n_apps)
+    let apps: Vec<TestNode> = (0..n_apps)
         .map(|i| {
-            let files: Vec<FileNode> = (0..files_per_app)
+            let files: Vec<TestNode> = (0..files_per_app)
                 .map(|j| {
                     let ext = exts[j % exts.len()];
-                    make_leaf(&format!("file_{j}.{ext}"), (j as u64 + 1) * 4096)
+                    leaf(&format!("file_{j}.{ext}"), (j as u64 + 1) * 4096)
                 })
                 .collect();
-            make_dir(&format!("App_{i:03}.app"), files)
+            dir(&format!("App_{i:03}.app"), files)
         })
         .collect();
-    make_dir("/Applications", apps)
+    build_test_tree(dir("/Applications", apps))
 }
 
-fn count_nodes(node: &FileNode) -> usize {
-    1 + node.children().iter().map(count_nodes).sum::<usize>()
+fn count_nodes(tree: &FileTree, id: NodeId) -> usize {
+    1 + tree.children(id).iter().map(|&c| count_nodes(tree, c)).sum::<usize>()
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +43,7 @@ fn bench_build_cache(c: &mut Criterion) {
     // Small: 50 apps × 20 files = 1050 nodes
     {
         let tree = build_applications_like(50, 20);
-        let n = count_nodes(&tree);
+        let n = count_nodes(&tree, tree.root());
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
             b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
         });
@@ -67,7 +52,7 @@ fn bench_build_cache(c: &mut Criterion) {
     // Medium: 100 apps × 100 files = 10100 nodes
     {
         let tree = build_applications_like(100, 100);
-        let n = count_nodes(&tree);
+        let n = count_nodes(&tree, tree.root());
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
             b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
         });
@@ -76,7 +61,7 @@ fn bench_build_cache(c: &mut Criterion) {
     // Large: 200 apps × 200 files = 40200 nodes
     {
         let tree = build_applications_like(200, 200);
-        let n = count_nodes(&tree);
+        let n = count_nodes(&tree, tree.root());
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
             b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
         });
@@ -135,7 +120,7 @@ fn bench_tree_navigation(c: &mut Criterion) {
     // Deep zoom path
     let tree = build_applications_like(200, 100);
     let zoom = std::path::PathBuf::from("/Applications/App_150.app");
-    let n = count_nodes(&tree);
+    let n = count_nodes(&tree, tree.root());
 
     group.bench_with_input(BenchmarkId::new("find_node", n), &tree, |b, t| {
         b.iter(|| treemap::find_node(t, &zoom))
@@ -189,7 +174,7 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
 
     for &(n_apps, files_per_app) in &[(200, 100), (500, 200)] {
         let tree = build_applications_like(n_apps, files_per_app);
-        let n = count_nodes(&tree);
+        let n = count_nodes(&tree, tree.root());
 
         // Shallow zoom (top-level dir)
         let shallow = std::path::PathBuf::from("/Applications/App_000.app");

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::tree::FileNode;
+use crate::tree::{FileTree, NodeId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SafetyLevel {
@@ -168,7 +168,7 @@ fn is_dsym(name: &str) -> bool {
 }
 
 /// Walk the scanned tree and detect reclaimable items.
-pub fn analyze(tree: &FileNode) -> SuggestionReport {
+pub fn analyze(tree: &FileTree) -> SuggestionReport {
     let mut build_items = Vec::new();
     let mut package_items = Vec::new();
     let mut cache_items = Vec::new();
@@ -176,9 +176,11 @@ pub fn analyze(tree: &FileNode) -> SuggestionReport {
     let mut temp_items = Vec::new();
     let mut installer_items = Vec::new();
 
-    let mut path_buf = PathBuf::from(tree.name());
+    let root = tree.root();
+    let mut path_buf = PathBuf::from(tree.name(root));
     walk_for_suggestions(
         tree,
+        root,
         &mut path_buf,
         &mut build_items,
         &mut package_items,
@@ -200,7 +202,6 @@ pub fn analyze(tree: &FileNode) -> SuggestionReport {
     ] {
         if !items.is_empty() {
             let total_size = items.iter().map(|i| i.size).sum();
-            // Auto-expand Caution groups so users can review before cleaning
             let auto_expand = category.safety() == SafetyLevel::Caution;
             groups.push(SuggestionGroup {
                 category,
@@ -222,7 +223,8 @@ pub fn analyze(tree: &FileNode) -> SuggestionReport {
 
 #[allow(clippy::too_many_arguments)]
 fn walk_for_suggestions(
-    node: &FileNode,
+    tree: &FileTree,
+    id: NodeId,
     current_path: &mut PathBuf,
     build_items: &mut Vec<SuggestionItem>,
     package_items: &mut Vec<SuggestionItem>,
@@ -231,52 +233,50 @@ fn walk_for_suggestions(
     temp_items: &mut Vec<SuggestionItem>,
     installer_items: &mut Vec<SuggestionItem>,
 ) {
-    let name = node.name();
+    let name = tree.name(id);
 
-    if node.is_dir() {
-        // Check if this directory matches a known pattern.
-        // If it does, add it as a single suggestion item and DON'T recurse
-        // into it (to avoid double-counting children).
-        if matches_dir_pattern(name, BUILD_DIRS) && node.size() > 0 {
+    if tree.is_dir(id) {
+        if matches_dir_pattern(name, BUILD_DIRS) && tree.size(id) > 0 {
             build_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
             return;
         }
-        if matches_dir_pattern(name, PACKAGE_DIRS) && node.size() > 0 {
+        if matches_dir_pattern(name, PACKAGE_DIRS) && tree.size(id) > 0 {
             package_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
             return;
         }
-        if matches_dir_pattern(name, CACHE_DIRS) && node.size() > 0 {
+        if matches_dir_pattern(name, CACHE_DIRS) && tree.size(id) > 0 {
             cache_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
             return;
         }
-        if matches_dir_pattern(name, IDE_DIRS) && node.size() > 0 {
+        if matches_dir_pattern(name, IDE_DIRS) && tree.size(id) > 0 {
             ide_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
             return;
         }
-        if is_dsym(name) && node.size() > 0 {
+        if is_dsym(name) && tree.size(id) > 0 {
             ide_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
             return;
         }
 
         // Not a known directory pattern — recurse into children
-        for child in node.children() {
-            current_path.push(child.name());
+        for &child in tree.children(id) {
+            current_path.push(tree.name(child));
             walk_for_suggestions(
+                tree,
                 child,
                 current_path,
                 build_items,
@@ -290,15 +290,15 @@ fn walk_for_suggestions(
         }
     } else {
         // File-level checks
-        if has_extension(name, TEMP_EXTENSIONS) && node.size() > 0 {
+        if has_extension(name, TEMP_EXTENSIONS) && tree.size(id) > 0 {
             temp_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
-        } else if has_extension(name, INSTALLER_EXTENSIONS) && node.size() > 0 {
+        } else if has_extension(name, INSTALLER_EXTENSIONS) && tree.size(id) > 0 {
             installer_items.push(SuggestionItem {
                 path: current_path.clone(),
-                size: node.size(),
+                size: tree.size(id),
             });
         }
     }
@@ -307,17 +307,17 @@ fn walk_for_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{dir, leaf};
+    use crate::tree::{build_test_tree, dir, leaf};
 
     #[test]
     fn detect_build_artifacts() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![
                 dir("target", vec![leaf("debug.o", 1000)]),
                 dir("src", vec![leaf("main.rs", 50)]),
             ],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(
@@ -330,13 +330,13 @@ mod tests {
 
     #[test]
     fn detect_node_modules() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![
                 dir("node_modules", vec![leaf("react.js", 5000)]),
                 leaf("index.js", 100),
             ],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].category, SuggestionCategory::PackageCaches);
@@ -345,14 +345,14 @@ mod tests {
 
     #[test]
     fn detect_temp_files() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![
                 leaf("debug.log", 200),
                 leaf("data.tmp", 100),
                 leaf("main.rs", 50),
             ],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].category, SuggestionCategory::TempFiles);
@@ -361,10 +361,10 @@ mod tests {
 
     #[test]
     fn detect_installers() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![leaf("Xcode.dmg", 8_000_000), leaf("notes.txt", 50)],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].category, SuggestionCategory::OldInstallers);
@@ -373,13 +373,13 @@ mod tests {
 
     #[test]
     fn no_double_count_nested_targets() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![dir(
                 "project",
                 vec![dir("target", vec![dir("debug", vec![leaf("bin", 500)])])],
             )],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].items.len(), 1);
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn empty_tree_no_suggestions() {
-        let tree = dir("/test", vec![]);
+        let tree = build_test_tree(dir("/test", vec![]));
         let report = analyze(&tree);
         assert!(report.groups.is_empty());
         assert_eq!(report.total_reclaimable, 0);
@@ -396,17 +396,16 @@ mod tests {
 
     #[test]
     fn multiple_categories_sorted_by_size() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "/test",
             vec![
                 dir("node_modules", vec![leaf("pkg.js", 10_000)]),
                 dir("target", vec![leaf("debug.o", 500)]),
                 leaf("crash.log", 50),
             ],
-        );
+        ));
         let report = analyze(&tree);
         assert_eq!(report.groups.len(), 3);
-        // Sorted by size descending
         assert!(report.groups[0].total_size >= report.groups[1].total_size);
         assert!(report.groups[1].total_size >= report.groups[2].total_size);
         assert_eq!(report.total_reclaimable, 10_550);

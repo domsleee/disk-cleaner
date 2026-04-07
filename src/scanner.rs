@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::{DirNode, FileLeaf, FileNode};
+use crate::tree::{self, FileTree, ScanDirNode, ScanFileLeaf, ScanFileNode};
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -112,27 +112,19 @@ pub struct ScanProgress {
 }
 
 /// Build a set of paths to skip during scanning to avoid double-counting.
-/// On macOS APFS, `/System/Volumes/Data` contains the real user data but is also
-/// accessible via firmlinks (e.g. `/Users` → `/System/Volumes/Data/Users`).
-/// Scanning from `/` without skipping Data counts everything twice.
-/// Mount points under `/Volumes/` also cause inflation when scanning root.
 fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
     Arc::new(platform_skip_paths(root))
 }
+
 
 #[cfg(target_os = "macos")]
 fn platform_skip_paths(root: &Path) -> HashSet<PathBuf> {
     let mut skip = HashSet::new();
 
     let data_vol = Path::new("/System/Volumes/Data");
-    // Only apply APFS dedup when scanning from a path that isn't under the Data volume
     if !root.starts_with(data_vol) {
-        // Skip the entire Data volume — all user-visible content is
-        // accessible via firmlinks from the root, so descending into
-        // /System/Volumes/Data would double-count everything.
         skip.insert(data_vol.to_path_buf());
 
-        // Also skip other APFS sub-volume mounts that inflate size
         for sub in &[
             "Preboot",
             "Recovery",
@@ -153,10 +145,6 @@ fn platform_skip_paths(root: &Path) -> HashSet<PathBuf> {
         }
     }
 
-    // Skip mount points under /Volumes/ to avoid counting other drives.
-    // /Volumes/ contains mount points like "Macintosh HD" (root alias) and
-    // "Macintosh HD - Data" (Data volume alias) plus external drives.
-    // When scanning root, traversing these re-counts the same data.
     if !root.starts_with("/Volumes/") && root != Path::new("/Volumes") {
         if let Ok(entries) = std::fs::read_dir("/Volumes") {
             for entry in entries.flatten() {
@@ -176,24 +164,25 @@ fn platform_skip_paths(_root: &Path) -> HashSet<PathBuf> {
     HashSet::new()
 }
 
-pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
+pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileTree {
     let skip = build_skip_set(root);
-    // Root node gets the full absolute path as its name so that
-    // path reconstruction (root.name / child.name / ...) produces
-    // correct absolute paths.
-    let mut root_node = walk_dir(root, &progress, &skip);
-    crate::tree::sort_children_recursive(&mut root_node);
-    root_node.set_expanded(true);
-    // Override name to be the full path (walk_dir used file_name only)
-    if let FileNode::Dir(d) = &mut root_node {
+    let mut scan_root = walk_dir(root, &progress, &skip);
+    tree::sort_scan_children(&mut scan_root);
+
+    // Override name to be the full path
+    if let ScanFileNode::Dir(d) = &mut scan_root {
         d.name = root.to_string_lossy().into_owned().into_boxed_str();
     }
-    root_node
+
+    // Convert to arena
+    let mut tree = tree::from_scan_tree(scan_root);
+    let root_id = tree.root();
+    tree.set_expanded(root_id, true);
+    tree
 }
 
 /// Convert an OsString to Box<str>, reusing the OsString allocation when
-/// the name is valid UTF-8 (the common case on macOS/Linux). `into_string()`
-/// transfers ownership of the inner buffer instead of copying the bytes.
+/// the name is valid UTF-8 (the common case on macOS/Linux).
 fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
     match name.into_string() {
         Ok(s) => s.into_boxed_str(),
@@ -205,9 +194,6 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
 #[cfg(target_os = "macos")]
 const UF_HIDDEN: u32 = 0x8000;
 
-/// Check the hidden bit from metadata already fetched by the caller.
-/// On macOS this checks both the dotfile convention and the UF_HIDDEN flag
-/// via `st_flags()`, avoiding a second `lstat` per entry.
 #[cfg(target_os = "macos")]
 fn is_hidden_from_metadata(name: &str, metadata: &std::fs::Metadata) -> bool {
     use std::os::darwin::fs::MetadataExt;
@@ -219,8 +205,12 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
-/// Parallel recursive directory walk, following dust's par_bridge() pattern.
-fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
+/// Parallel recursive directory walk using rayon par_bridge().
+fn walk_dir(
+    dir: &Path,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+) -> ScanFileNode {
     let dir_name: Box<str> = dir
         .file_name()
         .map(|n| os_name_to_boxed(n.to_os_string()))
@@ -230,16 +220,11 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         .map(|m| is_hidden_from_metadata(&dir_name, &m))
         .unwrap_or_else(|_| dir_name.starts_with('.'));
 
-    // Build the empty fallback only in early-return paths to avoid cloning
-    // dir_name and allocating a Vec on every directory visit.
-
-    // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
-        return FileNode::Dir(Box::new(DirNode {
+        return ScanFileNode::Dir(Box::new(ScanDirNode {
             name: dir_name,
             size: 0,
             children: Vec::new(),
-            expanded: false,
             hidden: dir_hidden,
         }));
     }
@@ -247,17 +232,16 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
-            return FileNode::Dir(Box::new(DirNode {
+            return ScanFileNode::Dir(Box::new(ScanDirNode {
                 name: dir_name,
                 size: 0,
                 children: Vec::new(),
-                expanded: false,
                 hidden: dir_hidden,
             }));
         }
     };
 
-    let mut children: Vec<FileNode> = entries
+    let mut children: Vec<ScanFileNode> = entries
         .into_iter()
         .par_bridge()
         .filter_map(|entry| {
@@ -283,7 +267,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 progress.total_size.fetch_add(len, Ordering::Relaxed);
                 let name = os_name_to_boxed(entry.file_name());
                 let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
+                Some(ScanFileNode::File(ScanFileLeaf::new(name, len, hidden)))
             } else {
                 None
             }
@@ -293,11 +277,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
     children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 
-    FileNode::Dir(Box::new(DirNode {
+    ScanFileNode::Dir(Box::new(ScanDirNode {
         name: dir_name,
         size,
         children,
-        expanded: false,
         hidden: dir_hidden,
     }))
 }
@@ -306,6 +289,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::Ordering;
 
     fn new_progress() -> Arc<ScanProgress> {
         Arc::new(ScanProgress {
@@ -319,12 +303,13 @@ mod tests {
     fn scan_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress.clone());
+        let tree = scan_directory(tmp.path(), progress.clone());
 
-        assert!(root.is_dir());
-        assert!(root.children().is_empty());
-        assert_eq!(root.size(), 0);
-        assert!(root.expanded());
+        let root = tree.root();
+        assert!(tree.is_dir(root));
+        assert!(tree.children(root).is_empty());
+        assert_eq!(tree.size(root), 0);
+        assert!(tree.expanded(root));
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
     }
 
@@ -335,23 +320,19 @@ mod tests {
         fs::write(tmp.path().join("b.txt"), "hi").unwrap();
 
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress.clone());
+        let tree = scan_directory(tmp.path(), progress.clone());
 
-        assert_eq!(root.children().len(), 2);
+        let root = tree.root();
+        assert_eq!(tree.children(root).len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
-        // On unix, sizes are reported as disk usage (blocks * 512), not apparent size.
-        // Both small files fit in one block each, so they report the same on-disk size.
         #[cfg(unix)]
         {
-            let expected_per_file = fs::metadata(tmp.path().join("a.txt"))
-                .unwrap()
-                .blocks()
-                * 512;
-            assert_eq!(root.size(), expected_per_file * 2);
+            let expected_per_file = fs::metadata(tmp.path().join("a.txt")).unwrap().blocks() * 512;
+            assert_eq!(tree.size(root), expected_per_file * 2);
         }
         #[cfg(not(unix))]
         {
-            assert_eq!(root.size(), 7);
+            assert_eq!(tree.size(root), 7);
         }
     }
 
@@ -364,37 +345,37 @@ mod tests {
         fs::write(tmp.path().join("root.txt"), "r").unwrap();
 
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress.clone());
+        let tree = scan_directory(tmp.path(), progress.clone());
 
-        assert_eq!(root.children().len(), 2);
+        let root = tree.root();
+        assert_eq!(tree.children(root).len(), 2);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 2);
 
-        // Both small files use one block each on unix, so same on-disk size
         #[cfg(unix)]
         {
-            let block_size = fs::metadata(sub.join("file.bin"))
-                .unwrap()
-                .blocks()
-                * 512;
-            assert_eq!(root.size(), block_size * 2);
+            let block_size = fs::metadata(sub.join("file.bin")).unwrap().blocks() * 512;
+            assert_eq!(tree.size(root), block_size * 2);
         }
         #[cfg(not(unix))]
         {
-            assert_eq!(root.size(), 101);
+            assert_eq!(tree.size(root), 101);
         }
 
-        // sub dir should sort before root.txt (or equal size, stable order)
-        let sub_node = &root.children().iter().find(|c| c.name() == "sub").unwrap();
-        assert!(sub_node.is_dir());
-        assert_eq!(sub_node.children().len(), 1);
+        let sub_node = tree
+            .children(root)
+            .iter()
+            .find(|&&c| tree.name(c) == "sub")
+            .unwrap();
+        assert!(tree.is_dir(*sub_node));
+        assert_eq!(tree.children(*sub_node).len(), 1);
     }
 
     #[test]
     fn root_is_expanded_by_default() {
         let tmp = tempfile::tempdir().unwrap();
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress);
-        assert!(root.expanded());
+        let tree = scan_directory(tmp.path(), progress);
+        assert!(tree.expanded(tree.root()));
     }
 
     #[test]
@@ -402,8 +383,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("child")).unwrap();
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress);
-        assert!(!root.children()[0].expanded());
+        let tree = scan_directory(tmp.path(), progress);
+        let child = tree.children(tree.root())[0];
+        assert!(!tree.expanded(child));
     }
 
     #[test]
@@ -414,12 +396,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sparse_path = tmp.path().join("sparse.raw");
 
-        // Create a sparse file: seek to 1GB and write one byte.
-        // Apparent size = 1GB+1, but actual disk usage is one block (~4KB).
         let file = fs::File::create(&sparse_path).unwrap();
         use std::io::{Seek, Write};
         let mut writer = std::io::BufWriter::new(file);
-        writer.seek(std::io::SeekFrom::Start(1_000_000_000)).unwrap();
+        writer
+            .seek(std::io::SeekFrom::Start(1_000_000_000))
+            .unwrap();
         writer.write_all(b"\0").unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -428,17 +410,15 @@ mod tests {
         let apparent = meta.len();
         let on_disk = meta.blocks() * 512;
 
-        // Confirm the file is actually sparse
         assert_eq!(apparent, 1_000_000_001);
         assert!(
             on_disk < 1_000_000,
             "expected sparse file to use <1MB on disk, got {on_disk}"
         );
 
-        // Scanner should report actual disk usage, not apparent size
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress.clone());
-        let scanned_size = root.size();
+        let tree = scan_directory(tmp.path(), progress.clone());
+        let scanned_size = tree.size(tree.root());
 
         assert_eq!(
             scanned_size, on_disk,
@@ -446,7 +426,6 @@ mod tests {
         );
     }
 
-    /// Set the macOS UF_HIDDEN flag on a path using chflags(2).
     #[cfg(target_os = "macos")]
     fn set_uf_hidden(path: &Path) {
         let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
@@ -462,63 +441,60 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn uf_hidden_file_detected_as_hidden() {
         let tmp = tempfile::tempdir().unwrap();
-        // Non-dot file with UF_HIDDEN flag
         let hidden_file = tmp.path().join("visible_name.txt");
         fs::write(&hidden_file, "secret").unwrap();
         set_uf_hidden(&hidden_file);
-
-        // Normal non-dot file for comparison
         fs::write(tmp.path().join("normal.txt"), "hello").unwrap();
 
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress);
+        let tree = scan_directory(tmp.path(), progress);
 
-        let hidden_node = root
-            .children()
+        let root = tree.root();
+        let hidden_node = tree
+            .children(root)
             .iter()
-            .find(|c| c.name() == "visible_name.txt")
+            .find(|&&c| tree.name(c) == "visible_name.txt")
             .expect("hidden file should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN file should be marked hidden");
+        assert!(tree.is_hidden(*hidden_node), "UF_HIDDEN file should be marked hidden");
 
-        let normal_node = root
-            .children()
+        let normal_node = tree
+            .children(root)
             .iter()
-            .find(|c| c.name() == "normal.txt")
+            .find(|&&c| tree.name(c) == "normal.txt")
             .expect("normal file should appear in scan");
-        assert!(!normal_node.is_hidden(), "normal file should not be hidden");
+        assert!(!tree.is_hidden(*normal_node), "normal file should not be hidden");
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn uf_hidden_dir_detected_as_hidden() {
         let tmp = tempfile::tempdir().unwrap();
-        // Non-dot directory with UF_HIDDEN flag
         let hidden_dir = tmp.path().join("secret_dir");
         fs::create_dir(&hidden_dir).unwrap();
         fs::write(hidden_dir.join("child.txt"), "data").unwrap();
         set_uf_hidden(&hidden_dir);
 
-        // Normal directory for comparison
         let normal_dir = tmp.path().join("normal_dir");
         fs::create_dir(&normal_dir).unwrap();
 
         let progress = new_progress();
-        let root = scan_directory(tmp.path(), progress);
+        let tree = scan_directory(tmp.path(), progress);
 
-        let hidden_node = root
-            .children()
+        let root = tree.root();
+        let hidden_node = tree
+            .children(root)
             .iter()
-            .find(|c| c.name() == "secret_dir")
+            .find(|&&c| tree.name(c) == "secret_dir")
             .expect("hidden dir should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN dir should be marked hidden");
-        assert_eq!(hidden_node.children().len(), 1, "hidden dir contents should still be scanned");
+        assert!(tree.is_hidden(*hidden_node), "UF_HIDDEN dir should be marked hidden");
+        assert_eq!(tree.children(*hidden_node).len(), 1, "hidden dir contents should still be scanned");
 
-        let normal_node = root
-            .children()
+        let normal_node = tree
+            .children(root)
             .iter()
-            .find(|c| c.name() == "normal_dir")
+            .find(|&&c| tree.name(c) == "normal_dir")
             .expect("normal dir should appear in scan");
-        assert!(!normal_node.is_hidden(), "normal dir should not be hidden");
+        assert!(!tree.is_hidden(*normal_node), "normal dir should not be hidden");
     }
 
     #[test]
@@ -530,13 +506,12 @@ mod tests {
         fs::write(tmp.path().join("root.txt"), "data").unwrap();
 
         let progress = new_progress();
-        // Cancel before scanning starts
         progress.cancelled.store(true, Ordering::Relaxed);
-        let root = scan_directory(tmp.path(), progress.clone());
+        let tree = scan_directory(tmp.path(), progress.clone());
 
-        // Cancelled scan should produce an empty root with no children
-        assert!(root.children().is_empty());
-        assert_eq!(root.size(), 0);
+        let root = tree.root();
+        assert!(tree.children(root).is_empty());
+        assert_eq!(tree.size(root), 0);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
     }
 }

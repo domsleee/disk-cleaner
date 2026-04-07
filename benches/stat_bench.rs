@@ -23,7 +23,7 @@
 //! Compare branches by running on each and comparing the summary lines.
 
 use disk_cleaner::scanner::{self, ScanProgress};
-use disk_cleaner::tree::FileNode;
+use disk_cleaner::tree::{FileTree, NodeId};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -61,8 +61,8 @@ fn reset_peak() {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn count_nodes(node: &FileNode) -> usize {
-    1 + node.children().iter().map(count_nodes).sum::<usize>()
+fn count_nodes(tree: &FileTree, id: NodeId) -> usize {
+    1 + tree.children(id).iter().map(|&c| count_nodes(tree, c)).sum::<usize>()
 }
 
 fn new_progress() -> Arc<ScanProgress> {
@@ -150,7 +150,7 @@ fn main() {
         let peak = PEAK.load(Ordering::SeqCst);
 
         let delta = after.saturating_sub(before);
-        let nodes = count_nodes(&tree);
+        let nodes = count_nodes(&tree, tree.root());
         let bpn = delta as f64 / nodes as f64;
         file_count_last = progress.file_count.load(Ordering::Relaxed);
         node_count = nodes;

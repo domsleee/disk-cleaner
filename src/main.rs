@@ -29,11 +29,11 @@ fn debug_enabled() -> bool {
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
-    tree: tree::FileNode,
+    tree: tree::FileTree,
     stats: categories::CategoryStats,
     suggestions: suggestions::SuggestionReport,
 }
-use tree::FileNode;
+use tree::FileTree;
 use treemap::TreemapAction;
 
 use deleter::BackgroundDeleter;
@@ -215,7 +215,7 @@ enum ScreenshotState {
 }
 
 struct App {
-    tree: Option<FileNode>,
+    tree: Option<FileTree>,
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
@@ -525,7 +525,8 @@ impl eframe::App for App {
                 self.suggestion_report = Some(result.suggestions);
                 self.tree = Some(result.tree);
                 if let Some(ref mut t) = self.tree {
-                    tree::auto_expand(t, 0, 2);
+                    let root = t.root();
+                    tree::auto_expand(t, root, 0, 2);
                 }
                 self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
                 self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
@@ -1496,7 +1497,7 @@ impl eframe::App for App {
                             match action {
                                 TreemapAction::ZoomTo(path) => {
                                     let is_root =
-                                        std::path::Path::new(tree.name()) == path.as_path();
+                                        std::path::Path::new(tree.name(tree.root())) == path.as_path();
                                     let new_zoom = if is_root { None } else { Some(path) };
                                     if new_zoom != self.treemap_zoom {
                                         self.treemap_zoom_anim = Some(ctx.input(|i| i.time));

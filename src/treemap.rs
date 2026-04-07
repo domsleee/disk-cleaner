@@ -1,4 +1,4 @@
-use crate::tree::FileNode;
+use crate::tree::{FileTree, NodeId};
 use bytesize::ByteSize;
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -75,16 +75,11 @@ fn text_color_for_bg(bg: egui::Color32) -> egui::Color32 {
 
 // ─── Squarified treemap layout ──────────────────────────────────
 
-/// Worst aspect ratio for items in a strip laid against `side`.
-///
-/// `areas` are pixel-area values; `side` is the length of the shorter
-/// dimension of the remaining rectangle.
 fn worst_ratio(areas: &[f64], side: f64) -> f64 {
     let sum: f64 = areas.iter().sum();
     if sum <= 0.0 || side <= 0.0 {
         return f64::MAX;
     }
-    // strip dimension perpendicular to `side`
     let d = sum / side;
     areas
         .iter()
@@ -98,10 +93,6 @@ fn worst_ratio(areas: &[f64], side: f64) -> f64 {
         .fold(0.0f64, f64::max)
 }
 
-/// Compute squarified treemap layout.
-///
-/// `sizes` must be sorted **descending**. Returns egui `Rect`s in the
-/// same order, filling the rectangle at (`x`, `y`, `w`, `h`).
 pub fn squarify(sizes: &[f64], x: f32, y: f32, w: f32, h: f32) -> Vec<egui::Rect> {
     let n = sizes.len();
     if n == 0 || w <= 0.0 || h <= 0.0 {
@@ -137,7 +128,6 @@ fn squarify_impl(
 
     let shorter = (bw as f64).min(bh as f64);
 
-    // Greedy strip building
     let mut strip_end = 1;
     let mut strip = vec![areas[0]];
     let mut best = worst_ratio(&strip, shorter);
@@ -158,7 +148,6 @@ fn squarify_impl(
     let strip_sum: f64 = strip_areas.iter().sum();
 
     if bw >= bh {
-        // Strip fills full height, laid out vertically on the left
         let sw = (strip_sum / bh as f64) as f32;
         let mut cy = by;
         for (i, &a) in strip_areas.iter().enumerate() {
@@ -176,7 +165,6 @@ fn squarify_impl(
             offset + strip_end,
         );
     } else {
-        // Strip fills full width, laid out horizontally on top
         let sh = (strip_sum / bw as f64) as f32;
         let mut cx = bx;
         for (i, &a) in strip_areas.iter().enumerate() {
@@ -198,23 +186,25 @@ fn squarify_impl(
 
 // ─── Tree navigation helpers ────────────────────────────────────
 
-/// Find a node by path in the file tree.
-pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    let mut buf = PathBuf::from(node.name());
-    find_node_inner(node, target, &mut buf)
+/// Find a node by path in the file tree. Returns its NodeId.
+pub fn find_node(tree: &FileTree, target: &Path) -> Option<NodeId> {
+    let root = tree.root();
+    let mut buf = PathBuf::from(tree.name(root));
+    find_node_inner(tree, root, target, &mut buf)
 }
 
-fn find_node_inner<'a>(
-    node: &'a FileNode,
+fn find_node_inner(
+    tree: &FileTree,
+    id: NodeId,
     target: &Path,
     buf: &mut PathBuf,
-) -> Option<&'a FileNode> {
+) -> Option<NodeId> {
     if buf.as_path() == target {
-        return Some(node);
+        return Some(id);
     }
-    for child in node.children() {
-        buf.push(child.name());
-        if let Some(found) = find_node_inner(child, target, buf) {
+    for &child in tree.children(id) {
+        buf.push(tree.name(child));
+        if let Some(found) = find_node_inner(tree, child, target, buf) {
             buf.pop();
             return Some(found);
         }
@@ -224,37 +214,39 @@ fn find_node_inner<'a>(
 }
 
 /// Build breadcrumb trail from root to `target`.
-pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
-    let root_path = PathBuf::from(root.name());
-    let mut trail = vec![(root.name().to_string(), root_path.clone())];
+pub fn breadcrumbs(tree: &FileTree, target: &Path) -> Vec<(String, PathBuf)> {
+    let root = tree.root();
+    let root_path = PathBuf::from(tree.name(root));
+    let mut trail = vec![(tree.name(root).to_string(), root_path.clone())];
     if root_path.as_path() == target {
         return trail;
     }
     let mut buf = root_path;
-    if breadcrumbs_walk(root, target, &mut buf, &mut trail) {
+    if breadcrumbs_walk(tree, root, target, &mut buf, &mut trail) {
         trail
     } else {
-        vec![(root.name().to_string(), PathBuf::from(root.name()))]
+        vec![(tree.name(root).to_string(), PathBuf::from(tree.name(root)))]
     }
 }
 
 fn breadcrumbs_walk(
-    node: &FileNode,
+    tree: &FileTree,
+    id: NodeId,
     target: &Path,
     buf: &mut PathBuf,
     trail: &mut Vec<(String, PathBuf)>,
 ) -> bool {
-    for child in node.children() {
-        buf.push(child.name());
+    for &child in tree.children(id) {
+        buf.push(tree.name(child));
         let child_path = buf.clone();
         if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
+            trail.push((tree.name(child).to_string(), child_path));
             buf.pop();
             return true;
         }
-        if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
+        if tree.is_dir(child) {
+            trail.push((tree.name(child).to_string(), child_path));
+            if breadcrumbs_walk(tree, child, target, buf, trail) {
                 buf.pop();
                 return true;
             }
@@ -273,7 +265,6 @@ pub struct TreemapCache {
     pub breadcrumbs: Vec<(String, PathBuf)>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub view_size: u64,
-    /// Pre-formatted view size string for breadcrumb display.
     pub view_size_label: Box<str>,
     pub layout_size: (f32, f32),
 }
@@ -287,15 +278,10 @@ pub struct TreemapTile {
     pub color: egui::Color32,
     pub child_count: Option<usize>,
     pub nested: Vec<NestedTile>,
-    /// Pre-formatted short label (name only).
     pub label_short: Box<str>,
-    /// Pre-formatted tall label (name + size).
     pub label_tall: Box<str>,
-    /// Pre-computed text color for this tile's background.
     pub text_color: egui::Color32,
-    /// Pre-computed darkened header color (dirs only, unused for files).
     pub header_color: egui::Color32,
-    /// Pre-computed text color for header background (dirs only).
     pub header_text_color: egui::Color32,
 }
 
@@ -313,28 +299,22 @@ pub struct OtherBucket {
     #[cfg_attr(not(test), allow(dead_code))]
     pub count: usize,
     pub size: u64,
-    /// Pre-formatted short label.
     pub label_short: Box<str>,
-    /// Pre-formatted tall label.
     pub label_tall: Box<str>,
 }
 
-/// Build a cached treemap layout from the given tree and parameters.
-///
-/// This extracts all filtering + squarifying logic from `render_treemap` into a
-/// pure function whose result can be stored and reused across frames.
 pub fn build_treemap_cache(
-    root: &FileNode,
+    tree: &FileTree,
     zoom_path: &Option<PathBuf>,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
     full_rect: egui::Rect,
 ) -> TreemapCache {
-    let root_path = PathBuf::from(root.name());
+    let root = tree.root();
+    let root_path = PathBuf::from(tree.name(root));
 
-    // Resolve the node we're viewing and its full path
-    let (view_node, view_path) = if let Some(ref zp) = zoom_path {
-        match find_node(root, zp) {
+    let (view_id, view_path) = if let Some(ref zp) = zoom_path {
+        match find_node(tree, zp) {
             Some(n) => (n, zp.clone()),
             None => (root, root_path.clone()),
         }
@@ -342,17 +322,15 @@ pub fn build_treemap_cache(
         (root, root_path.clone())
     };
 
-    let view_size = view_node.size();
+    let view_size = tree.size(view_id);
     let view_size_label: Box<str> = format!("  ({})", ByteSize::b(view_size)).into();
 
-    // Cache breadcrumbs (avoids O(N) tree walk every frame)
     let cached_breadcrumbs = zoom_path
         .as_ref()
-        .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+        .map(|p| breadcrumbs(tree, p))
+        .unwrap_or_else(|| vec![(tree.name(root).to_string(), root_path)]);
 
-    // Empty directory — return empty cache
-    if view_node.children().is_empty() {
+    if tree.children(view_id).is_empty() {
         return TreemapCache {
             tiles: vec![],
             other: None,
@@ -363,14 +341,15 @@ pub fn build_treemap_cache(
         };
     }
 
-    // Filter children by size, hidden status, and optional category
-    let all_children: Vec<&FileNode> = view_node
-        .children()
+    let all_children: Vec<NodeId> = tree
+        .children(view_id)
         .iter()
-        .filter(|c| c.size() > 0)
-        .filter(|c| show_hidden || !c.is_hidden())
-        .filter(|c| {
-            category_filter.is_none_or(|cat| crate::categories::node_matches_category(c, cat))
+        .copied()
+        .filter(|&c| tree.size(c) > 0)
+        .filter(|&c| show_hidden || !tree.is_hidden(c))
+        .filter(|&c| {
+            category_filter
+                .is_none_or(|cat| crate::categories::node_matches_category(tree, c, cat))
         })
         .collect();
 
@@ -385,28 +364,24 @@ pub fn build_treemap_cache(
         };
     }
 
-    // Collapse tiny files into an "Other" bucket to reduce visual noise.
-    // Files below 0.5% of total size are grouped together.
-    let total_size: u64 = all_children.iter().map(|c| c.size()).sum();
-    let threshold = (total_size as f64 * 0.005) as u64; // 0.5%
-    let mut children: Vec<&FileNode> = Vec::new();
+    let total_size: u64 = all_children.iter().map(|&c| tree.size(c)).sum();
+    let threshold = (total_size as f64 * 0.005) as u64;
+    let mut children: Vec<NodeId> = Vec::new();
     let mut other_size: u64 = 0;
     let mut other_count: usize = 0;
-    for c in &all_children {
-        if c.size() < threshold && !c.is_dir() {
-            other_size += c.size();
+    for &c in &all_children {
+        if tree.size(c) < threshold && !tree.is_dir(c) {
+            other_size += tree.size(c);
             other_count += 1;
         } else {
             children.push(c);
         }
     }
 
-    // Hard cap: if we still have too many entries, keep only the largest
-    // and fold the rest into "Other".
     if children.len() > MAX_VISIBLE_ENTRIES {
-        children.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        children.sort_by_key(|&c| std::cmp::Reverse(tree.size(c)));
         for c in children.drain(MAX_VISIBLE_ENTRIES..) {
-            other_size += c.size();
+            other_size += tree.size(c);
             other_count += 1;
         }
     }
@@ -425,8 +400,7 @@ pub fn build_treemap_cache(
         };
     }
 
-    // Compute squarified layout
-    let mut sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
+    let mut sizes: Vec<f64> = children.iter().map(|&c| tree.size(c) as f64).collect();
     if has_other {
         sizes.push(other_size as f64);
     }
@@ -438,46 +412,42 @@ pub fn build_treemap_cache(
         full_rect.height(),
     );
 
-    // Build tiles for real children, tracking global nested budget
     let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
-    for (i, child) in children.iter().enumerate() {
+    for (i, &child) in children.iter().enumerate() {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
             continue;
         }
-        let child_path = view_path.join(child.name());
-        let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        let child_path = view_path.join(tree.name(child));
+        let is_dir = tree.is_dir(child);
+        let color = extension_color(tree.name(child), is_dir);
         let child_count = if is_dir {
-            Some(child.children().len())
+            Some(tree.children_count(child))
         } else {
             None
         };
 
-        // Build nested sub-tiles for directory tiles large enough (respecting global budget)
         let nested = if is_dir
             && nested_budget > 0
             && r.width() > 40.0
             && r.height() > DIR_HEADER_H + 16.0
         {
-            let tiles = build_nested_tiles(child, &child_path, r, nested_budget);
+            let tiles = build_nested_tiles(tree, child, &child_path, r, nested_budget);
             nested_budget = nested_budget.saturating_sub(tiles.len());
             tiles
         } else {
             vec![]
         };
 
-        let name: Box<str> = child.name().into();
-        let size = child.size();
+        let name: Box<str> = tree.name(child).into();
+        let size = tree.size(child);
         let size_str = ByteSize::b(size).to_string();
         let header_color = darken(color, 15);
         let label_short: Box<str> = name.clone();
         let label_tall: Box<str> = if is_dir {
-            // For dirs: "name (size)" used in header
             format!("{} ({})", name, size_str).into()
         } else {
-            // For files: "name\nsize" used in tall tiles
             format!("{}\n{}", name, size_str).into()
         };
 
@@ -498,7 +468,6 @@ pub fn build_treemap_cache(
         });
     }
 
-    // Build Other bucket if needed
     let other = if has_other {
         let other_idx = children.len();
         let r = rects[other_idx].shrink(GAP);
@@ -524,11 +493,9 @@ pub fn build_treemap_cache(
     }
 }
 
-/// Build nested sub-tiles for the children of a directory tile.
-/// `budget` caps how many nested tiles to create (global limit).
-/// Extracts the nested layout logic from `paint_directory`.
 fn build_nested_tiles(
-    node: &FileNode,
+    tree: &FileTree,
+    id: NodeId,
     node_path: &Path,
     rect: egui::Rect,
     budget: usize,
@@ -538,21 +505,27 @@ fn build_nested_tiles(
         egui::pos2(rect.max.x - 1.0, rect.max.y - 1.0),
     );
 
-    if content_rect.width() <= 4.0 || content_rect.height() <= 4.0 || node.children().is_empty() {
+    if content_rect.width() <= 4.0 || content_rect.height() <= 4.0 || tree.children(id).is_empty()
+    {
         return vec![];
     }
 
-    let mut nested: Vec<&FileNode> = node.children().iter().filter(|c| c.size() > 0).collect();
+    let mut nested: Vec<NodeId> = tree
+        .children(id)
+        .iter()
+        .copied()
+        .filter(|&c| tree.size(c) > 0)
+        .collect();
     if nested.is_empty() {
         return vec![];
     }
     let limit = MAX_NESTED_CHILDREN.min(budget);
     if nested.len() > limit {
-        nested.sort_by_key(|c| std::cmp::Reverse(c.size()));
+        nested.sort_by_key(|&c| std::cmp::Reverse(tree.size(c)));
         nested.truncate(limit);
     }
 
-    let child_sizes: Vec<f64> = nested.iter().map(|c| c.size() as f64).collect();
+    let child_sizes: Vec<f64> = nested.iter().map(|&c| tree.size(c) as f64).collect();
     let child_rects = squarify(
         &child_sizes,
         content_rect.min.x,
@@ -562,18 +535,18 @@ fn build_nested_tiles(
     );
 
     let mut result = Vec::with_capacity(nested.len());
-    for (j, child) in nested.iter().enumerate() {
+    for (j, &child) in nested.iter().enumerate() {
         let cr = child_rects[j].shrink(0.5);
         if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
             continue;
         }
-        let child_path = node_path.join(child.name());
-        let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        let child_path = node_path.join(tree.name(child));
+        let is_dir = tree.is_dir(child);
+        let color = extension_color(tree.name(child), is_dir);
         result.push(NestedTile {
             rect: cr,
             path: child_path,
-            name: child.name().into(),
+            name: tree.name(child).into(),
             is_dir,
             color,
         });
@@ -593,24 +566,17 @@ pub enum TreemapAction {
 const GAP: f32 = 1.5;
 const DIR_HEADER_H: f32 = 20.0;
 const MIN_LABEL_W: f32 = 32.0;
-/// Hard cap on visible top-level entries to prevent lag with huge directories.
 const MAX_VISIBLE_ENTRIES: usize = 200;
-/// Minimum rect area (px²) worth painting — below this we skip.
 const MIN_PAINT_AREA: f32 = 4.0;
-/// Maximum nested children to paint inside a directory tile.
 const MAX_NESTED_CHILDREN: usize = 50;
-/// Global budget for total nested tiles across all directory tiles.
-/// Prevents 200 dirs × 50 nested = 10K paint ops scenario.
 const MAX_TOTAL_NESTED: usize = 1000;
 
-/// Render the full treemap view (breadcrumbs + map) from a cached layout.
-/// Returns user-triggered actions.
 #[allow(clippy::too_many_arguments)]
 pub fn render_treemap(
     ui: &mut egui::Ui,
     cache: &mut Option<TreemapCache>,
     cache_dirty: &mut bool,
-    root: &FileNode,
+    tree: &FileTree,
     zoom_path: &Option<PathBuf>,
     focused_path: &Option<PathBuf>,
     zoom_anim_start: Option<f64>,
@@ -618,11 +584,9 @@ pub fn render_treemap(
     show_hidden: bool,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
-    let root_path = PathBuf::from(root.name());
+    let root = tree.root();
+    let root_path = PathBuf::from(tree.name(root));
 
-    // ── Breadcrumb bar ──
-    // Use cached breadcrumbs when available to avoid O(N) tree walk every frame.
-    // On first frame (cache not yet built), compute inline.
     let have_cached_crumbs = cache.is_some();
     let inline_crumbs;
     let crumbs: &[(String, PathBuf)] = if have_cached_crumbs {
@@ -630,8 +594,8 @@ pub fn render_treemap(
     } else {
         inline_crumbs = zoom_path
             .as_ref()
-            .map(|p| breadcrumbs(root, p))
-            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+            .map(|p| breadcrumbs(tree, p))
+            .unwrap_or_else(|| vec![(tree.name(root).to_string(), root_path)]);
         &inline_crumbs
     };
     let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
@@ -640,9 +604,9 @@ pub fn render_treemap(
         l
     } else {
         let view_size = if let Some(ref zp) = zoom_path {
-            find_node(root, zp).map_or(root.size(), |n| n.size())
+            find_node(tree, zp).map_or(tree.size(root), |n| tree.size(n))
         } else {
-            root.size()
+            tree.size(root)
         };
         inline_size_label = format!("  ({})", ByteSize::b(view_size));
         &inline_size_label
@@ -675,7 +639,6 @@ pub fn render_treemap(
 
     ui.add_space(4.0);
 
-    // ── Zoom transition opacity ──
     let alpha = if let Some(start) = zoom_anim_start {
         let elapsed = (ui.input(|i| i.time) - start) as f32;
         let t = (elapsed / 0.2).clamp(0.0, 1.0);
@@ -687,12 +650,10 @@ pub fn render_treemap(
         1.0
     };
 
-    // ── Treemap canvas ──
     let available = ui.available_size();
     let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
     let painter = ui.painter_at(full_rect);
 
-    // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
     let needs_rebuild = *cache_dirty
         || cache.is_none()
         || cache.as_ref().is_some_and(|c| {
@@ -701,7 +662,7 @@ pub fn render_treemap(
         });
     if needs_rebuild {
         *cache = Some(build_treemap_cache(
-            root,
+            tree,
             zoom_path,
             category_filter,
             show_hidden,
@@ -711,7 +672,6 @@ pub fn render_treemap(
     }
     let cache = cache.as_ref().unwrap();
 
-    // Background
     painter.rect_filled(full_rect, 0.0, ui.visuals().extreme_bg_color);
 
     if cache.tiles.is_empty() && cache.other.is_none() {
@@ -729,13 +689,11 @@ pub fn render_treemap(
     let mut hovered_tile: Option<usize> = None;
     let mut hovered_other = false;
 
-    // Pre-create font IDs once (FontId::proportional allocates a String each call)
     let font_leaf = egui::FontId::proportional(11.0);
     let font_dir_header = egui::FontId::proportional(13.0);
     let font_nested = egui::FontId::proportional(10.0);
     let has_focus = focused_path.is_some();
 
-    // Paint tiles
     for (idx, tile) in cache.tiles.iter().enumerate() {
         let is_focused = has_focus && focused_path.as_ref().is_some_and(|fp| *fp == tile.path);
 
@@ -760,7 +718,6 @@ pub fn render_treemap(
         }
     }
 
-    // Paint Other bucket
     if let Some(ref other) = cache.other {
         paint_other_bucket(&painter, other, alpha, &font_leaf);
         if let Some(pos) = hover_pos {
@@ -770,7 +727,6 @@ pub fn render_treemap(
         }
     }
 
-    // Hover tooltip
     if let Some(idx) = hovered_tile {
         let tile = &cache.tiles[idx];
         egui::Tooltip::always_open(
@@ -805,7 +761,6 @@ pub fn render_treemap(
         }
     }
 
-    // Handle click — reuse hovered_tile instead of re-scanning
     if response.clicked() {
         if let Some(idx) = hovered_tile {
             let tile = &cache.tiles[idx];
@@ -847,7 +802,6 @@ fn paint_cached_leaf(
         );
     }
 
-    // Label if large enough — clip to tile rect, use pre-computed strings
     if tile.rect.width() > MIN_LABEL_W && tile.rect.height() > 14.0 {
         let clipped = painter.with_clip_rect(tile.rect);
         let tc = apply_alpha(tile.text_color, alpha);
@@ -876,7 +830,6 @@ fn paint_other_bucket(
     let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
     painter.rect_filled(rect, 2.0, bg);
 
-    // Dashed-style border to distinguish from real blocks
     painter.rect_stroke(
         rect,
         2.0,
@@ -918,7 +871,6 @@ fn paint_cached_directory(
     let bg = apply_alpha(tile.color, alpha);
     let header_bg = apply_alpha(tile.header_color, alpha);
 
-    // Background
     painter.rect_filled(rect, 2.0, bg);
 
     if is_focused {
@@ -930,11 +882,9 @@ fn paint_cached_directory(
         );
     }
 
-    // Header
     let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), DIR_HEADER_H));
     painter.rect_filled(header_rect, 2.0, header_bg);
 
-    // Header text — clip to header rect, use pre-computed label
     if rect.width() > MIN_LABEL_W {
         let clipped = painter.with_clip_rect(header_rect);
         let tc = apply_alpha(tile.header_text_color, alpha);
@@ -947,7 +897,6 @@ fn paint_cached_directory(
         );
     }
 
-    // Nested children (pre-computed in cache) — single clip group for entire tile
     if tile.nested.is_empty() {
         return;
     }
@@ -970,7 +919,6 @@ fn paint_cached_directory(
             }
         }
 
-        // Label only for tiles large enough to be readable.
         if cr.width() > 60.0 && cr.height() > 16.0 {
             let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
             tile_painter.text(
@@ -989,7 +937,7 @@ fn paint_cached_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{dir, leaf};
+    use crate::tree::{build_test_tree, dir, leaf};
 
     #[test]
     fn squarify_single_item() {
@@ -1018,7 +966,6 @@ mod tests {
 
     #[test]
     fn squarify_proportional() {
-        // 75/25 split in a 100x100 rect
         let rects = squarify(&[75.0, 25.0], 0.0, 0.0, 100.0, 100.0);
         let a0 = rects[0].width() * rects[0].height();
         let a1 = rects[1].width() * rects[1].height();
@@ -1038,11 +985,7 @@ mod tests {
         for i in 0..rects.len() {
             for j in (i + 1)..rects.len() {
                 let overlap = rects[i].intersect(rects[j]);
-                assert!(
-                    overlap.area() < 2.0,
-                    "rects {i} and {j} overlap by {}",
-                    overlap.area()
-                );
+                assert!(overlap.area() < 2.0, "rects {i} and {j} overlap");
             }
         }
     }
@@ -1052,7 +995,6 @@ mod tests {
         let sizes: Vec<f64> = (1..=20).rev().map(|i| i as f64).collect();
         let rects = squarify(&sizes, 0.0, 0.0, 800.0, 600.0);
         assert_eq!(rects.len(), 20);
-        // All rects should have positive area
         for (i, r) in rects.iter().enumerate() {
             assert!(r.width() > 0.0, "rect {i} has zero width");
             assert!(r.height() > 0.0, "rect {i} has zero height");
@@ -1061,31 +1003,34 @@ mod tests {
 
     #[test]
     fn find_node_root() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
+        let tree = build_test_tree(dir("root", vec![leaf("a.txt", 10)]));
         assert!(find_node(&tree, Path::new("root")).is_some());
     }
 
     #[test]
     fn find_node_child() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
+        let tree = build_test_tree(dir("root", vec![leaf("a.txt", 10)]));
         assert!(find_node(&tree, Path::new("root/a.txt")).is_some());
     }
 
     #[test]
     fn find_node_missing() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
+        let tree = build_test_tree(dir("root", vec![leaf("a.txt", 10)]));
         assert!(find_node(&tree, Path::new("missing")).is_none());
     }
 
     #[test]
     fn find_node_nested() {
-        let tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 5)])]);
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir("sub", vec![leaf("deep.txt", 5)])],
+        ));
         assert!(find_node(&tree, Path::new("root/sub/deep.txt")).is_some());
     }
 
     #[test]
     fn breadcrumbs_root() {
-        let tree = dir("root", vec![]);
+        let tree = build_test_tree(dir("root", vec![]));
         let bc = breadcrumbs(&tree, Path::new("root"));
         assert_eq!(bc.len(), 1);
         assert_eq!(bc[0].0, "root");
@@ -1093,7 +1038,10 @@ mod tests {
 
     #[test]
     fn breadcrumbs_nested() {
-        let tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 10)])]);
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir("sub", vec![leaf("f.txt", 10)])],
+        ));
         let bc = breadcrumbs(&tree, Path::new("root/sub"));
         assert_eq!(bc.len(), 2);
         assert_eq!(bc[0].0, "root");
@@ -1102,10 +1050,10 @@ mod tests {
 
     #[test]
     fn breadcrumbs_deep() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "root",
             vec![dir("a", vec![dir("b", vec![leaf("c.txt", 1)])])],
-        );
+        ));
         let bc = breadcrumbs(&tree, Path::new("root/a/b"));
         assert_eq!(bc.len(), 3);
         assert_eq!(bc[2].0, "b");
@@ -1113,7 +1061,7 @@ mod tests {
 
     #[test]
     fn breadcrumbs_missing_returns_root() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
+        let tree = build_test_tree(dir("root", vec![leaf("a.txt", 10)]));
         let bc = breadcrumbs(&tree, Path::new("missing"));
         assert_eq!(bc.len(), 1);
     }
@@ -1132,19 +1080,14 @@ mod tests {
 
     #[test]
     fn text_contrast() {
-        // Dark bg should give light text
         let tc = text_color_for_bg(egui::Color32::from_rgb(20, 20, 20));
         assert!(tc.r() > 200);
-        // Light bg should give dark text
         let tc = text_color_for_bg(egui::Color32::from_rgb(220, 220, 220));
         assert!(tc.r() < 50);
     }
 
-    // ── worst_ratio tests ──
-
     #[test]
     fn worst_ratio_single_square() {
-        // A single 100-area item on a 10-length side → strip is 10×10, ratio = 1
         let r = worst_ratio(&[100.0], 10.0);
         assert!((r - 1.0).abs() < 1e-9);
     }
@@ -1166,12 +1109,9 @@ mod tests {
 
     #[test]
     fn worst_ratio_equal_items() {
-        // Two 50-area items on a 10-length side → strip is 10×10, each 10×5, ratio = 2
         let r = worst_ratio(&[50.0, 50.0], 10.0);
         assert!((r - 2.0).abs() < 1e-9);
     }
-
-    // ── squarify bounds and ordering tests ──
 
     #[test]
     fn squarify_rects_within_bounds() {
@@ -1185,129 +1125,158 @@ mod tests {
                     && r.min.y >= bounds.min.y - 0.1
                     && r.max.x <= bounds.max.x + 0.1
                     && r.max.y <= bounds.max.y + 0.1,
-                "rect {i} ({:?}) outside bounds ({:?})",
-                r,
-                bounds
+                "rect {i} outside bounds"
             );
         }
     }
 
     #[test]
-    fn squarify_with_offset_origin() {
-        let rects = squarify(&[100.0], 50.0, 75.0, 200.0, 100.0);
-        assert_eq!(rects.len(), 1);
-        assert!((rects[0].min.x - 50.0).abs() < 0.1);
-        assert!((rects[0].min.y - 75.0).abs() < 0.1);
-        assert!((rects[0].width() - 200.0).abs() < 0.1);
-        assert!((rects[0].height() - 100.0).abs() < 0.1);
+    fn find_node_deeply_nested() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("deep.txt", 1)])])],
+            )],
+        ));
+        assert!(find_node(&tree, Path::new("root/a/b/c/deep.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c")).is_some());
+        assert!(find_node(&tree, Path::new("root/a/b/c/nope")).is_none());
     }
 
     #[test]
-    fn squarify_zero_width() {
-        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 0.0, 100.0);
-        assert_eq!(rects.len(), 2);
-        // All should be NOTHING rects
-        for r in &rects {
-            assert_eq!(*r, egui::Rect::NOTHING);
+    fn find_node_among_siblings() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                dir("sub", vec![leaf("c.txt", 5)]),
+            ],
+        ));
+        assert!(find_node(&tree, Path::new("root/b.txt")).is_some());
+        assert!(find_node(&tree, Path::new("root/sub/c.txt")).is_some());
+    }
+
+    #[test]
+    fn breadcrumbs_deep_path() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir(
+                "a",
+                vec![dir("b", vec![dir("c", vec![leaf("d.txt", 1)])])],
+            )],
+        ));
+        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"));
+        assert_eq!(bc.len(), 4);
+        assert_eq!(bc[0].0, "root");
+        assert_eq!(bc[1].0, "a");
+        assert_eq!(bc[2].0, "b");
+        assert_eq!(bc[3].0, "c");
+    }
+
+    #[test]
+    fn breadcrumbs_to_file() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir("sub", vec![leaf("file.txt", 10)])],
+        ));
+        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
+        assert_eq!(bc.len(), 3);
+        assert_eq!(bc[2].0, "file.txt");
+    }
+
+    #[test]
+    fn build_cache_basic() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![
+                dir("big", vec![leaf("a.mp4", 500), leaf("b.rs", 200)]),
+                leaf("c.txt", 300),
+            ],
+        ));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 2);
+        assert!(cache.other.is_none());
+        assert_eq!(cache.view_size, 1000);
+        assert_eq!(cache.layout_size, (800.0, 600.0));
+    }
+
+    #[test]
+    fn build_cache_with_zoom() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![
+                dir("sub", vec![leaf("a.txt", 100), leaf("b.txt", 200)]),
+                leaf("c.txt", 50),
+            ],
+        ));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let zoom = Some(PathBuf::from("root/sub"));
+        let cache = build_treemap_cache(&tree, &zoom, None, true, rect);
+        assert_eq!(cache.tiles.len(), 2);
+        assert_eq!(cache.view_size, 300);
+    }
+
+    #[test]
+    fn build_cache_other_bucket() {
+        let mut children = vec![leaf("big.mp4", 10000)];
+        for i in 0..20 {
+            children.push(leaf(&format!("tiny_{i}.txt"), 1));
         }
+        let tree = build_test_tree(dir("root", children));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert!(cache.other.is_some());
+        let other = cache.other.as_ref().unwrap();
+        assert_eq!(other.count, 20);
+        assert_eq!(other.size, 20);
     }
 
     #[test]
-    fn squarify_zero_height() {
-        let rects = squarify(&[100.0, 50.0], 0.0, 0.0, 100.0, 0.0);
-        assert_eq!(rects.len(), 2);
-        for r in &rects {
-            assert_eq!(*r, egui::Rect::NOTHING);
-        }
+    fn build_cache_dir_tile_has_nested() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![dir(
+                "sub",
+                vec![leaf("a.mp4", 500), leaf("b.rs", 300), leaf("c.txt", 200)],
+            )],
+        ));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        let tile = &cache.tiles[0];
+        assert!(tile.is_dir);
+        assert_eq!(tile.child_count, Some(3));
+        assert_eq!(tile.nested.len(), 3);
     }
 
     #[test]
-    fn squarify_all_zero_sizes() {
-        let rects = squarify(&[0.0, 0.0, 0.0], 0.0, 0.0, 100.0, 100.0);
-        assert_eq!(rects.len(), 3);
-        for r in &rects {
-            assert_eq!(*r, egui::Rect::NOTHING);
-        }
+    fn build_cache_hidden_filtered() {
+        let tree = build_test_tree(dir(
+            "root",
+            vec![leaf(".hidden", 500), leaf("visible.txt", 500)],
+        ));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let cache = build_treemap_cache(&tree, &None, None, false, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert_eq!(&*cache.tiles[0].name, "visible.txt");
     }
 
     #[test]
-    fn squarify_ordering_largest_gets_largest_rect() {
-        let sizes = vec![100.0, 50.0, 25.0, 10.0];
-        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
-        let areas: Vec<f32> = rects.iter().map(|r| r.width() * r.height()).collect();
-        // Each rect's area should be >= the next (matching descending size order)
-        for i in 0..areas.len() - 1 {
-            assert!(
-                areas[i] >= areas[i + 1] - 1.0,
-                "area[{}] = {} < area[{}] = {}",
-                i,
-                areas[i],
-                i + 1,
-                areas[i + 1]
-            );
-        }
+    fn build_cache_tile_colors_and_paths() {
+        let tree = build_test_tree(dir("root", vec![leaf("movie.mp4", 100)]));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        let tile = &cache.tiles[0];
+        assert_eq!(&*tile.name, "movie.mp4");
+        assert_eq!(tile.path, PathBuf::from("root/movie.mp4"));
+        assert_eq!(tile.color, extension_color("movie.mp4", false));
+        assert!(!tile.is_dir);
+        assert_eq!(tile.child_count, None);
     }
-
-    #[test]
-    fn squarify_tall_narrow_rect() {
-        let sizes = vec![60.0, 30.0, 10.0];
-        let rects = squarify(&sizes, 0.0, 0.0, 50.0, 600.0);
-        assert_eq!(rects.len(), 3);
-        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
-        assert!((total_area - 30000.0).abs() < 10.0);
-        for (i, r) in rects.iter().enumerate() {
-            assert!(r.width() > 0.0, "rect {i} has zero width");
-            assert!(r.height() > 0.0, "rect {i} has zero height");
-        }
-    }
-
-    #[test]
-    fn squarify_square_canvas() {
-        let sizes = vec![25.0, 25.0, 25.0, 25.0];
-        let rects = squarify(&sizes, 0.0, 0.0, 100.0, 100.0);
-        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
-        assert!((total_area - 10000.0).abs() < 1.0);
-        // All rects should have equal area
-        let expected_each = 2500.0f32;
-        for (i, r) in rects.iter().enumerate() {
-            let a = r.width() * r.height();
-            assert!(
-                (a - expected_each).abs() < 1.0,
-                "rect {i} area = {a}, expected {expected_each}"
-            );
-        }
-    }
-
-    #[test]
-    fn squarify_no_overlap_many_items() {
-        let sizes: Vec<f64> = (1..=50).rev().map(|i| i as f64).collect();
-        let rects = squarify(&sizes, 0.0, 0.0, 1000.0, 800.0);
-        assert_eq!(rects.len(), 50);
-        for i in 0..rects.len() {
-            for j in (i + 1)..rects.len() {
-                let overlap = rects[i].intersect(rects[j]);
-                assert!(
-                    overlap.area() < 2.0,
-                    "rects {i} and {j} overlap by {}",
-                    overlap.area()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn squarify_extreme_skew() {
-        // One huge item and several tiny ones
-        let sizes = vec![10000.0, 1.0, 1.0, 1.0];
-        let rects = squarify(&sizes, 0.0, 0.0, 400.0, 300.0);
-        assert_eq!(rects.len(), 4);
-        let a0 = rects[0].width() * rects[0].height();
-        let total_area: f32 = rects.iter().map(|r| r.width() * r.height()).sum();
-        // First rect should dominate
-        assert!(a0 / total_area > 0.99);
-    }
-
-    // ── darken / apply_alpha tests ──
 
     #[test]
     fn darken_reduces_rgb() {
@@ -1334,201 +1303,43 @@ mod tests {
     fn apply_alpha_half() {
         let c = egui::Color32::from_rgb(100, 150, 200);
         let result = apply_alpha(c, 0.5);
-        // Alpha should be halved (255 * 0.5 ≈ 127)
         assert!((result.a() as f32 - 127.0).abs() < 2.0);
-        // RGB premultiplied, so values are halved too
         assert!((result.r() as f32 - 50.0).abs() < 2.0);
     }
 
-    // ── extension_color category coverage ──
-
     #[test]
     fn extension_color_categories() {
-        // Audio
         assert_eq!(
             extension_color("song.mp3", false),
             egui::Color32::from_rgb(142, 68, 173)
         );
-        // Image
         assert_eq!(
             extension_color("photo.png", false),
             egui::Color32::from_rgb(39, 174, 96)
         );
-        // Archive
         assert_eq!(
             extension_color("backup.zip", false),
             egui::Color32::from_rgb(211, 84, 0)
         );
-        // Source code
         assert_eq!(
             extension_color("main.rs", false),
             egui::Color32::from_rgb(22, 160, 133)
         );
-        // Document
         assert_eq!(
             extension_color("report.pdf", false),
             egui::Color32::from_rgb(41, 128, 185)
         );
-        // Config
         assert_eq!(
             extension_color("config.json", false),
             egui::Color32::from_rgb(44, 62, 80)
         );
-        // Build artifact
         assert_eq!(
             extension_color("module.o", false),
             egui::Color32::from_rgb(146, 43, 33)
         );
-        // Unknown → default gray
         assert_eq!(
             extension_color("random.xyz", false),
             egui::Color32::from_rgb(93, 109, 126)
         );
-    }
-
-    // ── find_node / breadcrumbs with deeper trees ──
-
-    #[test]
-    fn find_node_deeply_nested() {
-        let tree = dir(
-            "root",
-            vec![dir(
-                "a",
-                vec![dir("b", vec![dir("c", vec![leaf("deep.txt", 1)])])],
-            )],
-        );
-        assert!(find_node(&tree, Path::new("root/a/b/c/deep.txt")).is_some());
-        assert!(find_node(&tree, Path::new("root/a/b/c")).is_some());
-        assert!(find_node(&tree, Path::new("root/a/b/c/nope")).is_none());
-    }
-
-    #[test]
-    fn find_node_among_siblings() {
-        let tree = dir(
-            "root",
-            vec![
-                leaf("a.txt", 10),
-                leaf("b.txt", 20),
-                dir("sub", vec![leaf("c.txt", 5)]),
-            ],
-        );
-        assert!(find_node(&tree, Path::new("root/b.txt")).is_some());
-        assert!(find_node(&tree, Path::new("root/sub/c.txt")).is_some());
-    }
-
-    #[test]
-    fn breadcrumbs_deep_path() {
-        let tree = dir(
-            "root",
-            vec![dir(
-                "a",
-                vec![dir("b", vec![dir("c", vec![leaf("d.txt", 1)])])],
-            )],
-        );
-        let bc = breadcrumbs(&tree, Path::new("root/a/b/c"));
-        assert_eq!(bc.len(), 4);
-        assert_eq!(bc[0].0, "root");
-        assert_eq!(bc[1].0, "a");
-        assert_eq!(bc[2].0, "b");
-        assert_eq!(bc[3].0, "c");
-    }
-
-    #[test]
-    fn breadcrumbs_to_file() {
-        let tree = dir("root", vec![dir("sub", vec![leaf("file.txt", 10)])]);
-        let bc = breadcrumbs(&tree, Path::new("root/sub/file.txt"));
-        assert_eq!(bc.len(), 3);
-        assert_eq!(bc[2].0, "file.txt");
-    }
-
-    // ── build_treemap_cache tests ──
-
-    #[test]
-    fn build_cache_basic() {
-        let tree = dir(
-            "root",
-            vec![
-                dir("big", vec![leaf("a.mp4", 500), leaf("b.rs", 200)]),
-                leaf("c.txt", 300),
-            ],
-        );
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
-        assert_eq!(cache.tiles.len(), 2);
-        assert!(cache.other.is_none());
-        assert_eq!(cache.view_size, 1000);
-        assert_eq!(cache.layout_size, (800.0, 600.0));
-    }
-
-    #[test]
-    fn build_cache_with_zoom() {
-        let tree = dir(
-            "root",
-            vec![
-                dir("sub", vec![leaf("a.txt", 100), leaf("b.txt", 200)]),
-                leaf("c.txt", 50),
-            ],
-        );
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let zoom = Some(std::path::PathBuf::from("root/sub"));
-        let cache = build_treemap_cache(&tree, &zoom, None, true, rect);
-        assert_eq!(cache.tiles.len(), 2);
-        assert_eq!(cache.view_size, 300);
-    }
-
-    #[test]
-    fn build_cache_other_bucket() {
-        let mut children: Vec<FileNode> = vec![leaf("big.mp4", 10000)];
-        for i in 0..20 {
-            children.push(leaf(&format!("tiny_{i}.txt"), 1));
-        }
-        let tree = dir("root", children);
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
-        assert_eq!(cache.tiles.len(), 1);
-        assert!(cache.other.is_some());
-        let other = cache.other.as_ref().unwrap();
-        assert_eq!(other.count, 20);
-        assert_eq!(other.size, 20);
-    }
-
-    #[test]
-    fn build_cache_dir_tile_has_nested() {
-        let tree = dir(
-            "root",
-            vec![dir(
-                "sub",
-                vec![leaf("a.mp4", 500), leaf("b.rs", 300), leaf("c.txt", 200)],
-            )],
-        );
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
-        assert_eq!(cache.tiles.len(), 1);
-        let tile = &cache.tiles[0];
-        assert!(tile.is_dir);
-        assert_eq!(tile.child_count, Some(3));
-        assert_eq!(tile.nested.len(), 3);
-    }
-
-    #[test]
-    fn build_cache_hidden_filtered() {
-        let tree = dir("root", vec![leaf(".hidden", 500), leaf("visible.txt", 500)]);
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let cache = build_treemap_cache(&tree, &None, None, false, rect);
-        assert_eq!(cache.tiles.len(), 1);
-        assert_eq!(&*cache.tiles[0].name, "visible.txt");
-    }
-
-    #[test]
-    fn build_cache_tile_colors_and_paths() {
-        let tree = dir("root", vec![leaf("movie.mp4", 100)]);
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
-        let tile = &cache.tiles[0];
-        assert_eq!(&*tile.name, "movie.mp4");
-        assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
-        assert_eq!(tile.color, extension_color("movie.mp4", false));
-        assert!(!tile.is_dir);
-        assert_eq!(tile.child_count, None);
     }
 }

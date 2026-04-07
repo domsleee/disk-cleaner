@@ -49,7 +49,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use disk_cleaner::scanner::{self, ScanProgress};
-use disk_cleaner::tree::FileNode;
+use disk_cleaner::tree::{FileTree, NodeId};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -96,8 +96,8 @@ fn new_progress() -> Arc<ScanProgress> {
     })
 }
 
-fn count_nodes(node: &FileNode) -> usize {
-    1 + node.children().iter().map(count_nodes).sum::<usize>()
+fn count_nodes(tree: &FileTree, id: NodeId) -> usize {
+    1 + tree.children(id).iter().map(|&c| count_nodes(tree, c)).sum::<usize>()
 }
 
 // ── Fixture ──────────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ fn bench_regression_memory(c: &mut Criterion) {
     let files = progress.file_count.load(Ordering::Relaxed);
     let total_size = progress.total_size.load(Ordering::Relaxed);
     let delta = after.saturating_sub(before);
-    let nodes = count_nodes(&tree);
+    let nodes = count_nodes(&tree, tree.root());
     let bytes_per_node = delta as f64 / nodes as f64;
 
     let mem_status = if bytes_per_node <= MAX_BYTES_PER_NODE {

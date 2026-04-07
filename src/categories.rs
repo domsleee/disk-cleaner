@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use crate::tree::FileNode;
+use crate::tree::{FileTree, NodeId};
 
 /// High-level file category for grouping by type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -70,9 +70,9 @@ pub struct CategoryStats {
 }
 
 /// Compute file category statistics from a scanned tree.
-pub fn compute_stats(tree: &FileNode) -> CategoryStats {
+pub fn compute_stats(tree: &FileTree) -> CategoryStats {
     let mut map: HashMap<FileCategory, (u64, usize)> = HashMap::new();
-    collect_stats(tree, &mut map);
+    collect_stats(tree, tree.root(), &mut map);
 
     let mut entries: Vec<(FileCategory, u64, usize)> = map
         .into_iter()
@@ -83,32 +83,36 @@ pub fn compute_stats(tree: &FileNode) -> CategoryStats {
     CategoryStats { entries }
 }
 
-fn collect_stats(node: &FileNode, map: &mut HashMap<FileCategory, (u64, usize)>) {
-    if !node.is_dir() {
-        let cat = categorize(node.name());
+fn collect_stats(
+    tree: &FileTree,
+    id: NodeId,
+    map: &mut HashMap<FileCategory, (u64, usize)>,
+) {
+    if !tree.is_dir(id) {
+        let cat = categorize(tree.name(id));
         let entry = map.entry(cat).or_insert((0, 0));
-        entry.0 += node.size();
+        entry.0 += tree.size(id);
         entry.1 += 1;
     }
-    for child in node.children() {
-        collect_stats(child, map);
+    for &child in tree.children(id) {
+        collect_stats(tree, child, map);
     }
 }
 
 /// Returns true if this node (or any descendant) matches the given category.
-pub fn node_matches_category(node: &FileNode, cat: FileCategory) -> bool {
-    if !node.is_dir() {
-        return categorize(node.name()) == cat;
+pub fn node_matches_category(tree: &FileTree, id: NodeId, cat: FileCategory) -> bool {
+    if !tree.is_dir(id) {
+        return categorize(tree.name(id)) == cat;
     }
-    node.children()
+    tree.children(id)
         .iter()
-        .any(|c| node_matches_category(c, cat))
+        .any(|&c| node_matches_category(tree, c, cat))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{dir, leaf};
+    use crate::tree::{build_test_tree, dir, leaf};
 
     #[test]
     fn categorize_video() {
@@ -137,7 +141,7 @@ mod tests {
 
     #[test]
     fn stats_counts_files() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "root",
             vec![
                 leaf("movie.mp4", 1000),
@@ -145,7 +149,7 @@ mod tests {
                 leaf("photo.jpg", 200),
                 leaf("readme.md", 50),
             ],
-        );
+        ));
         let stats = compute_stats(&tree);
         assert!(!stats.entries.is_empty());
         // First entry should be largest (video = 1000)
@@ -156,12 +160,11 @@ mod tests {
 
     #[test]
     fn stats_aggregates_category() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "root",
             vec![leaf("a.rs", 100), leaf("b.py", 200), leaf("c.toml", 50)],
-        );
+        ));
         let stats = compute_stats(&tree);
-        // All are Code category
         assert_eq!(stats.entries.len(), 1);
         assert_eq!(stats.entries[0].0, FileCategory::Code);
         assert_eq!(stats.entries[0].1, 350);
@@ -170,16 +173,15 @@ mod tests {
 
     #[test]
     fn stats_sorted_by_size() {
-        let tree = dir(
+        let tree = build_test_tree(dir(
             "root",
             vec![
                 leaf("small.txt", 10),
                 leaf("big.mp4", 9999),
                 leaf("medium.zip", 500),
             ],
-        );
+        ));
         let stats = compute_stats(&tree);
-        // Should be sorted descending by size
         for i in 1..stats.entries.len() {
             assert!(stats.entries[i - 1].1 >= stats.entries[i].1);
         }
@@ -187,16 +189,19 @@ mod tests {
 
     #[test]
     fn node_matches_category_file() {
-        let node = leaf("video.mp4", 100);
-        assert!(node_matches_category(&node, FileCategory::Video));
-        assert!(!node_matches_category(&node, FileCategory::Audio));
+        let tree = build_test_tree(leaf("video.mp4", 100));
+        assert!(node_matches_category(&tree, tree.root(), FileCategory::Video));
+        assert!(!node_matches_category(&tree, tree.root(), FileCategory::Audio));
     }
 
     #[test]
     fn node_matches_category_dir() {
-        let tree = dir("root", vec![leaf("song.mp3", 50), leaf("readme.md", 10)]);
-        assert!(node_matches_category(&tree, FileCategory::Audio));
-        assert!(node_matches_category(&tree, FileCategory::Code));
-        assert!(!node_matches_category(&tree, FileCategory::Video));
+        let tree = build_test_tree(dir(
+            "root",
+            vec![leaf("song.mp3", 50), leaf("readme.md", 10)],
+        ));
+        assert!(node_matches_category(&tree, tree.root(), FileCategory::Audio));
+        assert!(node_matches_category(&tree, tree.root(), FileCategory::Code));
+        assert!(!node_matches_category(&tree, tree.root(), FileCategory::Video));
     }
 }

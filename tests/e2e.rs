@@ -5,7 +5,7 @@
 
 use disk_cleaner::categories::{compute_stats, FileCategory};
 use disk_cleaner::scanner::{scan_directory, ScanProgress};
-use disk_cleaner::tree::auto_expand;
+use disk_cleaner::tree::{auto_expand, FileTree, NodeId};
 use disk_cleaner::ui;
 use std::collections::HashSet;
 use std::fs;
@@ -34,9 +34,17 @@ fn progress() -> Arc<ScanProgress> {
     })
 }
 
-/// Helper: scan a temp directory and return the tree root.
-fn scan(dir: &std::path::Path) -> disk_cleaner::tree::FileNode {
+/// Helper: scan a temp directory and return the tree.
+fn scan(dir: &std::path::Path) -> FileTree {
     scan_directory(dir, progress())
+}
+
+/// Find a child of `parent` whose name matches `name`.
+fn find_child(tree: &FileTree, parent: NodeId, name: &str) -> Option<NodeId> {
+    tree.children(parent)
+        .iter()
+        .copied()
+        .find(|&c| tree.name(c) == name)
 }
 
 // ---------------------------------------------------------------------------
@@ -54,25 +62,27 @@ fn scan_produces_correct_hierarchy() {
     create_file(&root.join("sub"), "c.log", 300);
 
     let tree = scan(root);
+    let r = tree.root();
 
-    assert!(tree.is_dir());
-    assert_eq!(tree.children().len(), 3); // a.txt, b.rs, sub/
-    assert!(tree.size() >= 600);
+    assert!(tree.is_dir(r));
+    assert_eq!(tree.children(r).len(), 3); // a.txt, b.rs, sub/
+    assert!(tree.size(r) >= 600);
 
-    let sub = tree.children().iter().find(|c| c.name() == "sub").unwrap();
-    assert!(sub.is_dir());
-    assert_eq!(sub.children().len(), 1);
-    assert_eq!(sub.children()[0].name(), "c.log");
-    assert!(sub.children()[0].size() >= 300);
+    let sub = find_child(&tree, r, "sub").unwrap();
+    assert!(tree.is_dir(sub));
+    assert_eq!(tree.children(sub).len(), 1);
+    assert_eq!(tree.name(tree.children(sub)[0]), "c.log");
+    assert!(tree.size(tree.children(sub)[0]) >= 300);
 }
 
 #[test]
 fn scan_empty_dir_produces_empty_tree() {
     let tmp = tmpdir();
     let tree = scan(tmp.path());
-    assert!(tree.is_dir());
-    assert_eq!(tree.children().len(), 0);
-    assert_eq!(tree.size(), 0);
+    let r = tree.root();
+    assert!(tree.is_dir(r));
+    assert_eq!(tree.children(r).len(), 0);
+    assert_eq!(tree.size(r), 0);
 }
 
 #[test]
@@ -86,21 +96,19 @@ fn scan_deeply_nested_structure() {
     create_file(&cur, "deep.txt", 42);
 
     let tree = scan(tmp.path());
-    assert!(tree.size() >= 42);
+    let r = tree.root();
+    assert!(tree.size(r) >= 42);
 
     // Walk down 5 levels
-    let mut node = &tree;
+    let mut node = r;
     for i in 0..5 {
-        let child = node
-            .children()
-            .iter()
-            .find(|c| c.name() == format!("level{i}"))
+        let child = find_child(&tree, node, &format!("level{i}"))
             .unwrap_or_else(|| panic!("Missing level{i}"));
-        assert!(child.is_dir());
+        assert!(tree.is_dir(child));
         node = child;
     }
-    assert_eq!(node.children().len(), 1);
-    assert_eq!(node.children()[0].name(), "deep.txt");
+    assert_eq!(tree.children(node).len(), 1);
+    assert_eq!(tree.name(tree.children(node)[0]), "deep.txt");
 }
 
 // ---------------------------------------------------------------------------
@@ -169,14 +177,15 @@ fn auto_expand_works_on_scanned_tree() {
     create_file(&root.join("tiny"), "small.txt", 10);
 
     let mut tree = scan(root);
-    tree.set_expanded(true);
-    auto_expand(&mut tree, 0, 2);
+    let r = tree.root();
+    tree.set_expanded(r, true);
+    auto_expand(&mut tree, r, 0, 2);
 
-    let big = tree.children().iter().find(|c| c.name() == "big").unwrap();
-    assert!(big.expanded(), "big/ should auto-expand (dominant)");
+    let big = find_child(&tree, r, "big").unwrap();
+    assert!(tree.expanded(big), "big/ should auto-expand (dominant)");
 
-    let tiny = tree.children().iter().find(|c| c.name() == "tiny").unwrap();
-    assert!(!tiny.expanded(), "tiny/ should not auto-expand");
+    let tiny = find_child(&tree, r, "tiny").unwrap();
+    assert!(!tree.expanded(tiny), "tiny/ should not auto-expand");
 }
 
 // ---------------------------------------------------------------------------
@@ -228,25 +237,18 @@ fn search_filter_matches_correct_nodes() {
     create_file(&root.join("docs"), "guide.md", 300);
 
     let tree = scan(root);
+    let r = tree.root();
 
-    assert!(ui::node_matches(&tree, "md"));
+    assert!(ui::node_matches(&tree, r, "md"));
 
-    let readme = tree
-        .children()
-        .iter()
-        .find(|c| c.name() == "readme.md")
-        .unwrap();
-    assert!(ui::node_matches(readme, "md"));
+    let readme = find_child(&tree, r, "readme.md").unwrap();
+    assert!(ui::node_matches(&tree, readme, "md"));
 
-    let main_rs = tree
-        .children()
-        .iter()
-        .find(|c| c.name() == "main.rs")
-        .unwrap();
-    assert!(!ui::node_matches(main_rs, "md"));
+    let main_rs = find_child(&tree, r, "main.rs").unwrap();
+    assert!(!ui::node_matches(&tree, main_rs, "md"));
 
-    let docs = tree.children().iter().find(|c| c.name() == "docs").unwrap();
-    assert!(ui::node_matches(docs, "md")); // matches because descendant has .md
+    let docs = find_child(&tree, r, "docs").unwrap();
+    assert!(ui::node_matches(&tree, docs, "md")); // matches because descendant has .md
 }
 
 // ---------------------------------------------------------------------------
@@ -262,16 +264,19 @@ fn remove_node_updates_tree_sizes() {
     create_file(root, "remove.txt", 500);
 
     let mut tree = scan(root);
-    let original_size = tree.size();
-    assert_eq!(tree.children().len(), 2);
+    let r = tree.root();
+    let original_size = tree.size(r);
+    assert_eq!(tree.children(r).len(), 2);
 
     let remove_path = root.join("remove.txt");
     let removed_size = ui::remove_node(&mut tree, &remove_path);
 
     assert!(removed_size.is_some());
-    assert_eq!(tree.children().len(), 1);
-    assert_eq!(tree.children()[0].name(), "keep.txt");
-    assert!(tree.size() < original_size);
+    let r = tree.root();
+    assert_eq!(tree.children(r).len(), 1);
+    // After swap-remove, order may change, so check by name
+    assert_eq!(tree.name(tree.children(r)[0]), "keep.txt");
+    assert!(tree.size(r) < original_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,14 +292,16 @@ fn delete_file_removes_from_tree_and_filesystem() {
     create_file(root, "keep.txt", 200);
 
     let mut tree = scan(root);
-    assert_eq!(tree.children().len(), 2);
+    let r = tree.root();
+    assert_eq!(tree.children(r).len(), 2);
 
     // Delete via filesystem (same codepath as permanent delete)
     fs::remove_file(&delete_me).unwrap();
     ui::remove_node(&mut tree, &delete_me);
 
-    assert_eq!(tree.children().len(), 1);
-    assert_eq!(tree.children()[0].name(), "keep.txt");
+    let r = tree.root();
+    assert_eq!(tree.children(r).len(), 1);
+    assert_eq!(tree.name(tree.children(r)[0]), "keep.txt");
     assert!(!delete_me.exists());
 }
 
@@ -311,7 +318,7 @@ fn toggle_expand_reveals_children_in_visible_paths() {
     create_file(&root.join("folder"), "inner.txt", 100);
     create_file(root, "outer.txt", 200);
 
-    let mut tree = scan(root);
+    let tree = scan(root);
     // Root is already expanded by scanner
 
     // Before expanding folder, inner.txt should not be visible
@@ -323,7 +330,8 @@ fn toggle_expand_reveals_children_in_visible_paths() {
         "inner.txt should not be visible when folder is collapsed"
     );
 
-    // Expand the folder
+    // Expand the folder (need mut)
+    let mut tree = tree;
     ui::toggle_expand(&mut tree, &root.join("folder"));
 
     let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
@@ -441,11 +449,12 @@ fn full_pipeline_scan_select_clear() {
 
     // Step 1: Scan
     let mut tree = scan(root);
-    assert!(tree.size() >= 1100);
-    assert_eq!(tree.children().len(), 3); // src/, docs/, Cargo.toml
+    let r = tree.root();
+    assert!(tree.size(r) >= 1100);
+    assert_eq!(tree.children(r).len(), 3); // src/, docs/, Cargo.toml
 
     // Step 2: Auto-expand
-    auto_expand(&mut tree, 0, 2);
+    auto_expand(&mut tree, r, 0, 2);
 
     // Step 3: Select files via HashSet (matching production code path)
     let main_path = root.join("src").join("main.rs");
@@ -465,15 +474,12 @@ fn full_pipeline_scan_select_clear() {
     assert_eq!(selected_paths.len(), 0);
 
     // Step 5: Verify tree structure is intact
-    let src = tree.children().iter().find(|c| c.name() == "src").unwrap();
-    assert_eq!(src.children().len(), 2);
-    let docs = tree.children().iter().find(|c| c.name() == "docs").unwrap();
-    assert_eq!(docs.children().len(), 1);
+    let r = tree.root();
+    let src = find_child(&tree, r, "src").unwrap();
+    assert_eq!(tree.children(src).len(), 2);
+    let docs = find_child(&tree, r, "docs").unwrap();
+    assert_eq!(tree.children(docs).len(), 1);
 }
-
-// ---------------------------------------------------------------------------
-// Scan cancellation
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Disclosure triangle click clears stale selection
@@ -494,7 +500,6 @@ fn disclosure_triangle_click_clears_selection() {
     // Simulate the app state fields relevant to selection
     let mut selected_paths: HashSet<PathBuf> = HashSet::new();
     // --- Step 1: Plain click on folder_a (Click action) ---
-    // This mirrors the Click handler in main.rs
     let click_path = root.join("folder_a");
     selected_paths.clear();
     selected_paths.insert(click_path.clone());
@@ -505,7 +510,6 @@ fn disclosure_triangle_click_clears_selection() {
     assert_eq!(focused_path.as_deref(), Some(click_path.as_path()));
 
     // --- Step 2: Click disclosure triangle on folder_b ---
-    // The UI emits two actions: Focus(folder_b) + ToggleExpand(folder_b)
     let triangle_path = root.join("folder_b");
 
     // Focus action (processed first in the action loop)
@@ -516,25 +520,20 @@ fn disclosure_triangle_click_clears_selection() {
     selected_paths.clear(); // <-- the fix under test
 
     // --- Assertions ---
-    // Selection must be empty (no ghost highlight on folder_a)
     assert!(
         selected_paths.is_empty(),
         "selected_paths should be empty after disclosure triangle click"
     );
-    // Focus should point to the triangle-clicked row
     assert_eq!(
         focused_path.as_deref(),
         Some(triangle_path.as_path()),
         "focused_path should be set to the disclosure-triangle target"
     );
     // The folder should now be expanded
-    let folder_b = tree
-        .children()
-        .iter()
-        .find(|c| c.name() == "folder_b")
-        .unwrap();
+    let r = tree.root();
+    let folder_b = find_child(&tree, r, "folder_b").unwrap();
     assert!(
-        folder_b.expanded(),
+        tree.expanded(folder_b),
         "folder_b should be expanded after toggle"
     );
 }
@@ -559,6 +558,7 @@ fn cancelled_scan_stops_early() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let tree = scan_directory(root, prog);
+    let r = tree.root();
     // Tree should be mostly empty due to cancellation
-    assert!(tree.children().len() < 100);
+    assert!(tree.children(r).len() < 100);
 }

@@ -1,5 +1,6 @@
 mod app_icon;
 mod categories;
+mod deleter;
 mod icons;
 mod scanner;
 mod suggestions;
@@ -11,7 +12,7 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -35,8 +36,7 @@ struct ScanResult {
 use tree::FileNode;
 use treemap::TreemapAction;
 
-/// Result of background deletion: list of (path, optional error message).
-type DeleteResults = Vec<(PathBuf, Option<String>)>;
+use deleter::BackgroundDeleter;
 
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
@@ -248,10 +248,7 @@ struct App {
     /// Number of screenshots saved (for tracking completion).
     screenshots_saved: u8,
     /// Background deletion state.
-    deleting: bool,
-    delete_progress: Arc<AtomicUsize>,
-    delete_total: usize,
-    delete_receiver: Option<mpsc::Receiver<DeleteResults>>,
+    deleter: BackgroundDeleter,
 }
 
 impl Default for App {
@@ -304,10 +301,7 @@ impl Default for App {
             screenshot_prefix: None,
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
-            deleting: false,
-            delete_progress: Arc::new(AtomicUsize::new(0)),
-            delete_total: 0,
-            delete_receiver: None,
+            deleter: BackgroundDeleter::default(),
         }
     }
 }
@@ -406,75 +400,34 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        self.start_background_delete(paths, true);
+        self.deleter.start(paths, true);
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        self.start_background_delete(paths, false);
-    }
-
-    /// Spawn deletion on a background thread so the UI stays responsive.
-    fn start_background_delete(&mut self, paths: Vec<PathBuf>, use_trash: bool) {
-        if paths.is_empty() || self.deleting {
-            return;
-        }
-        let total = paths.len();
-        let progress = Arc::new(AtomicUsize::new(0));
-        let progress_clone = Arc::clone(&progress);
-        let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            // Collect results: (path, error_or_none)
-            let mut results: Vec<(PathBuf, Option<String>)> = Vec::with_capacity(total);
-            for path in paths {
-                let result = if use_trash {
-                    trash::delete(&path).map_err(|e| e.to_string())
-                } else if path.is_dir() {
-                    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
-                } else {
-                    std::fs::remove_file(&path).map_err(|e| e.to_string())
-                };
-                let err = result.err();
-                results.push((path, err));
-                progress_clone.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = tx.send(results);
-        });
-
-        self.deleting = true;
-        self.delete_progress = progress;
-        self.delete_total = total;
-        self.delete_receiver = Some(rx);
+        self.deleter.start(paths, false);
     }
 
     /// Poll for background deletion completion and apply results to the tree.
     fn poll_delete_completion(&mut self) {
-        if !self.deleting {
-            return;
-        }
-        if let Some(ref rx) = self.delete_receiver {
-            if let Ok(results) = rx.try_recv() {
-                let mut deleted_paths = Vec::new();
-                for (path, err) in results {
-                    if let Some(msg) = err {
-                        self.error = Some(format!("Delete failed: {msg}"));
-                    } else {
-                        if let Some(ref mut tree) = self.tree {
-                            ui::remove_node(tree, &path);
-                            self.mark_dirty();
-                        }
-                        deleted_paths.push(path);
+        if let deleter::PollResult::Done(results) = self.deleter.poll() {
+            let mut deleted_paths = Vec::new();
+            for (path, err) in results {
+                if let Some(msg) = err {
+                    self.error = Some(format!("Delete failed: {msg}"));
+                } else {
+                    if let Some(ref mut tree) = self.tree {
+                        ui::remove_node(tree, &path);
+                        self.mark_dirty();
                     }
+                    deleted_paths.push(path);
                 }
-                if !deleted_paths.is_empty() {
-                    if let Some(ref mut report) = self.suggestion_report {
-                        report.remove_paths(&deleted_paths);
-                    }
-                    self.refresh_disk_info();
+            }
+            if !deleted_paths.is_empty() {
+                if let Some(ref mut report) = self.suggestion_report {
+                    report.remove_paths(&deleted_paths);
                 }
-                self.deleting = false;
-                self.delete_receiver = None;
+                self.refresh_disk_info();
             }
         }
     }
@@ -590,7 +543,7 @@ impl eframe::App for App {
 
         // Check if background deletion completed
         self.poll_delete_completion();
-        if self.deleting {
+        if self.deleter.is_active() {
             ctx.request_repaint();
         }
 
@@ -790,7 +743,7 @@ impl eframe::App for App {
                     self.confirm_delete = Some(focused.clone());
                 } else if del {
                     self.selected_paths.remove(focused);
-                    self.start_background_delete(vec![focused.clone()], true);
+                    self.deleter.start(vec![focused.clone()], true);
                     self.focused_path = None;
                 }
             }
@@ -870,7 +823,7 @@ impl eframe::App for App {
 
         if let Some(path) = do_delete {
             self.selected_paths.remove(&path);
-            self.start_background_delete(vec![path], false);
+            self.deleter.start(vec![path], false);
         }
 
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
@@ -1396,9 +1349,7 @@ impl eframe::App for App {
                     );
                     self.tree_scroll_to_focus = false;
                     let render_elapsed = render_start.elapsed();
-                    if debug_enabled()
-                        && render_elapsed > std::time::Duration::from_millis(16)
-                    {
+                    if debug_enabled() && render_elapsed > std::time::Duration::from_millis(16) {
                         eprintln!(
                             "[perf] tree frame: {:?} ({} rows, rebuild={})",
                             render_elapsed,
@@ -1452,7 +1403,7 @@ impl eframe::App for App {
                             }
                             ui::TreeAction::Trash(path) => {
                                 self.selected_paths.remove(path);
-                                self.start_background_delete(vec![path.clone()], true);
+                                self.deleter.start(vec![path.clone()], true);
                             }
                             ui::TreeAction::TrashSelected => {
                                 self.batch_trash_selected();
@@ -1559,7 +1510,7 @@ impl eframe::App for App {
                         }
                     }
                     if !trash_paths.is_empty() {
-                        self.start_background_delete(trash_paths, true);
+                        self.deleter.start(trash_paths, true);
                     }
                 }
             }
@@ -1622,9 +1573,9 @@ impl eframe::App for App {
         }
 
         // Deletion progress overlay
-        if self.deleting {
-            let done = self.delete_progress.load(Ordering::Relaxed);
-            let total = self.delete_total;
+        if self.deleter.is_active() {
+            let done = self.deleter.done_count();
+            let total = self.deleter.total();
             let fraction = if total > 0 {
                 done as f32 / total as f32
             } else {

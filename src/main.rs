@@ -131,7 +131,9 @@ fn main() -> eframe::Result {
                 } else {
                     PathBuf::from(other)
                 };
-                let p = expanded;
+                // Canonicalize so relative paths (e.g. "../") resolve to
+                // absolute paths before we pass them to the scanner.
+                let p = expanded.canonicalize().unwrap_or(expanded);
                 if !p.is_dir() {
                     eprintln!("Error: not a directory: {other}");
                     std::process::exit(1);

@@ -80,6 +80,19 @@ fn save_config(last_path: &std::path::Path, show_hidden: bool) {
     }
 }
 
+/// Strip the `\\?\` extended-length path prefix that `canonicalize()` adds
+/// on Windows. The prefix is unnecessary for paths under 260 chars and
+/// displays poorly in the UI.
+#[cfg(windows)]
+fn dunce_simplified(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 fn print_help() {
     eprintln!("Usage: disk-cleaner [OPTIONS] [PATH]");
     eprintln!();
@@ -131,7 +144,14 @@ fn main() -> eframe::Result {
                 } else {
                     PathBuf::from(other)
                 };
-                let p = expanded;
+                // Canonicalize so relative paths (e.g. "../") resolve to
+                // absolute paths before we pass them to the scanner.
+                // On Windows, strip the \\?\ extended-length prefix that
+                // canonicalize() adds — it's unnecessary for normal paths
+                // and looks ugly in the UI.
+                let p = expanded.canonicalize().unwrap_or(expanded);
+                #[cfg(windows)]
+                let p = dunce_simplified(&p);
                 if !p.is_dir() {
                     eprintln!("Error: not a directory: {other}");
                     std::process::exit(1);

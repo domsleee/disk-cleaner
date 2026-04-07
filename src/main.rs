@@ -314,6 +314,9 @@ impl App {
     }
 
     fn start_scan(&mut self, path: PathBuf) {
+        // Resolve to absolute path so the UI always shows the full path
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+
         // Cancel any in-progress scan so its threads release the rayon pool
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
 

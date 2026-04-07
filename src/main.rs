@@ -172,7 +172,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Disk Cleaner",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+            // Tell the OS to use dark window decorations (title bar on Windows).
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
             let mut app = App {
                 process_start: Some(process_start),
                 screenshot_prefix: screenshot_prefix.clone(),
@@ -1436,9 +1440,7 @@ impl eframe::App for App {
                     );
                     self.tree_scroll_to_focus = false;
                     let render_elapsed = render_start.elapsed();
-                    if debug_enabled()
-                        && render_elapsed > std::time::Duration::from_millis(16)
-                    {
+                    if debug_enabled() && render_elapsed > std::time::Duration::from_millis(16) {
                         eprintln!(
                             "[perf] tree frame: {:?} ({} rows, rebuild={})",
                             render_elapsed,

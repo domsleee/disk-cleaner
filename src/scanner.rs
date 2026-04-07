@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::{DirNode, FileLeaf, FileNode};
+use crate::tree::{ChildVec, DirNode, FileLeaf, FileNode};
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -237,7 +237,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         return FileNode::Dir(Box::new(DirNode {
             name: dir_name,
             size: 0,
-            children: Vec::new(),
+            children: ChildVec::new(),
             expanded: false,
             hidden: dir_hidden,
         }));
@@ -249,7 +249,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
             return FileNode::Dir(Box::new(DirNode {
                 name: dir_name,
                 size: 0,
-                children: Vec::new(),
+                children: ChildVec::new(),
                 expanded: false,
                 hidden: dir_hidden,
             }));
@@ -291,6 +291,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     children.sort_by_key(|b| std::cmp::Reverse(b.size()));
     children.shrink_to_fit();
+    let children: ChildVec = children.into();
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

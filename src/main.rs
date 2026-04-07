@@ -173,7 +173,7 @@ fn main() -> eframe::Result {
         "Disk Cleaner",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
             let mut app = App {
                 process_start: Some(process_start),
                 screenshot_prefix: screenshot_prefix.clone(),

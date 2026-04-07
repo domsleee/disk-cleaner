@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use disk_cleaner::intern::PathInterner;
 use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
 use disk_cleaner::treemap;
 use eframe::egui;
@@ -60,7 +61,7 @@ fn bench_build_cache(c: &mut Criterion) {
         let tree = build_applications_like(50, 20);
         let n = count_nodes(&tree);
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
-            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
+            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect, &mut PathInterner::new()))
         });
     }
 
@@ -69,7 +70,7 @@ fn bench_build_cache(c: &mut Criterion) {
         let tree = build_applications_like(100, 100);
         let n = count_nodes(&tree);
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
-            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
+            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect, &mut PathInterner::new()))
         });
     }
 
@@ -78,7 +79,7 @@ fn bench_build_cache(c: &mut Criterion) {
         let tree = build_applications_like(200, 200);
         let n = count_nodes(&tree);
         group.bench_with_input(BenchmarkId::new("apps", n), &tree, |b, t| {
-            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
+            b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect, &mut PathInterner::new()))
         });
     }
 
@@ -142,7 +143,7 @@ fn bench_tree_navigation(c: &mut Criterion) {
     });
 
     group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
-        b.iter(|| treemap::breadcrumbs(t, &zoom))
+        b.iter(|| treemap::breadcrumbs(t, &zoom, &mut PathInterner::new()))
     });
 
     group.finish();
@@ -211,7 +212,7 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
 
         // Breadcrumbs at scale
         group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
-            b.iter(|| treemap::breadcrumbs(t, &deep))
+            b.iter(|| treemap::breadcrumbs(t, &deep, &mut PathInterner::new()))
         });
     }
 

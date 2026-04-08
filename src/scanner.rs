@@ -6,8 +6,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use rayon::iter::ParallelBridge;
-use rayon::prelude::ParallelIterator;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
 
@@ -181,7 +180,7 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
-    let mut root_node = walk_dir(root, &progress, &skip);
+    let mut root_node = walk_dir(root, None, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
@@ -219,21 +218,34 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
-/// Parallel recursive directory walk, following dust's par_bridge() pattern.
-fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
+/// Parallel recursive directory walk.
+///
+/// Collects all directory entries up front, processes files inline, then
+/// recurses into subdirectories in parallel via `into_par_iter()`. This
+/// replaces the prior `par_bridge()` approach which serialized the `ReadDir`
+/// iterator — only one thread could dequeue entries, limiting parallelism
+/// for wide directories with many subdirectories.
+///
+/// `parent_meta` is the metadata from the parent's `DirEntry`, passed down
+/// to avoid a redundant `lstat` per directory. `None` for the root call.
+fn walk_dir(
+    dir: &Path,
+    parent_meta: Option<&std::fs::Metadata>,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
-    let dir_hidden = std::fs::symlink_metadata(dir)
-        .map(|m| is_hidden_from_metadata(&dir_name, &m))
-        .unwrap_or_else(|_| dir_name.starts_with('.'));
+    let dir_hidden = match parent_meta {
+        Some(m) => is_hidden_from_metadata(&dir_name, m),
+        None => std::fs::symlink_metadata(dir)
+            .map(|m| is_hidden_from_metadata(&dir_name, &m))
+            .unwrap_or_else(|_| dir_name.starts_with('.')),
+    };
 
-    // Build the empty fallback only in early-return paths to avoid cloning
-    // dir_name and allocating a Vec on every directory visit.
-
-    // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
         return FileNode::Dir(Box::new(DirNode {
             name: dir_name,
@@ -244,8 +256,9 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }));
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    // Collect all entries up front (fast, kernel-buffered via getdirentries64).
+    let entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
         Err(_) => {
             return FileNode::Dir(Box::new(DirNode {
                 name: dir_name,
@@ -257,40 +270,49 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }
     };
 
-    let mut children: Vec<FileNode> = entries
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| {
-            if progress.cancelled.load(Ordering::Relaxed) {
-                return None;
-            }
-            let entry = entry.ok()?;
-            let ft = entry.file_type().ok()?;
+    // Separate files (process inline) from directories.
+    let mut children = Vec::with_capacity(entries.len());
+    let mut subdirs: Vec<(PathBuf, Option<std::fs::Metadata>)> = Vec::new();
 
-            if ft.is_dir() {
-                let path = entry.path();
-                if skip.contains(&path) {
-                    return None;
-                }
-                Some(walk_dir(&path, progress, skip))
-            } else if ft.is_file() {
-                let metadata = entry.metadata().ok()?;
-                #[cfg(unix)]
-                let len = metadata.blocks() * 512;
-                #[cfg(not(unix))]
-                let len = metadata.len();
-                progress.file_count.fetch_add(1, Ordering::Relaxed);
-                progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = os_name_to_boxed(entry.file_name());
-                let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
-            } else {
-                None
+    for entry in entries {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            let path = entry.path();
+            if !skip.contains(&path) {
+                let meta = entry.metadata().ok();
+                subdirs.push((path, meta));
             }
-        })
+        } else if ft.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            #[cfg(unix)]
+            let len = metadata.blocks() * 512;
+            #[cfg(not(unix))]
+            let len = metadata.len();
+            progress.file_count.fetch_add(1, Ordering::Relaxed);
+            progress.total_size.fetch_add(len, Ordering::Relaxed);
+            let name = os_name_to_boxed(entry.file_name());
+            let hidden = is_hidden_from_metadata(&name, &metadata);
+            children.push(FileNode::File(FileLeaf::new(name, len, hidden)));
+        }
+    }
+
+    // Recurse into subdirectories in parallel via rayon work-stealing.
+    let dir_children: Vec<FileNode> = subdirs
+        .into_par_iter()
+        .map(|(path, meta)| walk_dir(&path, meta.as_ref(), progress, skip))
         .collect();
+    children.extend(dir_children);
 
-    children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

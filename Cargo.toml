@@ -57,6 +57,10 @@ harness = false
 name = "stat_bench"
 harness = false
 
+[[bench]]
+name = "dir_hidden_bench"
+harness = false
+
 [profile.release]
 lto = "thin"
 strip = true

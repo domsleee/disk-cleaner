@@ -2,6 +2,7 @@
 //!
 //! Extracted from App so the logic is independently testable without egui.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -19,12 +20,13 @@ pub enum PollResult {
     Done(DeleteResults),
 }
 
-/// Manages a single background deletion job at a time.
+/// Manages background deletion jobs with a queue for concurrent requests.
 pub struct BackgroundDeleter {
     active: bool,
     progress: Arc<AtomicUsize>,
     total: usize,
     receiver: Option<mpsc::Receiver<DeleteResults>>,
+    pending: VecDeque<(Vec<PathBuf>, bool)>,
 }
 
 impl Default for BackgroundDeleter {
@@ -34,6 +36,7 @@ impl Default for BackgroundDeleter {
             progress: Arc::new(AtomicUsize::new(0)),
             total: 0,
             receiver: None,
+            pending: VecDeque::new(),
         }
     }
 }
@@ -57,11 +60,21 @@ impl BackgroundDeleter {
     /// Start a background deletion job.
     ///
     /// `use_trash` — when true, move to OS trash instead of permanent delete.
-    /// No-op if `paths` is empty or a job is already running.
+    /// No-op if `paths` is empty. If a job is already running, the request is
+    /// queued and will start automatically when the current job finishes.
     pub fn start(&mut self, paths: Vec<PathBuf>, use_trash: bool) {
-        if paths.is_empty() || self.active {
+        if paths.is_empty() {
             return;
         }
+        if self.active {
+            self.pending.push_back((paths, use_trash));
+            return;
+        }
+        self.start_now(paths, use_trash);
+    }
+
+    /// Spawn the worker thread for a deletion job immediately.
+    fn start_now(&mut self, paths: Vec<PathBuf>, use_trash: bool) {
         let total = paths.len();
         let progress = Arc::new(AtomicUsize::new(0));
         let progress_clone = Arc::clone(&progress);
@@ -91,6 +104,9 @@ impl BackgroundDeleter {
     }
 
     /// Non-blocking poll. Returns [`PollResult::Done`] exactly once per job.
+    ///
+    /// When a job finishes and there are queued requests, the next job starts
+    /// automatically before returning [`PollResult::Done`].
     pub fn poll(&mut self) -> PollResult {
         if !self.active {
             return PollResult::Pending;
@@ -99,10 +115,20 @@ impl BackgroundDeleter {
             if let Ok(results) = rx.try_recv() {
                 self.active = false;
                 self.receiver = None;
+                // Kick off the next queued job, if any.
+                if let Some((paths, use_trash)) = self.pending.pop_front() {
+                    self.start_now(paths, use_trash);
+                }
                 return PollResult::Done(results);
             }
         }
         PollResult::Pending
+    }
+
+    /// Whether there are queued deletion requests waiting behind the active job.
+    #[cfg(test)]
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }
 
@@ -260,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn second_start_while_active_is_noop() {
+    fn second_start_while_active_is_queued() {
         let tmp = TempDir::new().unwrap();
         let f1 = make_file(&tmp, "first.txt", "1");
         let f2 = make_file(&tmp, "second.txt", "2");
@@ -270,14 +296,22 @@ mod tests {
         assert!(d.is_active());
         assert_eq!(d.total(), 1);
 
-        // Second start should be ignored
+        // Second start should be queued, not dropped
         d.start(vec![f2.clone()], false);
-        assert_eq!(d.total(), 1, "should still be first job");
+        assert!(d.has_pending());
+        assert_eq!(d.total(), 1, "should still report first job's total");
 
-        let results = poll_until_done(&mut d);
-        assert_eq!(results.len(), 1);
+        // First job completes
+        let r1 = poll_until_done(&mut d);
+        assert_eq!(r1.len(), 1);
         assert!(!f1.exists(), "first file deleted");
-        assert!(f2.exists(), "second file untouched");
+
+        // Second job should have auto-started
+        assert!(d.is_active(), "queued job should now be active");
+        let r2 = poll_until_done(&mut d);
+        assert_eq!(r2.len(), 1);
+        assert!(!f2.exists(), "second file should also be deleted");
+        assert!(!d.has_pending());
     }
 
     #[test]
@@ -300,6 +334,35 @@ mod tests {
         let r2 = poll_until_done(&mut d);
         assert_eq!(r2.len(), 1);
         assert!(!f2.exists());
+    }
+
+    #[test]
+    fn multiple_queued_deletes_drain_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let f1 = make_file(&tmp, "a.txt", "1");
+        let f2 = make_file(&tmp, "b.txt", "2");
+        let f3 = make_file(&tmp, "c.txt", "3");
+
+        let mut d = BackgroundDeleter::default();
+        d.start(vec![f1.clone()], false);
+        d.start(vec![f2.clone()], false);
+        d.start(vec![f3.clone()], false);
+
+        // Drain all three jobs sequentially
+        let r1 = poll_until_done(&mut d);
+        assert_eq!(r1[0].0, f1);
+        assert!(!f1.exists());
+
+        let r2 = poll_until_done(&mut d);
+        assert_eq!(r2[0].0, f2);
+        assert!(!f2.exists());
+
+        let r3 = poll_until_done(&mut d);
+        assert_eq!(r3[0].0, f3);
+        assert!(!f3.exists());
+
+        assert!(!d.is_active());
+        assert!(!d.has_pending());
     }
 
     #[test]

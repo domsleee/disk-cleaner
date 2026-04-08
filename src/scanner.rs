@@ -538,6 +538,242 @@ mod tests {
         assert!(!normal_node.is_hidden(), "normal dir should not be hidden");
     }
 
+    /// Reference implementation of the OLD walk_dir (pre-optimization):
+    /// each directory computes its own hidden flag via symlink_metadata.
+    #[allow(clippy::only_used_in_recursion)]
+    fn walk_dir_old(
+        dir: &Path,
+        progress: &Arc<ScanProgress>,
+        skip: &Arc<HashSet<PathBuf>>,
+    ) -> FileNode {
+        let dir_name: Box<str> = dir
+            .file_name()
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
+
+        // OLD approach: lstat inside each walk_dir call
+        let dir_hidden = std::fs::symlink_metadata(dir)
+            .map(|m| is_hidden_from_metadata(&dir_name, &m))
+            .unwrap_or_else(|_| dir_name.starts_with('.'));
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                return FileNode::Dir(Box::new(DirNode {
+                    name: dir_name,
+                    size: 0,
+                    children: Vec::new(),
+                    expanded: false,
+                    hidden: dir_hidden,
+                }));
+            }
+        };
+
+        // Use sequential iteration (not par_bridge) for deterministic order
+        let mut children: Vec<FileNode> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let ft = entry.file_type().ok()?;
+                if ft.is_dir() {
+                    let path = entry.path();
+                    if skip.contains(&path) {
+                        return None;
+                    }
+                    Some(walk_dir_old(&path, progress, skip))
+                } else if ft.is_file() {
+                    let metadata = entry.metadata().ok()?;
+                    #[cfg(unix)]
+                    let len = metadata.blocks() * 512;
+                    #[cfg(not(unix))]
+                    let len = metadata.len();
+                    let name = os_name_to_boxed(entry.file_name());
+                    let hidden = is_hidden_from_metadata(&name, &metadata);
+                    Some(FileNode::File(FileLeaf::new(name, len, hidden)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        children.sort_by(|a, b| a.name().cmp(b.name()));
+        let size = children.iter().map(|c| c.size()).sum();
+        FileNode::Dir(Box::new(DirNode {
+            name: dir_name,
+            size,
+            children,
+            expanded: false,
+            hidden: dir_hidden,
+        }))
+    }
+
+    /// Reference implementation of the NEW walk_dir (post-optimization):
+    /// parent passes hidden flag computed from DirEntry::metadata().
+    #[allow(clippy::only_used_in_recursion)]
+    fn walk_dir_new(
+        dir: &Path,
+        progress: &Arc<ScanProgress>,
+        skip: &Arc<HashSet<PathBuf>>,
+        dir_hidden: bool,
+    ) -> FileNode {
+        let dir_name: Box<str> = dir
+            .file_name()
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                return FileNode::Dir(Box::new(DirNode {
+                    name: dir_name,
+                    size: 0,
+                    children: Vec::new(),
+                    expanded: false,
+                    hidden: dir_hidden,
+                }));
+            }
+        };
+
+        // Use sequential iteration for deterministic order
+        let mut children: Vec<FileNode> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let ft = entry.file_type().ok()?;
+                if ft.is_dir() {
+                    let path = entry.path();
+                    if skip.contains(&path) {
+                        return None;
+                    }
+                    // NEW approach: compute hidden from DirEntry::metadata()
+                    let name = os_name_to_boxed(entry.file_name());
+                    let child_hidden = entry
+                        .metadata()
+                        .map(|m| is_hidden_from_metadata(&name, &m))
+                        .unwrap_or_else(|_| name.starts_with('.'));
+                    Some(walk_dir_new(&path, progress, skip, child_hidden))
+                } else if ft.is_file() {
+                    let metadata = entry.metadata().ok()?;
+                    #[cfg(unix)]
+                    let len = metadata.blocks() * 512;
+                    #[cfg(not(unix))]
+                    let len = metadata.len();
+                    let name = os_name_to_boxed(entry.file_name());
+                    let hidden = is_hidden_from_metadata(&name, &metadata);
+                    Some(FileNode::File(FileLeaf::new(name, len, hidden)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        children.sort_by(|a, b| a.name().cmp(b.name()));
+        let size = children.iter().map(|c| c.size()).sum();
+        FileNode::Dir(Box::new(DirNode {
+            name: dir_name,
+            size,
+            children,
+            expanded: false,
+            hidden: dir_hidden,
+        }))
+    }
+
+    /// Recursively compare two trees, collecting every path where
+    /// the hidden flag differs.
+    fn diff_hidden(old: &FileNode, new: &FileNode, path: &str, diffs: &mut Vec<String>) {
+        if old.is_hidden() != new.is_hidden() {
+            diffs.push(format!(
+                "{path}: old_hidden={}, new_hidden={}",
+                old.is_hidden(),
+                new.is_hidden()
+            ));
+        }
+        if old.name() != new.name() {
+            diffs.push(format!(
+                "{path}: name mismatch old={}, new={}",
+                old.name(),
+                new.name()
+            ));
+            return;
+        }
+        let old_children = old.children();
+        let new_children = new.children();
+        if !old_children.is_empty() || !new_children.is_empty() {
+            // Both sorted by name, so zip by name
+            let mut old_map: std::collections::BTreeMap<&str, &FileNode> =
+                old_children.iter().map(|c| (c.name(), c)).collect();
+            for child in new_children {
+                if let Some(old_child) = old_map.remove(child.name()) {
+                    let child_path = format!("{path}/{}", child.name());
+                    diff_hidden(old_child, child, &child_path, diffs);
+                } else {
+                    diffs.push(format!("{path}/{}: only in new tree", child.name()));
+                }
+            }
+            for (name, _) in old_map {
+                diffs.push(format!("{path}/{name}: only in old tree"));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn old_vs_new_hidden_flags_match_with_uf_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Visible dir
+        fs::create_dir(root.join("visible")).unwrap();
+        fs::write(root.join("visible/a.txt"), "a").unwrap();
+
+        // Dot-hidden dir
+        fs::create_dir(root.join(".dotdir")).unwrap();
+        fs::write(root.join(".dotdir/b.txt"), "b").unwrap();
+
+        // UF_HIDDEN dir (non-dot name)
+        fs::create_dir(root.join("flagged")).unwrap();
+        fs::write(root.join("flagged/c.txt"), "c").unwrap();
+        set_uf_hidden(&root.join("flagged"));
+
+        // Nested: visible > dot-hidden > UF_HIDDEN
+        fs::create_dir_all(root.join("outer/.inner")).unwrap();
+        fs::create_dir(root.join("outer/.inner/deep")).unwrap();
+        set_uf_hidden(&root.join("outer/.inner/deep"));
+        fs::write(root.join("outer/.inner/deep/d.txt"), "d").unwrap();
+
+        // UF_HIDDEN file (non-dot name)
+        fs::write(root.join("visible/secret.dat"), "s").unwrap();
+        set_uf_hidden(&root.join("visible/secret.dat"));
+
+        // Dot-hidden file
+        fs::write(root.join(".hidden_file"), "h").unwrap();
+
+        let skip = Arc::new(HashSet::new());
+
+        let progress_old = new_progress();
+        let old_tree = walk_dir_old(root, &progress_old, &skip);
+
+        let root_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let root_hidden = std::fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&root_name, &m))
+            .unwrap_or_else(|_| root_name.starts_with('.'));
+
+        let progress_new = new_progress();
+        let new_tree = walk_dir_new(root, &progress_new, &skip, root_hidden);
+
+        let mut diffs = Vec::new();
+        diff_hidden(&old_tree, &new_tree, root.to_str().unwrap(), &mut diffs);
+
+        assert!(
+            diffs.is_empty(),
+            "Hidden flag mismatches between old and new:\n{}",
+            diffs.join("\n")
+        );
+    }
+
     #[test]
     fn cancelled_scan_returns_empty_tree() {
         let tmp = tempfile::tempdir().unwrap();

@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(not(target_os = "macos"))]
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
@@ -181,6 +182,20 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
+    #[cfg(target_os = "macos")]
+    let mut root_node = {
+        // Compute root dir's hidden status (child dirs get this from the
+        // parent's bulk call, but the root has no parent).
+        let name_str = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let root_hidden = std::fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&name_str, &m))
+            .unwrap_or_else(|_| name_str.starts_with('.'));
+        walk_dir_bulk(root, root_hidden, &progress, &skip)
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
@@ -219,7 +234,248 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
-/// Parallel recursive directory walk, following dust's par_bridge() pattern.
+// ---------------------------------------------------------------------------
+// macOS bulk metadata walker using getattrlistbulk(2)
+// ---------------------------------------------------------------------------
+
+/// FFI declarations for macOS `getattrlistbulk(2)`.
+#[cfg(target_os = "macos")]
+mod bulk_attrs {
+    use std::os::raw::{c_int, c_void};
+
+    pub const ATTR_BIT_MAP_COUNT: u16 = 5;
+    pub const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+    pub const ATTR_CMN_NAME: u32 = 0x0000_0001;
+    pub const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+    pub const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+    pub const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+    pub const FSOPT_NOFOLLOW: u64 = 0x0000_0001;
+    /// `VREG` — regular file.
+    pub const VREG: u32 = 1;
+    /// `VDIR` — directory.
+    pub const VDIR: u32 = 2;
+
+    #[repr(C)]
+    pub struct AttrList {
+        pub bitmapcount: u16,
+        pub reserved: u16,
+        pub commonattr: u32,
+        pub volattr: u32,
+        pub dirattr: u32,
+        pub fileattr: u32,
+        pub forkattr: u32,
+    }
+
+    extern "C" {
+        pub fn getattrlistbulk(
+            dirfd: c_int,
+            alist: *const AttrList,
+            attribute_buffer: *mut c_void,
+            buffer_size: usize,
+            options: u64,
+        ) -> c_int;
+    }
+}
+
+/// Bulk metadata directory walker using `getattrlistbulk(2)`.
+///
+/// Returns name, type, flags, and allocation size for ALL entries in a
+/// directory via batched syscalls.  Reduces per-directory cost from
+/// ~2N+2 syscalls (`readdir` + per-file `lstat`) to ~⌈N/256⌉+1.
+///
+/// `dir_hidden` is pre-computed by the caller (the parent directory's
+/// bulk call already returned this directory's flags).
+#[cfg(target_os = "macos")]
+fn walk_dir_bulk(
+    dir: &Path,
+    dir_hidden: bool,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+) -> FileNode {
+    use bulk_attrs::*;
+    use rayon::iter::IntoParallelIterator;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir_name: Box<str> = dir
+        .file_name()
+        .map(|n| os_name_to_boxed(n.to_os_string()))
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
+
+    let empty_dir = |name: Box<str>| {
+        FileNode::Dir(Box::new(DirNode {
+            name,
+            size: 0,
+            children: Vec::new(),
+            expanded: false,
+            hidden: dir_hidden,
+        }))
+    };
+
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return empty_dir(dir_name);
+    }
+
+    // Open the directory to get a file descriptor for getattrlistbulk.
+    let c_path = match CString::new(dir.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return empty_dir(dir_name),
+    };
+    let dirfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if dirfd < 0 {
+        return empty_dir(dir_name);
+    }
+
+    let attrlist = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_RETURNED_ATTRS
+            | ATTR_CMN_NAME
+            | ATTR_CMN_OBJTYPE
+            | ATTR_CMN_FLAGS,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: ATTR_FILE_ALLOCSIZE,
+        forkattr: 0,
+    };
+
+    // 256 KB buffer — typically fits ~256+ entries per batch.
+    const BUF_SIZE: usize = 256 * 1024;
+    let mut buf = vec![0u8; BUF_SIZE];
+
+    let mut file_children: Vec<FileNode> = Vec::new();
+    let mut sub_dirs: Vec<(PathBuf, bool)> = Vec::new();
+
+    // Each getattrlistbulk call fills the buffer with as many entries as
+    // fit.  Returns entry count (>0), 0 when done, or -1 on error.
+    loop {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let count = unsafe {
+            getattrlistbulk(
+                dirfd,
+                &attrlist,
+                buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
+                BUF_SIZE,
+                FSOPT_NOFOLLOW,
+            )
+        };
+
+        if count <= 0 {
+            break;
+        }
+
+        // --- Parse returned entries ---
+        //
+        // Per-entry layout (offsets from entry start):
+        //   +0   u32  length          total bytes for this entry
+        //   +4   u32  returned common attrs
+        //   +8   u32  returned vol attrs
+        //  +12   u32  returned dir attrs
+        //  +16   u32  returned file attrs
+        //  +20   u32  returned fork attrs
+        //  +24   i32  name attr_dataoff (relative to +24)
+        //  +28   u32  name attr_length  (includes NUL)
+        //  +32   u32  objtype           (VREG=1, VDIR=2, …)
+        //  +36   u32  flags             (UF_HIDDEN = 0x8000)
+        //  +40   i64  allocsize         (only if returned_file & ALLOCSIZE)
+        //
+        // Variable-length name data lives at +24 + attr_dataoff.
+        let mut offset = 0usize;
+        for _ in 0..count as usize {
+            // Safety: getattrlistbulk guarantees entries are 4-byte
+            // aligned and fit within `count` entries in the buffer.
+            if offset + 40 > BUF_SIZE {
+                break;
+            }
+
+            unsafe {
+                let base = buf.as_ptr().add(offset);
+                let entry_len = *(base as *const u32) as usize;
+                if entry_len == 0 || offset + entry_len > BUF_SIZE {
+                    break;
+                }
+
+                // Which file attrs were actually returned for this entry?
+                let returned_file = *(base.add(16) as *const u32);
+
+                // Name — attrreference_t at +24
+                let name_dataoff = *(base.add(24) as *const i32);
+                let name_bytelen = *(base.add(28) as *const u32) as usize;
+
+                let name_ptr = base.add(24).offset(name_dataoff as isize);
+                let name_end =
+                    (name_ptr as usize).wrapping_sub(buf.as_ptr() as usize) + name_bytelen;
+                if name_bytelen == 0 || name_end > offset + entry_len {
+                    offset += entry_len;
+                    continue;
+                }
+
+                // Strip the NUL terminator.
+                let name_slice =
+                    std::slice::from_raw_parts(name_ptr, name_bytelen.saturating_sub(1));
+                let name: Box<str> = match std::str::from_utf8(name_slice) {
+                    Ok(s) => Box::from(s),
+                    Err(_) => String::from_utf8_lossy(name_slice).into_owned().into_boxed_str(),
+                };
+
+                let objtype = *(base.add(32) as *const u32);
+                let flags = *(base.add(36) as *const u32);
+                let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
+
+                match objtype {
+                    VDIR => {
+                        let path = dir.join(&*name);
+                        if !skip.contains(&path) {
+                            sub_dirs.push((path, hidden));
+                        }
+                    }
+                    VREG => {
+                        let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+                            *(base.add(40) as *const i64) as u64
+                        } else {
+                            0
+                        };
+                        progress.file_count.fetch_add(1, Ordering::Relaxed);
+                        progress.total_size.fetch_add(allocsize, Ordering::Relaxed);
+                        file_children.push(FileNode::File(FileLeaf::new(name, allocsize, hidden)));
+                    }
+                    _ => {} // skip symlinks, sockets, etc.
+                }
+
+                offset += entry_len;
+            }
+        }
+    }
+
+    unsafe {
+        libc::close(dirfd);
+    }
+
+    // Recurse into subdirectories in parallel.
+    let dir_children: Vec<FileNode> = sub_dirs
+        .into_par_iter()
+        .map(|(path, hidden)| walk_dir_bulk(&path, hidden, progress, skip))
+        .collect();
+
+    file_children.extend(dir_children);
+    file_children.shrink_to_fit();
+    let size = file_children.iter().map(|c| c.size()).sum();
+
+    FileNode::Dir(Box::new(DirNode {
+        name: dir_name,
+        size,
+        children: file_children,
+        expanded: false,
+        hidden: dir_hidden,
+    }))
+}
+
+/// Parallel recursive directory walk using `read_dir` + per-entry `lstat`.
+/// Used on non-macOS platforms; macOS uses `walk_dir_bulk` instead.
+#[cfg(not(target_os = "macos"))]
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()

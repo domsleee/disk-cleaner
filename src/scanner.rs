@@ -178,10 +178,18 @@ fn platform_skip_paths(_root: &Path) -> HashSet<PathBuf> {
 
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     let skip = build_skip_set(root);
+    // Root still needs one lstat — there is no parent DirEntry to reuse.
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let root_hidden = std::fs::symlink_metadata(root)
+        .map(|m| is_hidden_from_metadata(&root_name, &m))
+        .unwrap_or_else(|_| root_name.starts_with('.'));
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
-    let mut root_node = walk_dir(root, &progress, &skip);
+    let mut root_node = walk_dir(root, &progress, &skip, root_hidden);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
@@ -220,15 +228,19 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
 }
 
 /// Parallel recursive directory walk, following dust's par_bridge() pattern.
-fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
+/// `dir_hidden` is computed by the caller (from `DirEntry::metadata()` in the
+/// parent walk, or `symlink_metadata` for the root) so each child avoids
+/// a redundant `lstat` just to check the hidden flag.
+fn walk_dir(
+    dir: &Path,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+    dir_hidden: bool,
+) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
-
-    let dir_hidden = std::fs::symlink_metadata(dir)
-        .map(|m| is_hidden_from_metadata(&dir_name, &m))
-        .unwrap_or_else(|_| dir_name.starts_with('.'));
 
     // Build the empty fallback only in early-return paths to avoid cloning
     // dir_name and allocating a Vec on every directory visit.
@@ -272,7 +284,12 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 if skip.contains(&path) {
                     return None;
                 }
-                Some(walk_dir(&path, progress, skip))
+                let name = os_name_to_boxed(entry.file_name());
+                let child_hidden = entry
+                    .metadata()
+                    .map(|m| is_hidden_from_metadata(&name, &m))
+                    .unwrap_or_else(|_| name.starts_with('.'));
+                Some(walk_dir(&path, progress, skip, child_hidden))
             } else if ft.is_file() {
                 let metadata = entry.metadata().ok()?;
                 #[cfg(unix)]

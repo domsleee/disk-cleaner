@@ -1,7 +1,6 @@
 mod app_icon;
 mod categories;
 mod icons;
-mod permissions;
 mod scanner;
 mod suggestions;
 mod suggestions_ui;
@@ -9,6 +8,7 @@ mod tree;
 mod treemap;
 mod ui;
 
+use disk_cleaner::permissions;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;

@@ -1402,9 +1402,10 @@ impl eframe::App for App {
             if !self.scanning && self.tree.is_some() && !self.fda_banner_dismissed {
                 let denied = self.scan_progress.permission_denied.load(Ordering::Relaxed);
                 if denied > 0 {
-                    let banner_bg = egui::Color32::from_rgb(255, 243, 205);
-                    let banner_border = egui::Color32::from_rgb(220, 200, 150);
-                    let banner_text = egui::Color32::from_rgb(102, 77, 3);
+                    let warn = ui.visuals().warn_fg_color;
+                    let banner_bg = warn.linear_multiply(0.10);
+                    let banner_border = warn.linear_multiply(0.35);
+                    let banner_text = ui.visuals().text_color();
                     egui::Frame::none()
                         .fill(banner_bg)
                         .stroke(egui::Stroke::new(1.0, banner_border))
@@ -1426,7 +1427,7 @@ impl eframe::App for App {
                                 let link = ui.add(
                                     egui::Label::new(
                                         egui::RichText::new("Grant Full Disk Access")
-                                            .color(egui::Color32::from_rgb(0, 102, 204))
+                                            .color(ui.visuals().hyperlink_color)
                                             .underline()
                                             .size(13.0),
                                     )

@@ -339,116 +339,135 @@ fn walk_dir_bulk(
         forkattr: 0,
     };
 
-    // 256 KB buffer — typically fits ~256+ entries per batch.
     const BUF_SIZE: usize = 256 * 1024;
-    let mut buf = vec![0u8; BUF_SIZE];
+
+    // Thread-local buffer reused across recursive calls on the same rayon
+    // thread.  Avoids allocating 256 KB per stack frame — without this,
+    // ~8 threads × ~25 recursion depth = ~50 MB of live buffers.
+    thread_local! {
+        static ATTR_BUF: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; BUF_SIZE]);
+    }
 
     let mut file_children: Vec<FileNode> = Vec::new();
     let mut sub_dirs: Vec<(PathBuf, bool)> = Vec::new();
 
-    // Each getattrlistbulk call fills the buffer with as many entries as
-    // fit.  Returns entry count (>0), 0 when done, or -1 on error.
-    loop {
-        if progress.cancelled.load(Ordering::Relaxed) {
-            break;
-        }
+    // Borrow the thread-local buffer, fill it via getattrlistbulk, and
+    // parse all entries.  The borrow is released before we recurse into
+    // subdirectories, so the same buffer can be reused by the next call
+    // on this thread.
+    ATTR_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
 
-        let count = unsafe {
-            getattrlistbulk(
-                dirfd,
-                &attrlist,
-                buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
-                BUF_SIZE,
-                FSOPT_NOFOLLOW,
-            )
-        };
-
-        if count <= 0 {
-            break;
-        }
-
-        // --- Parse returned entries ---
-        //
-        // Per-entry layout (offsets from entry start):
-        //   +0   u32  length          total bytes for this entry
-        //   +4   u32  returned common attrs
-        //   +8   u32  returned vol attrs
-        //  +12   u32  returned dir attrs
-        //  +16   u32  returned file attrs
-        //  +20   u32  returned fork attrs
-        //  +24   i32  name attr_dataoff (relative to +24)
-        //  +28   u32  name attr_length  (includes NUL)
-        //  +32   u32  objtype           (VREG=1, VDIR=2, …)
-        //  +36   u32  flags             (UF_HIDDEN = 0x8000)
-        //  +40   i64  allocsize         (only if returned_file & ALLOCSIZE)
-        //
-        // Variable-length name data lives at +24 + attr_dataoff.
-        let mut offset = 0usize;
-        for _ in 0..count as usize {
-            // Safety: getattrlistbulk guarantees entries are 4-byte
-            // aligned and fit within `count` entries in the buffer.
-            if offset + 40 > BUF_SIZE {
+        // Each getattrlistbulk call fills the buffer with as many entries
+        // as fit.  Returns entry count (>0), 0 when done, or -1 on error.
+        loop {
+            if progress.cancelled.load(Ordering::Relaxed) {
                 break;
             }
 
-            unsafe {
-                let base = buf.as_ptr().add(offset);
-                let entry_len = *(base as *const u32) as usize;
-                if entry_len == 0 || offset + entry_len > BUF_SIZE {
+            let count = unsafe {
+                getattrlistbulk(
+                    dirfd,
+                    &attrlist,
+                    buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
+                    BUF_SIZE,
+                    FSOPT_NOFOLLOW,
+                )
+            };
+
+            if count <= 0 {
+                break;
+            }
+
+            // --- Parse returned entries ---
+            //
+            // Per-entry layout (offsets from entry start):
+            //   +0   u32  length          total bytes for this entry
+            //   +4   u32  returned common attrs
+            //   +8   u32  returned vol attrs
+            //  +12   u32  returned dir attrs
+            //  +16   u32  returned file attrs
+            //  +20   u32  returned fork attrs
+            //  +24   i32  name attr_dataoff (relative to +24)
+            //  +28   u32  name attr_length  (includes NUL)
+            //  +32   u32  objtype           (VREG=1, VDIR=2, …)
+            //  +36   u32  flags             (UF_HIDDEN = 0x8000)
+            //  +40   i64  allocsize         (only if returned_file & ALLOCSIZE)
+            //
+            // Variable-length name data lives at +24 + attr_dataoff.
+            let mut offset = 0usize;
+            for _ in 0..count as usize {
+                // Safety: getattrlistbulk guarantees entries are 4-byte
+                // aligned and fit within `count` entries in the buffer.
+                if offset + 40 > BUF_SIZE {
                     break;
                 }
 
-                // Which file attrs were actually returned for this entry?
-                let returned_file = *(base.add(16) as *const u32);
+                unsafe {
+                    let base = buf.as_ptr().add(offset);
+                    let entry_len = *(base as *const u32) as usize;
+                    if entry_len == 0 || offset + entry_len > BUF_SIZE {
+                        break;
+                    }
 
-                // Name — attrreference_t at +24
-                let name_dataoff = *(base.add(24) as *const i32);
-                let name_bytelen = *(base.add(28) as *const u32) as usize;
+                    // Which file attrs were actually returned for this entry?
+                    let returned_file = *(base.add(16) as *const u32);
 
-                let name_ptr = base.add(24).offset(name_dataoff as isize);
-                let name_end =
-                    (name_ptr as usize).wrapping_sub(buf.as_ptr() as usize) + name_bytelen;
-                if name_bytelen == 0 || name_end > offset + entry_len {
-                    offset += entry_len;
-                    continue;
-                }
+                    // Name — attrreference_t at +24
+                    let name_dataoff = *(base.add(24) as *const i32);
+                    let name_bytelen = *(base.add(28) as *const u32) as usize;
 
-                // Strip the NUL terminator.
-                let name_slice =
-                    std::slice::from_raw_parts(name_ptr, name_bytelen.saturating_sub(1));
-                let name: Box<str> = match std::str::from_utf8(name_slice) {
-                    Ok(s) => Box::from(s),
-                    Err(_) => String::from_utf8_lossy(name_slice).into_owned().into_boxed_str(),
-                };
+                    let name_ptr = base.add(24).offset(name_dataoff as isize);
+                    let name_end =
+                        (name_ptr as usize).wrapping_sub(buf.as_ptr() as usize) + name_bytelen;
+                    if name_bytelen == 0 || name_end > offset + entry_len {
+                        offset += entry_len;
+                        continue;
+                    }
 
-                let objtype = *(base.add(32) as *const u32);
-                let flags = *(base.add(36) as *const u32);
-                let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
-
-                match objtype {
-                    VDIR => {
-                        let path = dir.join(&*name);
-                        if !skip.contains(&path) {
-                            sub_dirs.push((path, hidden));
+                    // Strip the NUL terminator.
+                    let name_slice =
+                        std::slice::from_raw_parts(name_ptr, name_bytelen.saturating_sub(1));
+                    let name: Box<str> = match std::str::from_utf8(name_slice) {
+                        Ok(s) => Box::from(s),
+                        Err(_) => {
+                            String::from_utf8_lossy(name_slice)
+                                .into_owned()
+                                .into_boxed_str()
                         }
-                    }
-                    VREG => {
-                        let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                            *(base.add(40) as *const i64) as u64
-                        } else {
-                            0
-                        };
-                        progress.file_count.fetch_add(1, Ordering::Relaxed);
-                        progress.total_size.fetch_add(allocsize, Ordering::Relaxed);
-                        file_children.push(FileNode::File(FileLeaf::new(name, allocsize, hidden)));
-                    }
-                    _ => {} // skip symlinks, sockets, etc.
-                }
+                    };
 
-                offset += entry_len;
+                    let objtype = *(base.add(32) as *const u32);
+                    let flags = *(base.add(36) as *const u32);
+                    let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
+
+                    match objtype {
+                        VDIR => {
+                            let path = dir.join(&*name);
+                            if !skip.contains(&path) {
+                                sub_dirs.push((path, hidden));
+                            }
+                        }
+                        VREG => {
+                            let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+                                *(base.add(40) as *const i64) as u64
+                            } else {
+                                0
+                            };
+                            progress.file_count.fetch_add(1, Ordering::Relaxed);
+                            progress.total_size.fetch_add(allocsize, Ordering::Relaxed);
+                            file_children
+                                .push(FileNode::File(FileLeaf::new(name, allocsize, hidden)));
+                        }
+                        _ => {} // skip symlinks, sockets, etc.
+                    }
+
+                    offset += entry_len;
+                }
             }
         }
-    }
+    }); // thread-local borrow released — safe to recurse now.
 
     unsafe {
         libc::close(dirfd);

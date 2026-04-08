@@ -180,7 +180,14 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
-    let mut root_node = walk_dir(root, None, &progress, &skip);
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let root_hidden = std::fs::symlink_metadata(root)
+        .map(|m| is_hidden_from_metadata(&root_name, &m))
+        .unwrap_or_else(|_| root_name.starts_with('.'));
+    let mut root_node = walk_dir(root, root_hidden, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
@@ -218,6 +225,33 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
+/// Determine whether a directory entry is hidden, minimizing syscalls.
+///
+/// On non-macOS: hidden is purely the dot-prefix convention — no stat needed.
+/// On macOS: dot-prefixed entries are hidden without stat; for non-dot entries
+/// we call `entry.metadata()` to check the `UF_HIDDEN` flag via `st_flags()`.
+/// This avoids an `fstatat` on every directory entry just to check a flag that
+/// is almost always redundant with the dot convention.
+#[cfg(target_os = "macos")]
+fn is_dir_entry_hidden(name: &str, entry: &std::fs::DirEntry) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    // Non-dot name — need stat to check UF_HIDDEN (e.g. some /Library subdirs).
+    entry
+        .metadata()
+        .map(|m| {
+            use std::os::darwin::fs::MetadataExt;
+            m.st_flags() & UF_HIDDEN != 0
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dir_entry_hidden(name: &str, _entry: &std::fs::DirEntry) -> bool {
+    name.starts_with('.')
+}
+
 /// Parallel recursive directory walk.
 ///
 /// Collects all directory entries up front, processes files inline, then
@@ -226,11 +260,13 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
 /// iterator — only one thread could dequeue entries, limiting parallelism
 /// for wide directories with many subdirectories.
 ///
-/// `parent_meta` is the metadata from the parent's `DirEntry`, passed down
-/// to avoid a redundant `lstat` per directory. `None` for the root call.
+/// `dir_hidden` is pre-computed by the caller to avoid a redundant `lstat`
+/// per directory. The parent's readdir loop already has the entry and can
+/// determine hiddenness without an extra syscall (dot-prefix on all
+/// platforms; lazy `fstatat` for macOS UF_HIDDEN on non-dot names only).
 fn walk_dir(
     dir: &Path,
-    parent_meta: Option<&std::fs::Metadata>,
+    dir_hidden: bool,
     progress: &Arc<ScanProgress>,
     skip: &Arc<HashSet<PathBuf>>,
 ) -> FileNode {
@@ -238,13 +274,6 @@ fn walk_dir(
         .file_name()
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
-
-    let dir_hidden = match parent_meta {
-        Some(m) => is_hidden_from_metadata(&dir_name, m),
-        None => std::fs::symlink_metadata(dir)
-            .map(|m| is_hidden_from_metadata(&dir_name, &m))
-            .unwrap_or_else(|_| dir_name.starts_with('.')),
-    };
 
     if progress.cancelled.load(Ordering::Relaxed) {
         return FileNode::Dir(Box::new(DirNode {
@@ -272,7 +301,7 @@ fn walk_dir(
 
     // Separate files (process inline) from directories.
     let mut children = Vec::with_capacity(entries.len());
-    let mut subdirs: Vec<(PathBuf, Option<std::fs::Metadata>)> = Vec::new();
+    let mut subdirs: Vec<(PathBuf, bool)> = Vec::new();
 
     for entry in entries {
         if progress.cancelled.load(Ordering::Relaxed) {
@@ -286,8 +315,10 @@ fn walk_dir(
         if ft.is_dir() {
             let path = entry.path();
             if !skip.contains(&path) {
-                let meta = entry.metadata().ok();
-                subdirs.push((path, meta));
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let hidden = is_dir_entry_hidden(&name_str, &entry);
+                subdirs.push((path, hidden));
             }
         } else if ft.is_file() {
             let metadata = match entry.metadata() {
@@ -309,7 +340,7 @@ fn walk_dir(
     // Recurse into subdirectories in parallel via rayon work-stealing.
     let dir_children: Vec<FileNode> = subdirs
         .into_par_iter()
-        .map(|(path, meta)| walk_dir(&path, meta.as_ref(), progress, skip))
+        .map(|(path, hidden)| walk_dir(&path, hidden, progress, skip))
         .collect();
     children.extend(dir_children);
 

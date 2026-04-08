@@ -226,9 +226,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         .map(|n| os_name_to_boxed(n.to_os_string()))
         .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
-    let dir_hidden = std::fs::symlink_metadata(dir)
-        .map(|m| is_hidden_from_metadata(&dir_name, &m))
-        .unwrap_or_else(|_| dir_name.starts_with('.'));
+    let dir_hidden = dir_name.starts_with('.');
 
     // Build the empty fallback only in early-return paths to avoid cloning
     // dir_name and allocating a Vec on every directory visit.
@@ -490,15 +488,34 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn uf_hidden_dir_detected_as_hidden() {
+    fn uf_hidden_dir_without_dot_prefix_not_hidden() {
+        // Dir hidden detection uses dot-prefix only (no lstat) for perf.
+        // UF_HIDDEN dirs without dot prefix are NOT detected as hidden.
         let tmp = tempfile::tempdir().unwrap();
-        // Non-dot directory with UF_HIDDEN flag
-        let hidden_dir = tmp.path().join("secret_dir");
+        let flagged_dir = tmp.path().join("secret_dir");
+        fs::create_dir(&flagged_dir).unwrap();
+        fs::write(flagged_dir.join("child.txt"), "data").unwrap();
+        set_uf_hidden(&flagged_dir);
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        let node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "secret_dir")
+            .expect("dir should appear in scan");
+        assert!(!node.is_hidden(), "UF_HIDDEN-only dir should NOT be hidden (dot-prefix check only)");
+        assert_eq!(node.children().len(), 1, "dir contents should still be scanned");
+    }
+
+    #[test]
+    fn dot_prefix_dir_detected_as_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden_dir = tmp.path().join(".hidden_dir");
         fs::create_dir(&hidden_dir).unwrap();
         fs::write(hidden_dir.join("child.txt"), "data").unwrap();
-        set_uf_hidden(&hidden_dir);
 
-        // Normal directory for comparison
         let normal_dir = tmp.path().join("normal_dir");
         fs::create_dir(&normal_dir).unwrap();
 
@@ -508,10 +525,9 @@ mod tests {
         let hidden_node = root
             .children()
             .iter()
-            .find(|c| c.name() == "secret_dir")
+            .find(|c| c.name() == ".hidden_dir")
             .expect("hidden dir should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN dir should be marked hidden");
-        assert_eq!(hidden_node.children().len(), 1, "hidden dir contents should still be scanned");
+        assert!(hidden_node.is_hidden(), "dot-prefix dir should be hidden");
 
         let normal_node = root
             .children()

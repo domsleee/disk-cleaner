@@ -4,6 +4,10 @@ version = "0.3.0"
 edition = "2021"
 default-run = "disk-cleaner"
 
+[features]
+default = ["macos-bulk-scan"]
+macos-bulk-scan = []
+
 [dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 bytesize = "2"

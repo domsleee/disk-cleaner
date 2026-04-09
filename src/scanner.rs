@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+#[cfg(all(unix, any(not(all(target_os = "macos", feature = "macos-bulk-scan")), test)))]
 use std::os::unix::fs::MetadataExt;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "macos-bulk-scan")))]
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
@@ -182,7 +182,7 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
     let mut root_node = {
         // Compute root dir's hidden status (child dirs get this from the
         // parent's bulk call, but the root has no parent).
@@ -195,7 +195,7 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
             .unwrap_or_else(|_| name_str.starts_with('.'));
         walk_dir_bulk(root, root_hidden, &progress, &skip)
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "macos-bulk-scan")))]
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
@@ -239,7 +239,7 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
 // ---------------------------------------------------------------------------
 
 /// FFI declarations for macOS `getattrlistbulk(2)`.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
 mod bulk_attrs {
     use std::os::raw::{c_int, c_void};
 
@@ -285,7 +285,7 @@ mod bulk_attrs {
 ///
 /// `dir_hidden` is pre-computed by the caller (the parent directory's
 /// bulk call already returned this directory's flags).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
 fn walk_dir_bulk(
     dir: &Path,
     dir_hidden: bool,
@@ -493,8 +493,8 @@ fn walk_dir_bulk(
 }
 
 /// Parallel recursive directory walk using `read_dir` + per-entry `lstat`.
-/// Used on non-macOS platforms; macOS uses `walk_dir_bulk` instead.
-#[cfg(not(target_os = "macos"))]
+/// Used when `macos-bulk-scan` is disabled or on non-macOS platforms.
+#[cfg(not(all(target_os = "macos", feature = "macos-bulk-scan")))]
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()

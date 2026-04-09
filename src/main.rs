@@ -832,7 +832,9 @@ impl eframe::App for App {
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
         let show_toolbar = self.tree.is_some() || self.scanning;
         if show_toolbar {
-            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            egui::TopBottomPanel::top("toolbar")
+                .show_separator_line(false)
+                .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Standardize widget height so buttons and selectable labels align
                     ui.spacing_mut().interact_size.y = 24.0;

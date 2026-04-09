@@ -184,16 +184,16 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // correct absolute paths.
     #[cfg(target_os = "macos")]
     let mut root_node = {
-        // Compute root dir's hidden status (child dirs get this from the
-        // parent's bulk call, but the root has no parent).
-        let name_str = root
+        // Compute root dir's name and hidden status (child dirs get these
+        // from the parent's bulk call, but the root has no parent).
+        let root_name: Box<str> = root
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| root.to_string_lossy().into_owned().into_boxed_str());
         let root_hidden = std::fs::symlink_metadata(root)
-            .map(|m| is_hidden_from_metadata(&name_str, &m))
-            .unwrap_or_else(|_| name_str.starts_with('.'));
-        walk_dir_bulk(root, root_hidden, &progress, &skip)
+            .map(|m| is_hidden_from_metadata(&root_name, &m))
+            .unwrap_or_else(|_| root_name.starts_with('.'));
+        walk_dir_bulk(root, root_name, root_hidden, &progress, &skip)
     };
     #[cfg(not(target_os = "macos"))]
     let mut root_node = walk_dir(root, &progress, &skip);
@@ -288,6 +288,7 @@ mod bulk_attrs {
 #[cfg(target_os = "macos")]
 fn walk_dir_bulk(
     dir: &Path,
+    dir_name: Box<str>,
     dir_hidden: bool,
     progress: &Arc<ScanProgress>,
     skip: &Arc<HashSet<PathBuf>>,
@@ -296,11 +297,6 @@ fn walk_dir_bulk(
     use rayon::iter::IntoParallelIterator;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-
-    let dir_name: Box<str> = dir
-        .file_name()
-        .map(|n| os_name_to_boxed(n.to_os_string()))
-        .unwrap_or_else(|| dir.to_string_lossy().into_owned().into_boxed_str());
 
     let empty_dir = |name: Box<str>| {
         FileNode::Dir(Box::new(DirNode {
@@ -326,7 +322,7 @@ fn walk_dir_bulk(
         return empty_dir(dir_name);
     }
 
-    let attrlist = AttrList {
+    static ATTRLIST: AttrList = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
         commonattr: ATTR_CMN_RETURNED_ATTRS
@@ -356,6 +352,10 @@ fn walk_dir_bulk(
     // path construction to recursion time, avoiding the dir prefix copy
     // for every subdir entry held concurrently across rayon call stacks.
     let mut sub_dirs: Vec<(Box<str>, bool)> = Vec::new();
+    // Batch progress counters per-directory to reduce atomic ops from
+    // 2 per file (~6.6M total) to 2 per directory (~200K total).
+    let mut batch_file_count: u64 = 0;
+    let mut batch_total_size: u64 = 0;
 
     // Borrow the thread-local buffer, fill it via getattrlistbulk, and
     // parse all entries.  The borrow is released before we recurse into
@@ -374,7 +374,7 @@ fn walk_dir_bulk(
             let count = unsafe {
                 getattrlistbulk(
                     dirfd,
-                    &attrlist,
+                    &ATTRLIST,
                     buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
                     BUF_SIZE,
                     FSOPT_NOFOLLOW,
@@ -457,8 +457,8 @@ fn walk_dir_bulk(
                             } else {
                                 0
                             };
-                            progress.file_count.fetch_add(1, Ordering::Relaxed);
-                            progress.total_size.fetch_add(allocsize, Ordering::Relaxed);
+                            batch_file_count += 1;
+                            batch_total_size += allocsize;
                             file_children
                                 .push(FileNode::File(FileLeaf::new(name, allocsize, hidden)));
                         }
@@ -470,6 +470,13 @@ fn walk_dir_bulk(
             }
         }
     }); // thread-local borrow released — safe to recurse now.
+
+    // Flush batched progress counters (one atomic pair per directory
+    // instead of per file).
+    if batch_file_count > 0 {
+        progress.file_count.fetch_add(batch_file_count, Ordering::Relaxed);
+        progress.total_size.fetch_add(batch_total_size, Ordering::Relaxed);
+    }
 
     unsafe {
         libc::close(dirfd);
@@ -484,7 +491,7 @@ fn walk_dir_bulk(
             if skip.contains(&path) {
                 return None;
             }
-            Some(walk_dir_bulk(&path, hidden, progress, skip))
+            Some(walk_dir_bulk(&path, name, hidden, progress, skip))
         })
         .collect();
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[cfg(all(unix, any(not(all(target_os = "macos", feature = "macos-bulk-scan")), test)))]
 use std::os::unix::fs::MetadataExt;
 
-#[cfg(not(all(target_os = "macos", feature = "macos-bulk-scan")))]
+#[cfg(any(not(all(target_os = "macos", feature = "macos-bulk-scan")), test))]
 use rayon::iter::ParallelBridge;
 use rayon::prelude::ParallelIterator;
 
@@ -494,7 +494,7 @@ fn walk_dir_bulk(
 
 /// Parallel recursive directory walk using `read_dir` + per-entry `lstat`.
 /// Used when `macos-bulk-scan` is disabled or on non-macOS platforms.
-#[cfg(not(all(target_os = "macos", feature = "macos-bulk-scan")))]
+#[cfg(any(not(all(target_os = "macos", feature = "macos-bulk-scan")), test))]
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
@@ -813,5 +813,192 @@ mod tests {
         assert!(root.children().is_empty());
         assert_eq!(root.size(), 0);
         assert_eq!(progress.file_count.load(Ordering::Relaxed), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests: compare read_dir vs getattrlistbulk implementations
+    // -----------------------------------------------------------------------
+
+    /// Recursively compare two trees for structural equality.
+    /// Returns Ok(()) if identical, Err(description) on first mismatch.
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
+    fn assert_trees_equal(a: &FileNode, b: &FileNode, path: &str) {
+        assert_eq!(a.name(), b.name(), "name mismatch at {path}");
+        assert_eq!(
+            a.is_dir(),
+            b.is_dir(),
+            "type mismatch at {path}/{}",
+            a.name()
+        );
+        assert_eq!(
+            a.is_hidden(),
+            b.is_hidden(),
+            "hidden mismatch at {path}/{}",
+            a.name()
+        );
+        assert_eq!(
+            a.size(),
+            b.size(),
+            "size mismatch at {path}/{}: read_dir={}, bulk={}",
+            a.name(),
+            a.size(),
+            b.size()
+        );
+        let ac = a.children();
+        let bc = b.children();
+        assert_eq!(
+            ac.len(),
+            bc.len(),
+            "child count mismatch at {path}/{}: read_dir={}, bulk={}",
+            a.name(),
+            ac.len(),
+            bc.len()
+        );
+        let child_path = format!("{path}/{}", a.name());
+        for (ca, cb) in ac.iter().zip(bc.iter()) {
+            assert_trees_equal(ca, cb, &child_path);
+        }
+    }
+
+    /// Sort tree children by name for deterministic comparison.
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
+    fn sort_by_name(node: &mut FileNode) {
+        if let FileNode::Dir(d) = node {
+            d.children.sort_by(|a, b| a.name().cmp(b.name()));
+            for child in &mut d.children {
+                sort_by_name(child);
+            }
+        }
+    }
+
+    /// Scan a directory with both walk_dir (read_dir) and walk_dir_bulk
+    /// (getattrlistbulk), returning both trees sorted by name for comparison.
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
+    fn scan_both(
+        root: &Path,
+    ) -> (FileNode, Arc<ScanProgress>, FileNode, Arc<ScanProgress>) {
+        let skip = build_skip_set(root);
+
+        let progress_rd = new_progress();
+        let mut tree_rd = walk_dir(root, &progress_rd, &skip);
+        sort_by_name(&mut tree_rd);
+
+        let name_str = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let root_hidden = fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&name_str, &m))
+            .unwrap_or_else(|_| name_str.starts_with('.'));
+        let progress_bulk = new_progress();
+        let mut tree_bulk = walk_dir_bulk(root, root_hidden, &progress_bulk, &skip);
+        sort_by_name(&mut tree_bulk);
+
+        (tree_rd, progress_rd, tree_bulk, progress_bulk)
+    }
+
+    /// Exact regression test against a controlled temp directory.
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
+    fn regression_bulk_vs_readdir_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Build a known directory structure
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::create_dir(root.join("d")).unwrap();
+        fs::create_dir(root.join(".hidden_dir")).unwrap();
+
+        fs::write(root.join("file1.txt"), "hello world").unwrap();
+        fs::write(root.join("a/file2.rs"), vec![0u8; 1000]).unwrap();
+        fs::write(root.join("a/b/file3.dat"), vec![0u8; 5000]).unwrap();
+        fs::write(root.join("a/b/c/deep.txt"), "deep").unwrap();
+        fs::write(root.join("d/top.bin"), vec![0u8; 100]).unwrap();
+        fs::write(root.join(".dotfile"), "secret").unwrap();
+        fs::write(root.join(".hidden_dir/inner.txt"), "hi").unwrap();
+
+        // UF_HIDDEN file (non-dot name, hidden by macOS flag)
+        let uf_path = root.join("uf_hidden.txt");
+        fs::write(&uf_path, "hidden by flag").unwrap();
+        set_uf_hidden(&uf_path);
+
+        // UF_HIDDEN directory
+        let uf_dir = root.join("uf_hidden_dir");
+        fs::create_dir(&uf_dir).unwrap();
+        fs::write(uf_dir.join("child.txt"), "inside").unwrap();
+        set_uf_hidden(&uf_dir);
+
+        let (tree_rd, progress_rd, tree_bulk, progress_bulk) = scan_both(root);
+
+        // File counts
+        let files_rd = progress_rd.file_count.load(Ordering::Relaxed);
+        let files_bulk = progress_bulk.file_count.load(Ordering::Relaxed);
+        assert_eq!(
+            files_rd, files_bulk,
+            "file count mismatch: read_dir={files_rd}, bulk={files_bulk}"
+        );
+
+        // Total size
+        assert_eq!(
+            tree_rd.size(),
+            tree_bulk.size(),
+            "total size mismatch: read_dir={}, bulk={}",
+            tree_rd.size(),
+            tree_bulk.size()
+        );
+
+        // Full structural comparison (names, types, sizes, hidden flags)
+        assert_trees_equal(&tree_rd, &tree_bulk, "");
+    }
+
+    /// Regression test: scan ~ with both implementations.
+    /// Catches edge cases from real filesystems (weird filenames, permission
+    /// errors, large trees, symlinks, etc.) that synthetic tests miss.
+    #[test]
+    #[ignore] // ~60s on a real home directory
+    #[cfg(all(target_os = "macos", feature = "macos-bulk-scan"))]
+    fn regression_bulk_vs_readdir_home() {
+        let home = dirs::home_dir().expect("HOME not set");
+        let (tree_rd, progress_rd, tree_bulk, progress_bulk) = scan_both(&home);
+
+        let files_rd = progress_rd.file_count.load(Ordering::Relaxed);
+        let files_bulk = progress_bulk.file_count.load(Ordering::Relaxed);
+        let size_rd = tree_rd.size();
+        let size_bulk = tree_bulk.size();
+
+        eprintln!("read_dir : {files_rd} files, {size_rd} bytes");
+        eprintln!("bulk     : {files_bulk} files, {size_bulk} bytes");
+
+        // Allow 0.1% tolerance for filesystem churn between sequential scans
+        let file_tol = std::cmp::max(files_rd, files_bulk) / 1000;
+        let file_diff = (files_rd as i64 - files_bulk as i64).unsigned_abs();
+        assert!(
+            file_diff <= file_tol,
+            "file count diverged: read_dir={files_rd}, bulk={files_bulk}, \
+             diff={file_diff} > tolerance={file_tol}"
+        );
+
+        let size_tol = std::cmp::max(size_rd, size_bulk) / 1000;
+        let size_diff = (size_rd as i64 - size_bulk as i64).unsigned_abs();
+        assert!(
+            size_diff <= size_tol,
+            "total size diverged: read_dir={size_rd}, bulk={size_bulk}, \
+             diff={size_diff} > tolerance={size_tol}"
+        );
+
+        // Top-level children should match exactly (stable set of dirs in ~)
+        let rd_names: Vec<&str> = tree_rd.children().iter().map(|c| c.name()).collect();
+        let bulk_names: Vec<&str> = tree_bulk.children().iter().map(|c| c.name()).collect();
+        assert_eq!(rd_names, bulk_names, "top-level children differ");
+
+        // Hidden flag agreement on top-level entries
+        for (rd, bulk) in tree_rd.children().iter().zip(tree_bulk.children().iter()) {
+            assert_eq!(
+                rd.is_hidden(),
+                bulk.is_hidden(),
+                "hidden flag mismatch for top-level '{}'",
+                rd.name()
+            );
+        }
     }
 }

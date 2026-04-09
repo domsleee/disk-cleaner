@@ -339,18 +339,23 @@ fn walk_dir_bulk(
         forkattr: 0,
     };
 
-    const BUF_SIZE: usize = 256 * 1024;
+    // 64 KB is enough for ~700 entries per batch.  Keeping this small
+    // matters because rayon maintains one thread-local buffer per worker.
+    const BUF_SIZE: usize = 64 * 1024;
 
     // Thread-local buffer reused across recursive calls on the same rayon
-    // thread.  Avoids allocating 256 KB per stack frame — without this,
-    // ~8 threads × ~25 recursion depth = ~50 MB of live buffers.
+    // thread.  Avoids allocating a buffer per stack frame — without this,
+    // ~8 threads × ~25 recursion depth = many MB of live buffers.
     thread_local! {
         static ATTR_BUF: std::cell::RefCell<Vec<u8>> =
             std::cell::RefCell::new(vec![0u8; BUF_SIZE]);
     }
 
     let mut file_children: Vec<FileNode> = Vec::new();
-    let mut sub_dirs: Vec<(PathBuf, bool)> = Vec::new();
+    // Store (name, hidden) instead of (PathBuf, hidden) — defers full
+    // path construction to recursion time, avoiding the dir prefix copy
+    // for every subdir entry held concurrently across rayon call stacks.
+    let mut sub_dirs: Vec<(Box<str>, bool)> = Vec::new();
 
     // Borrow the thread-local buffer, fill it via getattrlistbulk, and
     // parse all entries.  The borrow is released before we recurse into
@@ -444,10 +449,7 @@ fn walk_dir_bulk(
 
                     match objtype {
                         VDIR => {
-                            let path = dir.join(&*name);
-                            if !skip.contains(&path) {
-                                sub_dirs.push((path, hidden));
-                            }
+                            sub_dirs.push((name, hidden));
                         }
                         VREG => {
                             let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
@@ -473,10 +475,17 @@ fn walk_dir_bulk(
         libc::close(dirfd);
     }
 
-    // Recurse into subdirectories in parallel.
+    // Recurse into subdirectories in parallel.  Build full paths here
+    // (deferred from the parse loop to keep sub_dirs small).
     let dir_children: Vec<FileNode> = sub_dirs
         .into_par_iter()
-        .map(|(path, hidden)| walk_dir_bulk(&path, hidden, progress, skip))
+        .filter_map(|(name, hidden)| {
+            let path = dir.join(&*name);
+            if skip.contains(&path) {
+                return None;
+            }
+            Some(walk_dir_bulk(&path, hidden, progress, skip))
+        })
         .collect();
 
     file_children.extend(dir_children);

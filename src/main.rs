@@ -7,6 +7,9 @@ mod tree;
 mod treemap;
 mod ui;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;

@@ -6,8 +6,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use rayon::iter::ParallelBridge;
-use rayon::prelude::ParallelIterator;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
 
@@ -219,7 +218,23 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
-/// Parallel recursive directory walk, following dust's par_bridge() pattern.
+/// Minimum entry count to use rayon parallelism. ~90% of directories have
+/// 0-3 entries; pushing tiny vecs through rayon's work-stealing queue costs
+/// more in atomic ops and thread wakes than sequential iteration saves.
+/// Override at runtime with `DISK_CLEANER_PAR_THRESHOLD` for benchmarking.
+fn par_threshold() -> usize {
+    use std::sync::OnceLock;
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("DISK_CLEANER_PAR_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// Recursive directory walk. Uses rayon for directories with ≥PAR_THRESHOLD
+/// entries, sequential iteration otherwise.
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
@@ -229,9 +244,6 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
     let dir_hidden = std::fs::symlink_metadata(dir)
         .map(|m| is_hidden_from_metadata(&dir_name, &m))
         .unwrap_or_else(|_| dir_name.starts_with('.'));
-
-    // Build the empty fallback only in early-return paths to avoid cloning
-    // dir_name and allocating a Vec on every directory visit.
 
     // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
@@ -244,8 +256,8 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }));
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
         Err(_) => {
             return FileNode::Dir(Box::new(DirNode {
                 name: dir_name,
@@ -257,40 +269,40 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }
     };
 
-    let mut children: Vec<FileNode> = entries
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| {
-            if progress.cancelled.load(Ordering::Relaxed) {
+    let process_entry = |entry: std::fs::DirEntry| -> Option<FileNode> {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let ft = entry.file_type().ok()?;
+
+        if ft.is_dir() {
+            let path = entry.path();
+            if skip.contains(&path) {
                 return None;
             }
-            let entry = entry.ok()?;
-            let ft = entry.file_type().ok()?;
+            Some(walk_dir(&path, progress, skip))
+        } else if ft.is_file() {
+            let metadata = entry.metadata().ok()?;
+            #[cfg(unix)]
+            let len = metadata.blocks() * 512;
+            #[cfg(not(unix))]
+            let len = metadata.len();
+            progress.file_count.fetch_add(1, Ordering::Relaxed);
+            progress.total_size.fetch_add(len, Ordering::Relaxed);
+            let name = os_name_to_boxed(entry.file_name());
+            let hidden = is_hidden_from_metadata(&name, &metadata);
+            Some(FileNode::File(FileLeaf::new(name, len, hidden)))
+        } else {
+            None
+        }
+    };
 
-            if ft.is_dir() {
-                let path = entry.path();
-                if skip.contains(&path) {
-                    return None;
-                }
-                Some(walk_dir(&path, progress, skip))
-            } else if ft.is_file() {
-                let metadata = entry.metadata().ok()?;
-                #[cfg(unix)]
-                let len = metadata.blocks() * 512;
-                #[cfg(not(unix))]
-                let len = metadata.len();
-                progress.file_count.fetch_add(1, Ordering::Relaxed);
-                progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = os_name_to_boxed(entry.file_name());
-                let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let children: Vec<FileNode> = if entries.len() >= par_threshold() {
+        entries.into_par_iter().filter_map(process_entry).collect()
+    } else {
+        entries.into_iter().filter_map(process_entry).collect()
+    };
 
-    children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

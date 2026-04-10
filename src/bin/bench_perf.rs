@@ -16,7 +16,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
+    // Match main binary's rayon oversubscription for I/O-bound scanning
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(8, |n| n.get()) * 2)
+        .build_global()
+        .ok();
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)

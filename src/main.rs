@@ -104,6 +104,12 @@ fn print_help() {
 }
 
 fn main() -> eframe::Result {
+    // Oversubscribe rayon threads for I/O-bound scanning on NVMe SSDs
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(8, |n| n.get()) * 2)
+        .build_global()
+        .ok();
+
     let process_start = Instant::now();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

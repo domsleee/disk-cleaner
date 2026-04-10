@@ -257,7 +257,7 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }
     };
 
-    let mut children: Vec<FileNode> = entries
+    let children: Vec<FileNode> = entries
         .into_iter()
         .par_bridge()
         .filter_map(|entry| {
@@ -290,7 +290,6 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         })
         .collect();
 
-    children.shrink_to_fit();
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

@@ -57,6 +57,9 @@ harness = false
 name = "stat_bench"
 harness = false
 
+[profile.dev.package.image]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 strip = true

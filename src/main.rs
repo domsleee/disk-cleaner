@@ -161,7 +161,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
-            .with_icon(app_icon::generate()),
+            .with_icon(app_icon::generate())
+            .with_visible(false), // hidden until first frame renders (avoids white flash)
         ..Default::default()
     };
 
@@ -472,14 +473,21 @@ fn save_screenshot_png(
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Match the panel fill so sub-pixel gaps between panels don't
+        // expose the default (darker) clear color as a shadow line.
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
 
-        // Log startup time on first frame
+        // Show window on first frame (was created hidden to avoid white flash)
         if let Some(start) = self.process_start.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             if debug_enabled() {
                 eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
             }
@@ -496,11 +504,6 @@ impl eframe::App for App {
                 let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
                 ctx.request_repaint_after(remaining);
             }
-        }
-
-        // Load system icons on first frame
-        if self.icon_cache.is_none() {
-            self.icon_cache = icons::IconCache::load(ctx);
         }
 
         // Check if scan completed
@@ -834,6 +837,7 @@ impl eframe::App for App {
         if show_toolbar {
             egui::TopBottomPanel::top("toolbar")
                 .show_separator_line(false)
+                .default_size(28.0) // 24px interact_size + 4px inner_margin
                 .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Standardize widget height so buttons and selectable labels align
@@ -1343,6 +1347,10 @@ impl eframe::App for App {
 
             match self.view_mode {
                 ViewMode::Tree => {
+                    // Lazy-load icons on first tree render (not at startup)
+                    if self.icon_cache.is_none() {
+                        self.icon_cache = icons::IconCache::load(ctx);
+                    }
                     let render_start = std::time::Instant::now();
                     let rebuild_needed = self.rows_dirty;
                     self.rebuild_rows_if_dirty();

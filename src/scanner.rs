@@ -184,6 +184,9 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     // correct absolute paths.
     #[cfg(target_os = "macos")]
     let mut root_node = {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
         // Compute root dir's name and hidden status (child dirs get these
         // from the parent's bulk call, but the root has no parent).
         let root_name: Box<str> = root
@@ -193,7 +196,24 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
         let root_hidden = std::fs::symlink_metadata(root)
             .map(|m| is_hidden_from_metadata(&root_name, &m))
             .unwrap_or_else(|_| root_name.starts_with('.'));
-        walk_dir_bulk(root, root_name, root_hidden, &progress, &skip)
+
+        // Open root directory fd — children will use openat() for
+        // fd-relative opens instead of resolving full paths from /.
+        let root_fd = CString::new(root.as_os_str().as_bytes())
+            .ok()
+            .map(|c| unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) })
+            .unwrap_or(-1);
+        if root_fd < 0 {
+            FileNode::Dir(Box::new(DirNode {
+                name: root_name,
+                size: 0,
+                children: Vec::new(),
+                expanded: false,
+                hidden: root_hidden,
+            }))
+        } else {
+            walk_dir_bulk(root_fd, root, root_name, root_hidden, &progress, &skip)
+        }
     };
     #[cfg(not(target_os = "macos"))]
     let mut root_node = walk_dir(root, &progress, &skip);
@@ -237,6 +257,18 @@ fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
 // ---------------------------------------------------------------------------
 // macOS bulk metadata walker using getattrlistbulk(2)
 // ---------------------------------------------------------------------------
+
+/// RAII wrapper for a raw file descriptor. Calls `libc::close` on drop
+/// so fds are released even on early returns or panics.
+#[cfg(target_os = "macos")]
+struct DropFd(std::os::unix::io::RawFd);
+
+#[cfg(target_os = "macos")]
+impl Drop for DropFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0); }
+    }
+}
 
 /// FFI declarations for macOS `getattrlistbulk(2)`.
 #[cfg(target_os = "macos")]
@@ -283,10 +315,16 @@ mod bulk_attrs {
 /// directory via batched syscalls.  Reduces per-directory cost from
 /// ~2N+2 syscalls (`readdir` + per-file `lstat`) to ~⌈N/256⌉+1.
 ///
+/// `dirfd` is an already-open file descriptor for the directory. This
+/// function takes ownership and will close it via `DropFd` on return.
+/// Children are opened with `openat(dirfd, name, ...)` to avoid full
+/// path resolution from `/` on every syscall.
+///
 /// `dir_hidden` is pre-computed by the caller (the parent directory's
 /// bulk call already returned this directory's flags).
 #[cfg(target_os = "macos")]
 fn walk_dir_bulk(
+    dirfd: std::os::unix::io::RawFd,
     dir: &Path,
     dir_name: Box<str>,
     dir_hidden: bool,
@@ -296,7 +334,8 @@ fn walk_dir_bulk(
     use bulk_attrs::*;
     use rayon::iter::IntoParallelIterator;
     use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+
+    let _dirfd_guard = DropFd(dirfd);
 
     let empty_dir = |name: Box<str>| {
         FileNode::Dir(Box::new(DirNode {
@@ -309,16 +348,6 @@ fn walk_dir_bulk(
     };
 
     if progress.cancelled.load(Ordering::Relaxed) {
-        return empty_dir(dir_name);
-    }
-
-    // Open the directory to get a file descriptor for getattrlistbulk.
-    let c_path = match CString::new(dir.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return empty_dir(dir_name),
-    };
-    let dirfd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-    if dirfd < 0 {
         return empty_dir(dir_name);
     }
 
@@ -478,12 +507,10 @@ fn walk_dir_bulk(
         progress.total_size.fetch_add(batch_total_size, Ordering::Relaxed);
     }
 
-    unsafe {
-        libc::close(dirfd);
-    }
-
-    // Recurse into subdirectories in parallel.  Build full paths here
-    // (deferred from the parse loop to keep sub_dirs small).
+    // Recurse into subdirectories in parallel.  Each child opens itself
+    // with openat(dirfd, name) — the kernel resolves only the final path
+    // component instead of the entire absolute path from /.  The parent
+    // dirfd stays open (via DropFd) until all children have called openat.
     let dir_children: Vec<FileNode> = sub_dirs
         .into_par_iter()
         .filter_map(|(name, hidden)| {
@@ -491,7 +518,22 @@ fn walk_dir_bulk(
             if skip.contains(&path) {
                 return None;
             }
-            Some(walk_dir_bulk(&path, name, hidden, progress, skip))
+            let child_fd = CString::new(name.as_bytes())
+                .ok()
+                .map(|c| unsafe {
+                    libc::openat(dirfd, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+                })
+                .unwrap_or(-1);
+            if child_fd < 0 {
+                return Some(FileNode::Dir(Box::new(DirNode {
+                    name,
+                    size: 0,
+                    children: Vec::new(),
+                    expanded: false,
+                    hidden,
+                })));
+            }
+            Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
         })
         .collect();
 

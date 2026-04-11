@@ -896,28 +896,26 @@ impl eframe::App for App {
                         }
                     }
 
-                    // Search/filter bar
-                    if self.tree.is_some() {
-                        ui.separator();
-                        ui.label("Filter:");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("file name...")
-                                .desired_width(200.0),
-                        );
-                        if response.changed() {
-                            // Convert to lowercase once; node_matches uses lowercase comparison
-                            self.search_query = self.search_query.to_lowercase();
-                            self.search_changed_at = Some(Instant::now());
-                        }
-                        if !self.search_query.is_empty() && ui.small_button("×").clicked() {
-                            self.search_query.clear();
-                            self.applied_search.clear();
-                            self.search_changed_at = None;
-                            self.rows_dirty = true;
-                            // Treemap doesn't filter by search text, so no treemap_dirty
-                        }
-                    }
+                    // Search/filter bar — hidden: filter feature crashes (DIS-253)
+                    // if self.tree.is_some() {
+                    //     ui.separator();
+                    //     ui.label("Filter:");
+                    //     let response = ui.add(
+                    //         egui::TextEdit::singleline(&mut self.search_query)
+                    //             .hint_text("file name...")
+                    //             .desired_width(200.0),
+                    //     );
+                    //     if response.changed() {
+                    //         self.search_query = self.search_query.to_lowercase();
+                    //         self.search_changed_at = Some(Instant::now());
+                    //     }
+                    //     if !self.search_query.is_empty() && ui.small_button("×").clicked() {
+                    //         self.search_query.clear();
+                    //         self.applied_search.clear();
+                    //         self.search_changed_at = None;
+                    //         self.rows_dirty = true;
+                    //     }
+                    // }
 
                     // Hidden files toggle
                     if self.tree.is_some() {

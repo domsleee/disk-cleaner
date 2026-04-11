@@ -698,7 +698,46 @@ impl eframe::App for App {
 
             if left || right {
                 if let Some(ref focused) = self.focused_path.clone() {
-                    if let Some(ref mut tree) = self.tree {
+                    let is_file_group = focused
+                        .file_name()
+                        .is_some_and(|n| n == "__file_group__");
+
+                    if is_file_group {
+                        // File group path is parent_dir/__file_group__; key is parent_dir
+                        if let Some(parent_dir) = focused.parent() {
+                            let key = parent_dir.to_path_buf();
+                            let group_expanded = self.expanded_file_groups.contains(&key);
+                            if left {
+                                if group_expanded {
+                                    self.expanded_file_groups.remove(&key);
+                                    self.mark_dirty();
+                                } else {
+                                    // Already collapsed — navigate to parent directory
+                                    self.focused_path = Some(parent_dir.to_path_buf());
+                                    self.selected_paths.clear();
+                                    self.tree_scroll_to_focus = true;
+                                }
+                            } else if right {
+                                if !group_expanded {
+                                    self.expanded_file_groups.insert(key);
+                                    self.mark_dirty();
+                                } else {
+                                    // Already expanded — move focus to first child row
+                                    let rows = &self.cached_rows;
+                                    if let Some(idx) =
+                                        rows.iter().position(|r| &r.path == focused)
+                                    {
+                                        if idx + 1 < rows.len() {
+                                            self.focused_path =
+                                                Some(rows[idx + 1].path.clone());
+                                            self.selected_paths.clear();
+                                            self.tree_scroll_to_focus = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(ref mut tree) = self.tree {
                         if let Some((is_dir, expanded, has_children)) =
                             ui::find_node_info(tree, focused)
                         {
@@ -717,10 +756,12 @@ impl eframe::App for App {
                                     self.mark_dirty();
                                 } else if is_dir && expanded {
                                     let rows = &self.cached_rows;
-                                    if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                    if let Some(idx) =
+                                        rows.iter().position(|r| &r.path == focused)
                                     {
                                         if idx + 1 < rows.len() {
-                                            self.focused_path = Some(rows[idx + 1].path.clone());
+                                            self.focused_path =
+                                                Some(rows[idx + 1].path.clone());
                                             self.selected_paths.clear();
                                             self.tree_scroll_to_focus = true;
                                         }

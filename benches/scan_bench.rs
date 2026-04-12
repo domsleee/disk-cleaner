@@ -113,7 +113,7 @@ fn bench_scan_20k_files(c: &mut Criterion) {
 // Real directory scan benchmarks
 // ---------------------------------------------------------------------------
 
-/// Benchmark scanning real directories (project dir, ~/git).
+/// Benchmark scanning real directories (project dir, ~/git, ~).
 /// Low sample count — these are I/O-bound and take seconds per iteration.
 fn bench_scan_real_dirs(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_real");
@@ -139,6 +139,15 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
         });
     } else {
         eprintln!("Skipping ~/git benchmark: directory not found");
+    }
+
+    if let Some(home) = dirs::home_dir().filter(|p| p.is_dir()) {
+        group.bench_function("home", |b| {
+            b.iter(|| {
+                let progress = new_progress();
+                scanner::scan_directory(&home, progress)
+            })
+        });
     }
 
     group.finish();

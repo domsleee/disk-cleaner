@@ -1,6 +1,6 @@
 //! Scanning benchmarks — disk I/O, tree construction, memory allocation.
 //!
-//! Covers: synthetic scans, real directory scans, hidden-flag detection,
+//! Covers: synthetic scans (deep + 20k-file), real directory scans,
 //! directory-heavy layouts, and memory-per-node tracking.
 //!
 //! ```sh
@@ -68,27 +68,8 @@ fn count_nodes(node: &FileNode) -> usize {
 // Synthetic scan benchmarks
 // ---------------------------------------------------------------------------
 
-/// Benchmark scanning a small synthetic tree (100 dirs, 1000 files)
-fn bench_scan_synthetic(c: &mut Criterion) {
-    let tmp = tempfile::tempdir().unwrap();
-    // Create 100 dirs with 10 files each
-    for i in 0..100 {
-        let dir = tmp.path().join(format!("dir_{i:03}"));
-        fs::create_dir(&dir).unwrap();
-        for j in 0..10 {
-            fs::write(dir.join(format!("file_{j}.bin")), vec![0u8; 1024]).unwrap();
-        }
-    }
-
-    c.bench_function("scan_1000_files_100_dirs", |b| {
-        b.iter(|| {
-            let progress = new_progress();
-            scanner::scan_directory(tmp.path(), progress)
-        })
-    });
-}
-
-/// Benchmark scanning a deep tree (10 levels, ~1000 nodes)
+/// Benchmark scanning a deep tree (10 levels, ~100 nodes).
+/// Tests recursive descent overhead separately from file volume.
 fn bench_scan_deep(c: &mut Criterion) {
     let tmp = tempfile::tempdir().unwrap();
     let mut path = tmp.path().to_path_buf();
@@ -108,26 +89,8 @@ fn bench_scan_deep(c: &mut Criterion) {
     });
 }
 
-/// Benchmark scanning a large synthetic tree (10,000 files / 500 dirs)
-fn bench_scan_large_synthetic(c: &mut Criterion) {
-    let tmp = tempfile::tempdir().unwrap();
-    for i in 0..500 {
-        let dir = tmp.path().join(format!("dir_{i:04}"));
-        fs::create_dir(&dir).unwrap();
-        for j in 0..20 {
-            fs::write(dir.join(format!("file_{j}.dat")), vec![0u8; 4096]).unwrap();
-        }
-    }
-
-    c.bench_function("scan_10000_files_500_dirs", |b| {
-        b.iter(|| {
-            let progress = new_progress();
-            scanner::scan_directory(tmp.path(), progress)
-        })
-    });
-}
-
 /// Benchmark scanning a 20k-file tree to measure hidden-detection overhead.
+/// Primary synthetic scan benchmark — large enough to surface real costs.
 fn bench_scan_20k_files(c: &mut Criterion) {
     let tmp = tempfile::tempdir().unwrap();
     for i in 0..200 {
@@ -150,26 +113,25 @@ fn bench_scan_20k_files(c: &mut Criterion) {
 // Real directory scan benchmarks
 // ---------------------------------------------------------------------------
 
-/// Benchmark scanning the project's own directory (real-world data)
-fn bench_scan_self(c: &mut Criterion) {
-    let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+/// Benchmark scanning real directories (project dir, ~/git).
+/// Low sample count — these are I/O-bound and take seconds per iteration.
+fn bench_scan_real_dirs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_real");
+    group.sample_size(10);
 
-    c.bench_function("scan_project_dir", |b| {
+    let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    group.bench_function("project_dir", |b| {
         b.iter(|| {
             let progress = new_progress();
             scanner::scan_directory(project_dir, progress)
         })
     });
-}
 
-/// Benchmark scanning ~/git (real-world, large directory)
-fn bench_scan_home_git(c: &mut Criterion) {
     let home_git = dirs::home_dir()
         .map(|h| h.join("git"))
         .filter(|p| p.is_dir());
-
     if let Some(git_dir) = home_git {
-        c.bench_function("scan_home_git", |b| {
+        group.bench_function("home_git", |b| {
             b.iter(|| {
                 let progress = new_progress();
                 scanner::scan_directory(&git_dir, progress)
@@ -178,41 +140,13 @@ fn bench_scan_home_git(c: &mut Criterion) {
     } else {
         eprintln!("Skipping ~/git benchmark: directory not found");
     }
-}
 
-// ---------------------------------------------------------------------------
-// Hidden flag + directory-heavy benchmarks (scan shape variants)
-// ---------------------------------------------------------------------------
-
-/// Benchmark the hidden-flag detection path on macOS.
-///
-/// Creates N non-dot files in a flat directory. On macOS, each file triggers
-/// an `lstat` call in `is_os_hidden()` to check the UF_HIDDEN flag.
-fn bench_hidden_flag_lookup(c: &mut Criterion) {
-    let mut group = c.benchmark_group("hidden_flag_lookup");
-    for count in [500, 2000, 5000] {
-        let tmp = tempfile::tempdir().unwrap();
-        for i in 0..count {
-            fs::write(
-                tmp.path().join(format!("file_{i:05}.dat")),
-                vec![0u8; 64],
-            )
-            .unwrap();
-        }
-
-        group.bench_with_input(
-            BenchmarkId::new("non_dot_files", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let progress = new_progress();
-                    scanner::scan_directory(tmp.path(), progress)
-                })
-            },
-        );
-    }
     group.finish();
 }
+
+// ---------------------------------------------------------------------------
+// Directory-heavy benchmarks (scan shape variant)
+// ---------------------------------------------------------------------------
 
 /// Benchmark many empty directories to isolate per-directory overhead.
 fn bench_many_empty_dirs(c: &mut Criterion) {
@@ -225,33 +159,6 @@ fn bench_many_empty_dirs(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("empty_dirs", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let progress = new_progress();
-                    scanner::scan_directory(tmp.path(), progress)
-                })
-            },
-        );
-    }
-    group.finish();
-}
-
-/// Benchmark many small directories (each with a few files).
-fn bench_many_small_dirs(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dir_heavy");
-    for count in [200, 1000, 3000] {
-        let tmp = tempfile::tempdir().unwrap();
-        for i in 0..count {
-            let dir = tmp.path().join(format!("dir_{i:05}"));
-            fs::create_dir(&dir).unwrap();
-            for j in 0..3 {
-                fs::write(dir.join(format!("f{j}.bin")), vec![0u8; 128]).unwrap();
-            }
-        }
-
-        group.bench_with_input(
-            BenchmarkId::new("small_dirs_3_files", count),
             &count,
             |b, _| {
                 b.iter(|| {
@@ -374,17 +281,12 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
 criterion_group!(
     benches,
     // Synthetic scans
-    bench_scan_synthetic,
     bench_scan_deep,
-    bench_scan_large_synthetic,
     bench_scan_20k_files,
     // Real directory scans
-    bench_scan_self,
-    bench_scan_home_git,
+    bench_scan_real_dirs,
     // Scan shape variants
-    bench_hidden_flag_lookup,
     bench_many_empty_dirs,
-    bench_many_small_dirs,
     // Memory allocation
     bench_memory_synthetic,
     bench_memory_large_synthetic,

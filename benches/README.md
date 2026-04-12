@@ -7,8 +7,8 @@ plus two special-purpose suites.
 
 ### Scanning (`scan_bench`)
 
-Disk I/O and tree construction. Synthetic fixtures, real directory scans,
-hidden-flag detection, directory-heavy layouts, and memory-per-node tracking.
+Disk I/O and tree construction. Synthetic fixtures (deep nesting + 20k-file),
+real directory scans (sample_size=10), directory-heavy layouts, and memory-per-node tracking.
 
 ```sh
 cargo bench --bench scan_bench

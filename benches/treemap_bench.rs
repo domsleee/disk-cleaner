@@ -218,6 +218,27 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// squarify layout algorithm (pure computation, no tree)
+// ---------------------------------------------------------------------------
+
+fn bench_squarify(c: &mut Criterion) {
+    let sizes_100: Vec<f64> = (1..=100).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_100_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_100, 0.0, 0.0, 1200.0, 800.0))
+    });
+
+    let sizes_1000: Vec<f64> = (1..=1000).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_1000_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_1000, 0.0, 0.0, 1200.0, 800.0))
+    });
+
+    let sizes_10k: Vec<f64> = (1..=10_000).rev().map(|i| i as f64).collect();
+    c.bench_function("squarify_10000_items", |b| {
+        b.iter(|| treemap::squarify(&sizes_10k, 0.0, 0.0, 1200.0, 800.0))
+    });
+}
+
 criterion_group!(
     benches,
     bench_build_cache,
@@ -225,5 +246,6 @@ criterion_group!(
     bench_tree_navigation,
     bench_fontid_alloc,
     bench_navigation_at_scale,
+    bench_squarify,
 );
 criterion_main!(benches);

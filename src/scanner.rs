@@ -6,8 +6,7 @@ use std::sync::Arc;
 #[cfg(all(unix, any(not(target_os = "macos"), test)))]
 use std::os::unix::fs::MetadataExt;
 
-#[cfg(not(target_os = "macos"))]
-use rayon::iter::ParallelBridge;
+use rayon::iter::IntoParallelIterator;
 use rayon::prelude::ParallelIterator;
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
@@ -332,7 +331,6 @@ fn walk_dir_bulk(
     skip: &Arc<HashSet<PathBuf>>,
 ) -> FileNode {
     use bulk_attrs::*;
-    use rayon::iter::IntoParallelIterator;
     use std::ffi::CString;
 
     let _dirfd_guard = DropFd(dirfd);
@@ -507,10 +505,9 @@ fn walk_dir_bulk(
         progress.total_size.fetch_add(batch_total_size, Ordering::Relaxed);
     }
 
-    // Recurse into subdirectories in parallel.  Each child opens itself
-    // with openat(dirfd, name) — the kernel resolves only the final path
-    // component instead of the entire absolute path from /.  The parent
-    // dirfd stays open (via DropFd) until all children have called openat.
+    // Recurse into subdirectories.  Each child opens itself with
+    // openat(dirfd, name) — one-component kernel lookup instead of
+    // resolving the full absolute path from /.
     let dir_children: Vec<FileNode> = sub_dirs
         .into_par_iter()
         .filter_map(|(name, hidden)| {
@@ -538,7 +535,6 @@ fn walk_dir_bulk(
         .collect();
 
     file_children.extend(dir_children);
-    file_children.shrink_to_fit();
     let size = file_children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {
@@ -590,40 +586,60 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }
     };
 
-    let mut children: Vec<FileNode> = entries
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| {
-            if progress.cancelled.load(Ordering::Relaxed) {
-                return None;
-            }
-            let entry = entry.ok()?;
-            let ft = entry.file_type().ok()?;
+    // Collect entries eagerly so rayon gets full workload visibility.
+    let dir_entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
 
-            if ft.is_dir() {
-                let path = entry.path();
-                if skip.contains(&path) {
-                    return None;
-                }
-                Some(walk_dir(&path, progress, skip))
-            } else if ft.is_file() {
-                let metadata = entry.metadata().ok()?;
-                #[cfg(unix)]
-                let len = metadata.blocks() * 512;
-                #[cfg(not(unix))]
-                let len = metadata.len();
-                progress.file_count.fetch_add(1, Ordering::Relaxed);
-                progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = os_name_to_boxed(entry.file_name());
-                let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut children: Vec<FileNode> = Vec::with_capacity(dir_entries.len());
+    let mut subdirs: Vec<PathBuf> = Vec::new();
 
-    children.shrink_to_fit();
+    for entry in dir_entries {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            let path = entry.path();
+            if !skip.contains(&path) {
+                subdirs.push(path);
+            }
+        } else if ft.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            #[cfg(unix)]
+            let len = {
+                use std::os::unix::fs::MetadataExt;
+                metadata.blocks() * 512
+            };
+            #[cfg(not(unix))]
+            let len = metadata.len();
+            progress.file_count.fetch_add(1, Ordering::Relaxed);
+            progress.total_size.fetch_add(len, Ordering::Relaxed);
+            let name = os_name_to_boxed(entry.file_name());
+            let hidden = is_hidden_from_metadata(&name, &metadata);
+            children.push(FileNode::File(FileLeaf::new(name, len, hidden)));
+        }
+    }
+
+    // Small-dir sequential fallback — skip rayon for few subdirs.
+    const PAR_THRESHOLD: usize = 4;
+    if subdirs.len() <= PAR_THRESHOLD {
+        for path in subdirs {
+            children.push(walk_dir(&path, progress, skip));
+        }
+    } else {
+        let dir_children: Vec<FileNode> = subdirs
+            .into_par_iter()
+            .map(|path| walk_dir(&path, progress, skip))
+            .collect();
+        children.extend(dir_children);
+    }
+
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

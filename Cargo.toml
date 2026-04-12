@@ -30,23 +30,11 @@ name = "scan_bench"
 harness = false
 
 [[bench]]
-name = "tree_memory"
-harness = false
-
-[[bench]]
-name = "tree_ops"
-harness = false
-
-[[bench]]
-name = "view_bench"
+name = "tree_bench"
 harness = false
 
 [[bench]]
 name = "treemap_bench"
-harness = false
-
-[[bench]]
-name = "bench_perf"
 harness = false
 
 [[bench]]

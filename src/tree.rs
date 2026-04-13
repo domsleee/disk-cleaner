@@ -107,7 +107,7 @@ impl FileNode {
 pub fn sort_children_recursive(node: &mut FileNode) {
     if let FileNode::Dir(d) = node {
         d.children
-            .sort_by_key(|c| std::cmp::Reverse(c.size()));
+            .sort_unstable_by_key(|c| std::cmp::Reverse(c.size()));
         for child in &mut d.children {
             sort_children_recursive(child);
         }

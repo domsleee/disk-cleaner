@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
 
-#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+#[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(not(target_os = "macos"))]

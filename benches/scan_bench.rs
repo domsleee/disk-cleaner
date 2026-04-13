@@ -151,6 +151,33 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
     }
 
     group.finish();
+
+    // One-time memory report for each real directory
+    eprintln!("\n=== Real Scan Memory Report ===");
+    for (label, path) in [
+        ("~/git", dirs::home_dir().map(|h| h.join("git")).filter(|p| p.is_dir())),
+        ("~", dirs::home_dir().filter(|p| p.is_dir())),
+    ] {
+        if let Some(ref p) = path {
+            reset_tracking();
+            let before = ALLOCATED.load(Ordering::SeqCst);
+            let progress = new_progress();
+            let tree = scanner::scan_directory(p, progress.clone());
+            let after = ALLOCATED.load(Ordering::SeqCst);
+            let peak = PEAK.load(Ordering::SeqCst);
+            let delta = after.saturating_sub(before);
+            let nodes = count_nodes(&tree);
+            let files = progress.file_count.load(Ordering::Relaxed);
+            eprintln!(
+                "  {label:8} | {files:>9} files | {nodes:>9} nodes | {:>6.1} MB delta | {:>6.1} MB peak | {:.0} b/node",
+                delta as f64 / 1e6,
+                peak as f64 / 1e6,
+                delta as f64 / nodes as f64,
+            );
+            std::hint::black_box(tree);
+        }
+    }
+    eprintln!("===============================\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ mod app_icon;
 mod categories;
 mod deleter;
 mod icons;
+mod permissions;
 mod scanner;
 mod tree;
 mod treemap;
@@ -39,6 +40,18 @@ use deleter::BackgroundDeleter;
 enum ViewMode {
     Tree,
     Treemap,
+}
+
+/// State machine for the pre-scan FDA permission prompt (macOS only).
+#[derive(Default)]
+enum FdaPromptState {
+    /// Not showing the FDA prompt.
+    #[default]
+    None,
+    /// Showing the prompt, waiting for user action.
+    Prompting { pending_path: PathBuf },
+    /// User clicked "Open Settings"; polling for FDA grant.
+    WaitingForGrant { pending_path: PathBuf },
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -188,7 +201,7 @@ fn main() -> eframe::Result {
                 app.show_hidden = true;
             }
             if let Some(path) = initial_path {
-                app.start_scan(path);
+                app.request_scan(path);
             }
             Ok(Box::new(app))
         }),
@@ -268,6 +281,8 @@ struct App {
     screenshots_saved: u8,
     /// Background deletion state.
     deleter: BackgroundDeleter,
+    /// FDA permission prompt state (macOS pre-scan gate).
+    fda_prompt: FdaPromptState,
 }
 
 impl Default for App {
@@ -320,6 +335,7 @@ impl Default for App {
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
             deleter: BackgroundDeleter::default(),
+            fda_prompt: FdaPromptState::None,
         }
     }
 }
@@ -329,6 +345,18 @@ impl App {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
+    }
+
+    /// Gate scan behind FDA check. If FDA is granted (or non-macOS), starts
+    /// the scan directly. Otherwise shows the FDA permission prompt.
+    fn request_scan(&mut self, path: PathBuf) {
+        if permissions::has_full_disk_access() {
+            self.start_scan(path);
+        } else {
+            self.fda_prompt = FdaPromptState::Prompting {
+                pending_path: path,
+            };
+        }
     }
 
     fn start_scan(&mut self, path: PathBuf) {
@@ -556,6 +584,17 @@ impl eframe::App for App {
         self.poll_delete_completion();
         if self.deleter.is_active() {
             ctx.request_repaint();
+        }
+
+        // Poll for FDA grant while waiting
+        if let FdaPromptState::WaitingForGrant { ref pending_path } = self.fda_prompt {
+            if permissions::has_full_disk_access() {
+                let path = pending_path.clone();
+                self.fda_prompt = FdaPromptState::None;
+                self.start_scan(path);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
         }
 
         // ── Screenshot state machine ──
@@ -886,13 +925,13 @@ impl eframe::App for App {
 
                     if ui.button("Open Directory...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 
                     if self.tree.is_some() && ui.button("Re-scan").clicked() {
                         if let Some(path) = self.scan_path.clone() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 
@@ -1188,6 +1227,86 @@ impl eframe::App for App {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
+            // FDA permission prompt (macOS only)
+            if matches!(
+                self.fda_prompt,
+                FdaPromptState::Prompting { .. } | FdaPromptState::WaitingForGrant { .. }
+            ) {
+                ui.vertical_centered(|ui| {
+                    let available = ui.available_height();
+                    ui.add_space(available * 0.25);
+
+                    ui.heading("\u{1F6E1}\u{FE0F} Full Disk Access Required");
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Disk Cleaner needs Full Disk Access to accurately scan\n\
+                             protected directories like ~/Library/Mail and Time Machine backups.\n\
+                             Without it, some folders will be invisible and sizes will be incomplete.",
+                        )
+                        .weak()
+                        .size(13.0),
+                    );
+                    ui.add_space(20.0);
+
+                    let is_waiting =
+                        matches!(self.fda_prompt, FdaPromptState::WaitingForGrant { .. });
+
+                    if is_waiting {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label("Waiting for Full Disk Access to be granted\u{2026}");
+                        ui.add_space(16.0);
+                    }
+
+                    let open_btn = egui::Button::new(
+                        egui::RichText::new("Open System Settings").size(15.0),
+                    )
+                    .min_size(egui::vec2(200.0, 36.0));
+                    if ui.add(open_btn).clicked() {
+                        permissions::open_fda_settings();
+                        if let FdaPromptState::Prompting { ref pending_path } = self.fda_prompt {
+                            self.fda_prompt = FdaPromptState::WaitingForGrant {
+                                pending_path: pending_path.clone(),
+                            };
+                        }
+                    }
+
+                    ui.add_space(12.0);
+
+                    let scan_anyway = egui::Button::new(
+                        egui::RichText::new("Scan Anyway")
+                            .size(14.0)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .frame(false);
+                    if ui.add(scan_anyway).clicked() {
+                        let path = match &self.fda_prompt {
+                            FdaPromptState::Prompting { pending_path }
+                            | FdaPromptState::WaitingForGrant { pending_path } => {
+                                pending_path.clone()
+                            }
+                            FdaPromptState::None => unreachable!(),
+                        };
+                        self.fda_prompt = FdaPromptState::None;
+                        self.start_scan(path);
+                    }
+
+                    ui.add_space(8.0);
+
+                    let cancel_link = egui::Button::new(
+                        egui::RichText::new("Cancel")
+                            .size(13.0)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .frame(false);
+                    if ui.add(cancel_link).clicked() {
+                        self.fda_prompt = FdaPromptState::None;
+                    }
+                });
+                return;
+            }
+
             // Full-page scanning UI
             if self.scanning {
                 ui.vertical_centered(|ui| {
@@ -1354,7 +1473,7 @@ impl eframe::App for App {
                         }
 
                         if let Some(path) = scan_path {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
 
                         ui.add_space(12.0);
@@ -1364,7 +1483,7 @@ impl eframe::App for App {
                     if let Some(ref last) = self.last_scan_path.clone() {
                         let label = format!("Resume: {}", last.display());
                         if ui.button(label).clicked() {
-                            self.start_scan(last.clone());
+                            self.request_scan(last.clone());
                         }
                         ui.add_space(8.0);
                     }
@@ -1372,7 +1491,7 @@ impl eframe::App for App {
                     // Open Directory — primary action on home page
                     if ui.button("Open Directory...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
+                            self.request_scan(path);
                         }
                     }
 

@@ -109,6 +109,13 @@ fn bench_scan_20k_files(c: &mut Criterion) {
     });
 }
 
+/// Check if a benchmark ID matches the CLI filter (Criterion passes it as args[1]).
+/// Returns true if no filter is set or if the ID contains the filter as a substring.
+fn bench_filter_matches(bench_id: &str) -> bool {
+    let filter = std::env::args().nth(1).unwrap_or_default();
+    filter.is_empty() || bench_id.contains(&filter)
+}
+
 // ---------------------------------------------------------------------------
 // Real directory scan benchmarks
 // ---------------------------------------------------------------------------
@@ -152,12 +159,15 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
 
     group.finish();
 
-    // One-time memory report for each real directory
+    // One-time memory report for each real directory (only when selected).
     eprintln!("\n=== Real Scan Memory Report ===");
-    for (label, path) in [
-        ("~/git", dirs::home_dir().map(|h| h.join("git")).filter(|p| p.is_dir())),
-        ("~", dirs::home_dir().filter(|p| p.is_dir())),
+    for (label, id, path) in [
+        ("~/git", "scan_real/home_git", dirs::home_dir().map(|h| h.join("git")).filter(|p| p.is_dir())),
+        ("~", "scan_real/home", dirs::home_dir().filter(|p| p.is_dir())),
     ] {
+        if !bench_filter_matches(id) {
+            continue;
+        }
         if let Some(ref p) = path {
             reset_tracking();
             let before = ALLOCATED.load(Ordering::SeqCst);
@@ -234,33 +244,35 @@ fn bench_memory_synthetic(c: &mut Criterion) {
         })
     });
 
-    // Print a one-time memory report
-    reset_tracking();
-    let progress = new_progress();
-    let before = ALLOCATED.load(Ordering::SeqCst);
-    let tree = scanner::scan_directory(tmp.path(), progress.clone());
-    let after = ALLOCATED.load(Ordering::SeqCst);
-    let nodes = count_nodes(&tree);
-    let files = progress.file_count.load(Ordering::Relaxed);
-    eprintln!("\n=== Memory Report: 1000 files / 100 dirs ===");
-    eprintln!("Nodes: {nodes}");
-    eprintln!("Files scanned: {files}");
-    eprintln!(
-        "Memory delta: {} bytes ({:.1} KB)",
-        after.saturating_sub(before),
-        after.saturating_sub(before) as f64 / 1024.0
-    );
-    eprintln!(
-        "Bytes per node: {:.0}",
-        after.saturating_sub(before) as f64 / nodes as f64
-    );
-    eprintln!(
-        "Peak allocation: {} bytes ({:.1} KB)",
-        PEAK.load(Ordering::SeqCst),
-        PEAK.load(Ordering::SeqCst) as f64 / 1024.0
-    );
-    eprintln!("=============================================\n");
-    std::hint::black_box(tree);
+    // Print a one-time memory report (only when this bench is selected)
+    if bench_filter_matches("memory_1000_files_100_dirs") {
+        reset_tracking();
+        let progress = new_progress();
+        let before = ALLOCATED.load(Ordering::SeqCst);
+        let tree = scanner::scan_directory(tmp.path(), progress.clone());
+        let after = ALLOCATED.load(Ordering::SeqCst);
+        let nodes = count_nodes(&tree);
+        let files = progress.file_count.load(Ordering::Relaxed);
+        eprintln!("\n=== Memory Report: 1000 files / 100 dirs ===");
+        eprintln!("Nodes: {nodes}");
+        eprintln!("Files scanned: {files}");
+        eprintln!(
+            "Memory delta: {} bytes ({:.1} KB)",
+            after.saturating_sub(before),
+            after.saturating_sub(before) as f64 / 1024.0
+        );
+        eprintln!(
+            "Bytes per node: {:.0}",
+            after.saturating_sub(before) as f64 / nodes as f64
+        );
+        eprintln!(
+            "Peak allocation: {} bytes ({:.1} KB)",
+            PEAK.load(Ordering::SeqCst),
+            PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+        );
+        eprintln!("=============================================\n");
+        std::hint::black_box(tree);
+    }
 }
 
 /// Memory benchmark for a large synthetic tree (10,000 files / 500 dirs)
@@ -281,33 +293,35 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
         })
     });
 
-    // Print memory report for large tree
-    reset_tracking();
-    let progress = new_progress();
-    let before = ALLOCATED.load(Ordering::SeqCst);
-    let tree = scanner::scan_directory(tmp.path(), progress.clone());
-    let after = ALLOCATED.load(Ordering::SeqCst);
-    let nodes = count_nodes(&tree);
-    let files = progress.file_count.load(Ordering::Relaxed);
-    eprintln!("\n=== Memory Report: 10,000 files / 500 dirs ===");
-    eprintln!("Nodes: {nodes}");
-    eprintln!("Files scanned: {files}");
-    eprintln!(
-        "Memory delta: {} bytes ({:.1} KB)",
-        after.saturating_sub(before),
-        after.saturating_sub(before) as f64 / 1024.0
-    );
-    eprintln!(
-        "Bytes per node: {:.0}",
-        after.saturating_sub(before) as f64 / nodes as f64
-    );
-    eprintln!(
-        "Peak allocation: {} bytes ({:.1} KB)",
-        PEAK.load(Ordering::SeqCst),
-        PEAK.load(Ordering::SeqCst) as f64 / 1024.0
-    );
-    eprintln!("================================================\n");
-    std::hint::black_box(tree);
+    // Print memory report for large tree (only when this bench is selected)
+    if bench_filter_matches("memory_10000_files_500_dirs") {
+        reset_tracking();
+        let progress = new_progress();
+        let before = ALLOCATED.load(Ordering::SeqCst);
+        let tree = scanner::scan_directory(tmp.path(), progress.clone());
+        let after = ALLOCATED.load(Ordering::SeqCst);
+        let nodes = count_nodes(&tree);
+        let files = progress.file_count.load(Ordering::Relaxed);
+        eprintln!("\n=== Memory Report: 10,000 files / 500 dirs ===");
+        eprintln!("Nodes: {nodes}");
+        eprintln!("Files scanned: {files}");
+        eprintln!(
+            "Memory delta: {} bytes ({:.1} KB)",
+            after.saturating_sub(before),
+            after.saturating_sub(before) as f64 / 1024.0
+        );
+        eprintln!(
+            "Bytes per node: {:.0}",
+            after.saturating_sub(before) as f64 / nodes as f64
+        );
+        eprintln!(
+            "Peak allocation: {} bytes ({:.1} KB)",
+            PEAK.load(Ordering::SeqCst),
+            PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+        );
+        eprintln!("================================================\n");
+        std::hint::black_box(tree);
+    }
 }
 
 // ---------------------------------------------------------------------------

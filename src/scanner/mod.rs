@@ -279,6 +279,8 @@ fn scan_directory_inner(
     root_node
 }
 
+
+
 /// Convert an OsString to Box<str>, reusing the OsString allocation when
 /// the name is valid UTF-8 (the common case on macOS/Linux). `into_string()`
 /// transfers ownership of the inner buffer instead of copying the bytes.

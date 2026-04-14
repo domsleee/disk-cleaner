@@ -186,6 +186,35 @@ pub fn walk_dir_bulk(
                 break;
             }
 
+            // --- Pre-count pass: count files vs dirs to pre-allocate ---
+            //
+            // Per-entry layout (offsets from entry start):
+            //   +0   u32  length          total bytes for this entry
+            //   +32  u32  objtype           (VREG=1, VDIR=2, …)
+            //
+            // Full layout parsed in the main pass below.
+            {
+                let mut off = 0usize;
+                let (mut nfiles, mut ndirs) = (0usize, 0usize);
+                for _ in 0..count as usize {
+                    if off + 40 > BUF_SIZE { break; }
+                    unsafe {
+                        let base = buf.as_ptr().add(off);
+                        let entry_len = *(base as *const u32) as usize;
+                        if entry_len == 0 || off + entry_len > BUF_SIZE { break; }
+                        let objtype = *(base.add(32) as *const u32);
+                        match objtype {
+                            VREG => nfiles += 1,
+                            VDIR => ndirs += 1,
+                            _ => {}
+                        }
+                        off += entry_len;
+                    }
+                }
+                file_children.reserve(nfiles + ndirs);
+                sub_dirs.reserve(ndirs);
+            }
+
             // --- Parse returned entries ---
             //
             // Per-entry layout (offsets from entry start):
@@ -309,6 +338,7 @@ pub fn walk_dir_bulk(
         .collect();
 
     file_children.extend(dir_children);
+    file_children.shrink_to_fit();
     let size = file_children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

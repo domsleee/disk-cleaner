@@ -1,15 +1,24 @@
+#[cfg(target_os = "macos")]
+mod macos;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+#[cfg(any(not(target_os = "macos"), test))]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, OnceLock};
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt;
 
-use rayon::iter::ParallelBridge;
+#[cfg(not(target_os = "macos"))]
+use rayon::iter::IntoParallelIterator;
+#[cfg(not(target_os = "macos"))]
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::{DirNode, FileLeaf, FileNode};
+use crate::tree::{DirNode, FileNode};
+#[cfg(not(target_os = "macos"))]
+use crate::tree::FileLeaf;
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -105,6 +114,41 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     volumes
 }
 
+// ---------------------------------------------------------------------------
+// Dedicated scan thread pool with elevated QoS
+// ---------------------------------------------------------------------------
+
+/// Thread pool for scanning, with macOS QoS set to USER_INITIATED to ensure
+/// P-core scheduling and elevated I/O priority.
+fn scan_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .spawn_handler(|thread| {
+                let mut b = std::thread::Builder::new();
+                if let Some(name) = thread.name() {
+                    b = b.name(name.to_owned());
+                }
+                if let Some(stack_size) = thread.stack_size() {
+                    b = b.stack_size(stack_size);
+                }
+                b.spawn(move || {
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        libc::pthread_set_qos_class_self_np(
+                            libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+                            0,
+                        );
+                    }
+                    thread.run();
+                })?;
+                Ok(())
+            })
+            .build()
+            .expect("failed to create scan thread pool")
+    })
+}
+
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
@@ -117,7 +161,9 @@ pub struct ScanProgress {
 /// Scanning from `/` without skipping Data counts everything twice.
 /// Mount points under `/Volumes/` also cause inflation when scanning root.
 fn build_skip_set(root: &Path) -> Arc<HashSet<PathBuf>> {
-    Arc::new(platform_skip_paths(root))
+    let mut skip = platform_skip_paths(root);
+    skip.retain(|p| p.starts_with(root));
+    Arc::new(skip)
 }
 
 #[cfg(target_os = "macos")]
@@ -178,9 +224,51 @@ fn platform_skip_paths(_root: &Path) -> HashSet<PathBuf> {
 
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     let skip = build_skip_set(root);
+    scan_pool().install(|| scan_directory_inner(root, progress, skip))
+}
+
+fn scan_directory_inner(
+    root: &Path,
+    progress: Arc<ScanProgress>,
+    skip: Arc<HashSet<PathBuf>>,
+) -> FileNode {
     // Root node gets the full absolute path as its name so that
     // path reconstruction (root.name / child.name / ...) produces
     // correct absolute paths.
+    #[cfg(target_os = "macos")]
+    let mut root_node = {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        // Compute root dir's name and hidden status (child dirs get these
+        // from the parent's bulk call, but the root has no parent).
+        let root_name: Box<str> = root
+            .file_name()
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| root.to_string_lossy().into_owned().into_boxed_str());
+        let root_hidden = std::fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&root_name, &m))
+            .unwrap_or_else(|_| root_name.starts_with('.'));
+
+        // Open root directory fd — children will use openat() for
+        // fd-relative opens instead of resolving full paths from /.
+        let root_fd = CString::new(root.as_os_str().as_bytes())
+            .ok()
+            .map(|c| unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) })
+            .unwrap_or(-1);
+        if root_fd < 0 {
+            FileNode::Dir(Box::new(DirNode {
+                name: root_name,
+                size: 0,
+                children: Vec::new(),
+                expanded: false,
+                hidden: root_hidden,
+            }))
+        } else {
+            macos::walk_dir_bulk(root_fd, root, root_name, root_hidden, &progress, &skip)
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
@@ -190,6 +278,8 @@ pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
     }
     root_node
 }
+
+
 
 /// Convert an OsString to Box<str>, reusing the OsString allocation when
 /// the name is valid UTF-8 (the common case on macOS/Linux). `into_string()`
@@ -201,25 +291,21 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
     }
 }
 
-/// macOS UF_HIDDEN flag constant.
 #[cfg(target_os = "macos")]
-const UF_HIDDEN: u32 = 0x8000;
-
-/// Check the hidden bit from metadata already fetched by the caller.
-/// On macOS this checks both the dotfile convention and the UF_HIDDEN flag
-/// via `st_flags()`, avoiding a second `lstat` per entry.
-#[cfg(target_os = "macos")]
-fn is_hidden_from_metadata(name: &str, metadata: &std::fs::Metadata) -> bool {
-    use std::os::darwin::fs::MetadataExt;
-    name.starts_with('.') || metadata.st_flags() & UF_HIDDEN != 0
-}
+use macos::is_hidden_from_metadata;
 
 #[cfg(not(target_os = "macos"))]
 fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
-/// Parallel recursive directory walk, following dust's par_bridge() pattern.
+// ---------------------------------------------------------------------------
+// Non-macOS directory walker
+// ---------------------------------------------------------------------------
+
+/// Parallel recursive directory walk using `read_dir` + per-entry `lstat`.
+/// Used on non-macOS platforms; macOS uses `walk_dir_bulk` instead.
+#[cfg(not(target_os = "macos"))]
 fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf>>) -> FileNode {
     let dir_name: Box<str> = dir
         .file_name()
@@ -257,40 +343,60 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
         }
     };
 
-    let mut children: Vec<FileNode> = entries
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| {
-            if progress.cancelled.load(Ordering::Relaxed) {
-                return None;
-            }
-            let entry = entry.ok()?;
-            let ft = entry.file_type().ok()?;
+    // Collect entries eagerly so rayon gets full workload visibility.
+    let dir_entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
 
-            if ft.is_dir() {
-                let path = entry.path();
-                if skip.contains(&path) {
-                    return None;
-                }
-                Some(walk_dir(&path, progress, skip))
-            } else if ft.is_file() {
-                let metadata = entry.metadata().ok()?;
-                #[cfg(unix)]
-                let len = metadata.blocks() * 512;
-                #[cfg(not(unix))]
-                let len = metadata.len();
-                progress.file_count.fetch_add(1, Ordering::Relaxed);
-                progress.total_size.fetch_add(len, Ordering::Relaxed);
-                let name = os_name_to_boxed(entry.file_name());
-                let hidden = is_hidden_from_metadata(&name, &metadata);
-                Some(FileNode::File(FileLeaf::new(name, len, hidden)))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut children: Vec<FileNode> = Vec::with_capacity(dir_entries.len());
+    let mut subdirs: Vec<PathBuf> = Vec::new();
 
-    children.shrink_to_fit();
+    for entry in dir_entries {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            let path = entry.path();
+            if !skip.contains(&path) {
+                subdirs.push(path);
+            }
+        } else if ft.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            #[cfg(unix)]
+            let len = {
+                use std::os::unix::fs::MetadataExt;
+                metadata.blocks() * 512
+            };
+            #[cfg(not(unix))]
+            let len = metadata.len();
+            progress.file_count.fetch_add(1, Ordering::Relaxed);
+            progress.total_size.fetch_add(len, Ordering::Relaxed);
+            let name = os_name_to_boxed(entry.file_name());
+            let hidden = is_hidden_from_metadata(&name, &metadata);
+            children.push(FileNode::File(FileLeaf::new(name, len, hidden)));
+        }
+    }
+
+    // Small-dir sequential fallback — skip rayon for few subdirs.
+    const PAR_THRESHOLD: usize = 4;
+    if subdirs.len() <= PAR_THRESHOLD {
+        for path in subdirs {
+            children.push(walk_dir(&path, progress, skip));
+        }
+    } else {
+        let dir_children: Vec<FileNode> = subdirs
+            .into_par_iter()
+            .map(|path| walk_dir(&path, progress, skip))
+            .collect();
+        children.extend(dir_children);
+    }
+
     let size = children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {

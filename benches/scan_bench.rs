@@ -13,7 +13,7 @@ use disk_cleaner::tree::FileNode;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Tracking allocator (for memory benchmarks)
@@ -64,6 +64,103 @@ fn count_nodes(node: &FileNode) -> usize {
     1 + node.children().iter().map(count_nodes).sum::<usize>()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CriterionCli {
+    filter: Option<String>,
+    exact: bool,
+    suppress_side_reports: bool,
+}
+
+fn criterion_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-c" | "--color"
+            | "-s"
+            | "--save-baseline"
+            | "-b"
+            | "--baseline"
+            | "--baseline-lenient"
+            | "--format"
+            | "--profile-time"
+            | "--load-baseline"
+            | "--sample-size"
+            | "--warm-up-time"
+            | "--measurement-time"
+            | "--nresamples"
+            | "--noise-threshold"
+            | "--confidence-level"
+            | "--significance-level"
+            | "--plotting-backend"
+            | "--output-format"
+    )
+}
+
+fn parse_criterion_cli<I, S>(args: I) -> CriterionCli
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut cli = CriterionCli::default();
+    let mut skip_next = false;
+
+    for arg in args.into_iter().skip(1) {
+        let arg = arg.as_ref();
+
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        match arg {
+            "--exact" => {
+                cli.exact = true;
+                continue;
+            }
+            "--list" | "--ignored" | "-h" | "--help" => {
+                cli.suppress_side_reports = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some((flag, _)) = arg.split_once('=') {
+            if criterion_option_takes_value(flag) {
+                continue;
+            }
+        }
+
+        if arg.starts_with('-') {
+            if criterion_option_takes_value(arg) {
+                skip_next = true;
+            }
+            continue;
+        }
+
+        if cli.filter.is_none() {
+            cli.filter = Some(arg.to_owned());
+        }
+    }
+
+    cli
+}
+
+fn criterion_cli() -> &'static CriterionCli {
+    static CLI: OnceLock<CriterionCli> = OnceLock::new();
+    CLI.get_or_init(|| parse_criterion_cli(std::env::args()))
+}
+
+fn cli_matches_bench_id(cli: &CriterionCli, bench_id: &str) -> bool {
+    match cli.filter.as_deref() {
+        None => true,
+        Some(filter) if cli.exact => bench_id == filter,
+        Some(filter) => bench_id.contains(filter),
+    }
+}
+
+fn should_emit_side_reports() -> bool {
+    !criterion_cli().suppress_side_reports
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic scan benchmarks
 // ---------------------------------------------------------------------------
@@ -109,12 +206,11 @@ fn bench_scan_20k_files(c: &mut Criterion) {
     });
 }
 
-/// Check if a benchmark ID matches the CLI filter.
-/// Criterion passes args as [binary, filter, "--bench"]; returns true if no
-/// filter is set or if the full ID contains the filter as a substring.
+/// Check if a benchmark ID matches the active Criterion filter.
+/// Criterion treats the first non-option argument as the filter, with
+/// `--exact` switching from substring to exact matching.
 fn bench_filter_matches(bench_id: &str) -> bool {
-    let filter = std::env::args().nth(1).unwrap_or_default();
-    filter.is_empty() || bench_id.contains(&filter)
+    cli_matches_bench_id(criterion_cli(), bench_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,35 +256,47 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
 
     group.finish();
 
-    // One-time memory report for each real directory (only when selected)
-    eprintln!("\n=== Real Scan Memory Report ===");
-    for (label, id, path) in [
-        ("~/git", "scan_real/home_git", dirs::home_dir().map(|h| h.join("git")).filter(|p| p.is_dir())),
-        ("~", "scan_real/home", dirs::home_dir().filter(|p| p.is_dir())),
-    ] {
-        if !bench_filter_matches(id) {
-            continue;
+    // One-time memory report for each real directory (only when selected).
+    if should_emit_side_reports() {
+        eprintln!("\n=== Real Scan Memory Report ===");
+        for (label, id, path) in [
+            (
+                "~/git",
+                "scan_real/home_git",
+                dirs::home_dir()
+                    .map(|h| h.join("git"))
+                    .filter(|p| p.is_dir()),
+            ),
+            (
+                "~",
+                "scan_real/home",
+                dirs::home_dir().filter(|p| p.is_dir()),
+            ),
+        ] {
+            if !bench_filter_matches(id) {
+                continue;
+            }
+            if let Some(ref p) = path {
+                reset_tracking();
+                let before = ALLOCATED.load(Ordering::SeqCst);
+                let progress = new_progress();
+                let tree = scanner::scan_directory(p, progress.clone());
+                let after = ALLOCATED.load(Ordering::SeqCst);
+                let peak = PEAK.load(Ordering::SeqCst);
+                let delta = after.saturating_sub(before);
+                let nodes = count_nodes(&tree);
+                let files = progress.file_count.load(Ordering::Relaxed);
+                eprintln!(
+                    "  {label:8} | {files:>9} files | {nodes:>9} nodes | {:>6.1} MB delta | {:>6.1} MB peak | {:.0} b/node",
+                    delta as f64 / 1e6,
+                    peak as f64 / 1e6,
+                    delta as f64 / nodes as f64,
+                );
+                std::hint::black_box(tree);
+            }
         }
-        if let Some(ref p) = path {
-            reset_tracking();
-            let before = ALLOCATED.load(Ordering::SeqCst);
-            let progress = new_progress();
-            let tree = scanner::scan_directory(p, progress.clone());
-            let after = ALLOCATED.load(Ordering::SeqCst);
-            let peak = PEAK.load(Ordering::SeqCst);
-            let delta = after.saturating_sub(before);
-            let nodes = count_nodes(&tree);
-            let files = progress.file_count.load(Ordering::Relaxed);
-            eprintln!(
-                "  {label:8} | {files:>9} files | {nodes:>9} nodes | {:>6.1} MB delta | {:>6.1} MB peak | {:.0} b/node",
-                delta as f64 / 1e6,
-                peak as f64 / 1e6,
-                delta as f64 / nodes as f64,
-            );
-            std::hint::black_box(tree);
-        }
+        eprintln!("===============================\n");
     }
-    eprintln!("===============================\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -204,16 +312,12 @@ fn bench_many_empty_dirs(c: &mut Criterion) {
             fs::create_dir(tmp.path().join(format!("dir_{i:05}"))).unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("empty_dirs", count),
-            &count,
-            |b, _| {
-                b.iter(|| {
-                    let progress = new_progress();
-                    scanner::scan_directory(tmp.path(), progress)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("empty_dirs", count), &count, |b, _| {
+            b.iter(|| {
+                let progress = new_progress();
+                scanner::scan_directory(tmp.path(), progress)
+            })
+        });
     }
     group.finish();
 }
@@ -246,7 +350,7 @@ fn bench_memory_synthetic(c: &mut Criterion) {
     });
 
     // Print a one-time memory report (only when this bench is selected)
-    if bench_filter_matches("memory_1000_files_100_dirs") {
+    if should_emit_side_reports() && bench_filter_matches("memory_1000_files_100_dirs") {
         reset_tracking();
         let progress = new_progress();
         let before = ALLOCATED.load(Ordering::SeqCst);
@@ -295,7 +399,7 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
     });
 
     // Print memory report for large tree (only when this bench is selected)
-    if bench_filter_matches("memory_10000_files_500_dirs") {
+    if should_emit_side_reports() && bench_filter_matches("memory_10000_files_500_dirs") {
         reset_tracking();
         let progress = new_progress();
         let before = ALLOCATED.load(Ordering::SeqCst);
@@ -343,3 +447,44 @@ criterion_group!(
     bench_memory_large_synthetic,
 );
 criterion_main!(benches);
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_plain_filter() {
+        let cli = super::parse_criterion_cli(["scan_bench", "scan_real/home_git"]);
+        assert_eq!(cli.filter.as_deref(), Some("scan_real/home_git"));
+        assert!(!cli.exact);
+        assert!(!cli.suppress_side_reports);
+    }
+
+    #[test]
+    fn parses_filter_after_flags_and_values() {
+        let cli = super::parse_criterion_cli([
+            "scan_bench",
+            "--color=always",
+            "--sample-size",
+            "25",
+            "--exact",
+            "scan_real/home_git",
+        ]);
+        assert_eq!(cli.filter.as_deref(), Some("scan_real/home_git"));
+        assert!(cli.exact);
+    }
+
+    #[test]
+    fn suppresses_side_reports_for_list_and_ignored_modes() {
+        let list_cli = super::parse_criterion_cli(["scan_bench", "--list"]);
+        assert!(list_cli.suppress_side_reports);
+
+        let ignored_cli = super::parse_criterion_cli(["scan_bench", "--ignored"]);
+        assert!(ignored_cli.suppress_side_reports);
+    }
+
+    #[test]
+    fn matches_exact_filters_exactly() {
+        let cli = super::parse_criterion_cli(["scan_bench", "--exact", "scan_real/home"]);
+        assert!(super::cli_matches_bench_id(&cli, "scan_real/home"));
+        assert!(!super::cli_matches_bench_id(&cli, "scan_real/home_git"));
+    }
+}

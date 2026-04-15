@@ -2,7 +2,6 @@
 name = "disk-cleaner"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
 default-run = "disk-cleaner"
 
 [dependencies]

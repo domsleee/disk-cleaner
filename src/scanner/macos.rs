@@ -71,7 +71,7 @@ mod bulk_attrs {
         pub forkattr: u32,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn getattrlistbulk(
             dirfd: c_int,
             alist: *const AttrList,

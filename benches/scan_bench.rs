@@ -123,10 +123,10 @@ where
             _ => {}
         }
 
-        if let Some((flag, _)) = arg.split_once('=') {
-            if criterion_option_takes_value(flag) {
-                continue;
-            }
+        if let Some((flag, _)) = arg.split_once('=')
+            && criterion_option_takes_value(flag)
+        {
+            continue;
         }
 
         if arg.starts_with('-') {

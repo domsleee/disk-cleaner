@@ -10,9 +10,9 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -507,48 +507,52 @@ impl eframe::App for App {
         }
 
         // Check if scan completed
-        if let Some(ref rx) = self.receiver {
-            if let Ok(result) = rx.try_recv() {
-                self.category_stats = Some(result.stats);
-                self.tree = Some(result.tree);
-                if let Some(ref mut t) = self.tree {
-                    tree::auto_expand(t, 0, 2);
-                }
-                self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
-                self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
-                self.scanning = false;
-                self.receiver = None;
-                self.category_filter = None;
-                self.mark_dirty();
+        if let Some(ref rx) = self.receiver
+            && let Ok(result) = rx.try_recv()
+        {
+            self.category_stats = Some(result.stats);
+            self.tree = Some(result.tree);
+            if let Some(ref mut t) = self.tree {
+                tree::auto_expand(t, 0, 2);
+            }
+            self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
+            self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
+            self.scanning = false;
+            self.receiver = None;
+            self.category_filter = None;
+            self.mark_dirty();
 
-                // Report frame-time stats for the scan
-                if let Some(scan_start) = self.scan_start_time.take() {
-                    if debug_enabled() {
-                        let scan_dur = scan_start.elapsed();
-                        let ft = &mut self.scan_frame_times;
-                        ft.sort();
-                        let n = ft.len();
-                        if n > 0 {
-                            let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
-                            let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
-                            let over = ft
-                                .iter()
-                                .filter(|d| **d > Duration::from_millis(16))
-                                .count();
-                            eprintln!(
-                                "[perf] scan done in {scan_dur:?} ({} files)",
-                                self.last_scan_file_count
-                            );
-                            eprintln!("[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
-                                ft[0], ft[n / 2], ft[n - 1]);
-                            eprintln!(
-                                "[perf] frames >16ms: {over}/{n} ({:.1}%)",
-                                over as f64 / n as f64 * 100.0
-                            );
-                        }
+            // Report frame-time stats for the scan
+            if let Some(scan_start) = self.scan_start_time.take() {
+                if debug_enabled() {
+                    let scan_dur = scan_start.elapsed();
+                    let ft = &mut self.scan_frame_times;
+                    ft.sort();
+                    let n = ft.len();
+                    if n > 0 {
+                        let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
+                        let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
+                        let over = ft
+                            .iter()
+                            .filter(|d| **d > Duration::from_millis(16))
+                            .count();
+                        eprintln!(
+                            "[perf] scan done in {scan_dur:?} ({} files)",
+                            self.last_scan_file_count
+                        );
+                        eprintln!(
+                            "[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
+                            ft[0],
+                            ft[n / 2],
+                            ft[n - 1]
+                        );
+                        eprintln!(
+                            "[perf] frames >16ms: {over}/{n} ({:.1}%)",
+                            over as f64 / n as f64 * 100.0
+                        );
                     }
-                    self.scan_frame_times.clear();
                 }
+                self.scan_frame_times.clear();
             }
         }
 
@@ -696,77 +700,68 @@ impl eframe::App for App {
                 }
             }
 
-            if left || right {
-                if let Some(ref focused) = self.focused_path.clone() {
-                    let is_file_group = focused
-                        .file_name()
-                        .is_some_and(|n| n == "__file_group__");
+            if (left || right)
+                && let Some(ref focused) = self.focused_path.clone()
+            {
+                let is_file_group = focused.file_name().is_some_and(|n| n == "__file_group__");
 
-                    if is_file_group {
-                        // File group path is parent_dir/__file_group__; key is parent_dir
-                        if let Some(parent_dir) = focused.parent() {
-                            let key = parent_dir.to_path_buf();
-                            let group_expanded = self.expanded_file_groups.contains(&key);
-                            if left {
-                                if group_expanded {
-                                    self.expanded_file_groups.remove(&key);
-                                    self.mark_dirty();
-                                } else {
-                                    // Already collapsed — navigate to parent directory
-                                    self.focused_path = Some(parent_dir.to_path_buf());
+                if is_file_group {
+                    // File group path is parent_dir/__file_group__; key is parent_dir
+                    if let Some(parent_dir) = focused.parent() {
+                        let key = parent_dir.to_path_buf();
+                        let group_expanded = self.expanded_file_groups.contains(&key);
+                        if left {
+                            if group_expanded {
+                                self.expanded_file_groups.remove(&key);
+                                self.mark_dirty();
+                            } else {
+                                // Already collapsed — navigate to parent directory
+                                self.focused_path = Some(parent_dir.to_path_buf());
+                                self.selected_paths.clear();
+                                self.tree_scroll_to_focus = true;
+                            }
+                        } else if right {
+                            if !group_expanded {
+                                self.expanded_file_groups.insert(key);
+                                self.mark_dirty();
+                            } else {
+                                // Already expanded — move focus to first child row
+                                let rows = &self.cached_rows;
+                                if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                    && idx + 1 < rows.len()
+                                {
+                                    self.focused_path = Some(rows[idx + 1].path.clone());
                                     self.selected_paths.clear();
                                     self.tree_scroll_to_focus = true;
-                                }
-                            } else if right {
-                                if !group_expanded {
-                                    self.expanded_file_groups.insert(key);
-                                    self.mark_dirty();
-                                } else {
-                                    // Already expanded — move focus to first child row
-                                    let rows = &self.cached_rows;
-                                    if let Some(idx) =
-                                        rows.iter().position(|r| &r.path == focused)
-                                    {
-                                        if idx + 1 < rows.len() {
-                                            self.focused_path =
-                                                Some(rows[idx + 1].path.clone());
-                                            self.selected_paths.clear();
-                                            self.tree_scroll_to_focus = true;
-                                        }
-                                    }
                                 }
                             }
                         }
-                    } else if let Some(ref mut tree) = self.tree {
-                        if let Some((is_dir, expanded, has_children)) =
-                            ui::find_node_info(tree, focused)
-                        {
-                            if left {
-                                if is_dir && expanded {
-                                    ui::set_expanded(tree, focused, false);
-                                    self.mark_dirty();
-                                } else if let Some(parent) = ui::find_parent_path(tree, focused) {
-                                    self.focused_path = Some(parent);
-                                    self.selected_paths.clear();
-                                    self.tree_scroll_to_focus = true;
-                                }
-                            } else if right {
-                                if is_dir && !expanded && has_children {
-                                    ui::set_expanded(tree, focused, true);
-                                    self.mark_dirty();
-                                } else if is_dir && expanded {
-                                    let rows = &self.cached_rows;
-                                    if let Some(idx) =
-                                        rows.iter().position(|r| &r.path == focused)
-                                    {
-                                        if idx + 1 < rows.len() {
-                                            self.focused_path =
-                                                Some(rows[idx + 1].path.clone());
-                                            self.selected_paths.clear();
-                                            self.tree_scroll_to_focus = true;
-                                        }
-                                    }
-                                }
+                    }
+                } else if let Some(ref mut tree) = self.tree
+                    && let Some((is_dir, expanded, has_children)) =
+                        ui::find_node_info(tree, focused)
+                {
+                    if left {
+                        if is_dir && expanded {
+                            ui::set_expanded(tree, focused, false);
+                            self.mark_dirty();
+                        } else if let Some(parent) = ui::find_parent_path(tree, focused) {
+                            self.focused_path = Some(parent);
+                            self.selected_paths.clear();
+                            self.tree_scroll_to_focus = true;
+                        }
+                    } else if right {
+                        if is_dir && !expanded && has_children {
+                            ui::set_expanded(tree, focused, true);
+                            self.mark_dirty();
+                        } else if is_dir && expanded {
+                            let rows = &self.cached_rows;
+                            if let Some(idx) = rows.iter().position(|r| &r.path == focused)
+                                && idx + 1 < rows.len()
+                            {
+                                self.focused_path = Some(rows[idx + 1].path.clone());
+                                self.selected_paths.clear();
+                                self.tree_scroll_to_focus = true;
                             }
                         }
                     }
@@ -880,131 +875,132 @@ impl eframe::App for App {
                 .show_separator_line(false)
                 .default_size(28.0) // 24px interact_size + 4px inner_margin
                 .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // Standardize widget height so buttons and selectable labels align
-                    ui.spacing_mut().interact_size.y = 24.0;
+                    ui.horizontal(|ui| {
+                        // Standardize widget height so buttons and selectable labels align
+                        ui.spacing_mut().interact_size.y = 24.0;
 
-                    if ui.button("Open Directory...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        if ui.button("Open Directory...").clicked()
+                            && let Some(path) = rfd::FileDialog::new().pick_folder()
+                        {
                             self.start_scan(path);
                         }
-                    }
 
-                    if self.tree.is_some() && ui.button("Re-scan").clicked() {
-                        if let Some(path) = self.scan_path.clone() {
+                        if self.tree.is_some()
+                            && ui.button("Re-scan").clicked()
+                            && let Some(path) = self.scan_path.clone()
+                        {
                             self.start_scan(path);
                         }
-                    }
 
-                    // View mode toggle
-                    if self.tree.is_some() {
-                        ui.separator();
-                        for (label, mode) in
-                            [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
-                        {
-                            let is_active = self.view_mode == mode;
-                            let text = if is_active {
-                                egui::RichText::new(label).strong().size(14.0)
-                            } else {
-                                egui::RichText::new(label)
-                                    .size(14.0)
-                                    .color(ui.visuals().weak_text_color())
-                            };
+                        // View mode toggle
+                        if self.tree.is_some() {
+                            ui.separator();
+                            for (label, mode) in
+                                [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
+                            {
+                                let is_active = self.view_mode == mode;
+                                let text = if is_active {
+                                    egui::RichText::new(label).strong().size(14.0)
+                                } else {
+                                    egui::RichText::new(label)
+                                        .size(14.0)
+                                        .color(ui.visuals().weak_text_color())
+                                };
 
-                            let btn = egui::Button::new(text)
-                                .frame(false)
-                                .min_size(egui::vec2(0.0, 24.0));
-                            let response = ui.add(btn);
+                                let btn = egui::Button::new(text)
+                                    .frame(false)
+                                    .min_size(egui::vec2(0.0, 24.0));
+                                let response = ui.add(btn);
 
-                            // Draw underline for active tab
-                            if is_active {
-                                let rect = response.rect;
-                                let painter = ui.painter();
-                                let accent = egui::Color32::from_rgb(100, 180, 255);
-                                painter.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                        egui::vec2(rect.width(), 2.0),
-                                    ),
-                                    0.0,
-                                    accent,
-                                );
-                            }
+                                // Draw underline for active tab
+                                if is_active {
+                                    let rect = response.rect;
+                                    let painter = ui.painter();
+                                    let accent = egui::Color32::from_rgb(100, 180, 255);
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                            egui::vec2(rect.width(), 2.0),
+                                        ),
+                                        0.0,
+                                        accent,
+                                    );
+                                }
 
-                            if response.clicked() {
-                                self.view_mode = mode;
-                            }
-                        }
-                    }
-
-                    // Search/filter bar — hidden: filter feature crashes (DIS-253)
-                    // if self.tree.is_some() {
-                    //     ui.separator();
-                    //     ui.label("Filter:");
-                    //     let response = ui.add(
-                    //         egui::TextEdit::singleline(&mut self.search_query)
-                    //             .hint_text("file name...")
-                    //             .desired_width(200.0),
-                    //     );
-                    //     if response.changed() {
-                    //         self.search_query = self.search_query.to_lowercase();
-                    //         self.search_changed_at = Some(Instant::now());
-                    //     }
-                    //     if !self.search_query.is_empty() && ui.small_button("×").clicked() {
-                    //         self.search_query.clear();
-                    //         self.applied_search.clear();
-                    //         self.search_changed_at = None;
-                    //         self.rows_dirty = true;
-                    //     }
-                    // }
-
-                    // Hidden files toggle
-                    if self.tree.is_some() {
-                        ui.separator();
-                        if ui
-                            .selectable_label(self.show_hidden, "Show hidden")
-                            .clicked()
-                        {
-                            self.show_hidden = !self.show_hidden;
-                            self.mark_dirty();
-                            // Persist preference
-                            if let Some(ref path) = self.last_scan_path {
-                                save_config(path, self.show_hidden);
-                            }
-                            // Recompute stats
-                            if let Some(ref tree) = self.tree {
-                                self.category_stats = Some(categories::compute_stats(tree));
+                                if response.clicked() {
+                                    self.view_mode = mode;
+                                }
                             }
                         }
-                    }
 
-                    // File types panel toggle
-                    if self.tree.is_some() {
-                        ui.separator();
-                        if ui
-                            .selectable_label(self.show_categories, "File Types")
-                            .clicked()
-                        {
-                            self.show_categories = !self.show_categories;
-                            if !self.show_categories {
-                                self.category_filter = None;
+                        // Search/filter bar — hidden: filter feature crashes (DIS-253)
+                        // if self.tree.is_some() {
+                        //     ui.separator();
+                        //     ui.label("Filter:");
+                        //     let response = ui.add(
+                        //         egui::TextEdit::singleline(&mut self.search_query)
+                        //             .hint_text("file name...")
+                        //             .desired_width(200.0),
+                        //     );
+                        //     if response.changed() {
+                        //         self.search_query = self.search_query.to_lowercase();
+                        //         self.search_changed_at = Some(Instant::now());
+                        //     }
+                        //     if !self.search_query.is_empty() && ui.small_button("×").clicked() {
+                        //         self.search_query.clear();
+                        //         self.applied_search.clear();
+                        //         self.search_changed_at = None;
+                        //         self.rows_dirty = true;
+                        //     }
+                        // }
+
+                        // Hidden files toggle
+                        if self.tree.is_some() {
+                            ui.separator();
+                            if ui
+                                .selectable_label(self.show_hidden, "Show hidden")
+                                .clicked()
+                            {
+                                self.show_hidden = !self.show_hidden;
                                 self.mark_dirty();
+                                // Persist preference
+                                if let Some(ref path) = self.last_scan_path {
+                                    save_config(path, self.show_hidden);
+                                }
+                                // Recompute stats
+                                if let Some(ref tree) = self.tree {
+                                    self.category_stats = Some(categories::compute_stats(tree));
+                                }
                             }
                         }
-                    }
 
-                    if self.scanning {
-                        // Throttle repaints during scanning — progress counter doesn't
-                        // need 1000fps. 100ms (~10fps) keeps the UI responsive without
-                        // starving scan threads or causing frame-pacing jank.
-                        ctx.request_repaint_after(Duration::from_millis(100));
-                    }
+                        // File types panel toggle
+                        if self.tree.is_some() {
+                            ui.separator();
+                            if ui
+                                .selectable_label(self.show_categories, "File Types")
+                                .clicked()
+                            {
+                                self.show_categories = !self.show_categories;
+                                if !self.show_categories {
+                                    self.category_filter = None;
+                                    self.mark_dirty();
+                                }
+                            }
+                        }
 
-                    if let Some(ref err) = self.error {
-                        ui.colored_label(egui::Color32::RED, err);
-                    }
+                        if self.scanning {
+                            // Throttle repaints during scanning — progress counter doesn't
+                            // need 1000fps. 100ms (~10fps) keeps the UI responsive without
+                            // starving scan threads or causing frame-pacing jank.
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                        }
+
+                        if let Some(ref err) = self.error {
+                            ui.colored_label(egui::Color32::RED, err);
+                        }
+                    });
                 });
-            });
         } // show_toolbar
 
         // Category side panel (toggled via toolbar button)
@@ -1136,18 +1132,19 @@ impl eframe::App for App {
                         );
                         let _ = path; // used for context above
                     }
-                } else if let Some(ref path) = self.scan_path {
-                    if !self.scanning && self.last_scan_file_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Scanned: {} \u{2014} {} files \u{2014} {}",
-                                path.display(),
-                                self.last_scan_file_count,
-                                bytesize::ByteSize::b(self.last_scan_total_size)
-                            ))
-                            .small(),
-                        );
-                    }
+                } else if let Some(ref path) = self.scan_path
+                    && !self.scanning
+                    && self.last_scan_file_count > 0
+                {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Scanned: {} \u{2014} {} files \u{2014} {}",
+                            path.display(),
+                            self.last_scan_file_count,
+                            bytesize::ByteSize::b(self.last_scan_total_size)
+                        ))
+                        .small(),
+                    );
                 }
 
                 // Right: keyboard hints + disk stats + version
@@ -1213,15 +1210,15 @@ impl eframe::App for App {
                     ui.label(format!("{files} files — {size_str}"));
 
                     // Progress bar: estimated scan progress based on used disk space
-                    if self.scan_is_volume {
-                        if let Some((total, available)) = self.scan_disk_info {
-                            let used = total.saturating_sub(available);
-                            if used > 0 {
-                                ui.add_space(12.0);
-                                let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                                let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
-                                ui.add(bar);
-                            }
+                    if self.scan_is_volume
+                        && let Some((total, available)) = self.scan_disk_info
+                    {
+                        let used = total.saturating_sub(available);
+                        if used > 0 {
+                            ui.add_space(12.0);
+                            let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
+                            let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
+                            ui.add(bar);
                         }
                     }
 
@@ -1370,10 +1367,10 @@ impl eframe::App for App {
                     }
 
                     // Open Directory — primary action on home page
-                    if ui.button("Open Directory...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.start_scan(path);
-                        }
+                    if ui.button("Open Directory...").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.start_scan(path);
                     }
 
                     if let Some(ref err) = self.error {

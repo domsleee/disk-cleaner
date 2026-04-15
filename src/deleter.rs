@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 /// Result of background deletion: list of (path, optional error message).
@@ -111,16 +111,16 @@ impl BackgroundDeleter {
         if !self.active {
             return PollResult::Pending;
         }
-        if let Some(ref rx) = self.receiver {
-            if let Ok(results) = rx.try_recv() {
-                self.active = false;
-                self.receiver = None;
-                // Kick off the next queued job, if any.
-                if let Some((paths, use_trash)) = self.pending.pop_front() {
-                    self.start_now(paths, use_trash);
-                }
-                return PollResult::Done(results);
+        if let Some(ref rx) = self.receiver
+            && let Ok(results) = rx.try_recv()
+        {
+            self.active = false;
+            self.receiver = None;
+            // Kick off the next queued job, if any.
+            if let Some((paths, use_trash)) = self.pending.pop_front() {
+                self.start_now(paths, use_trash);
             }
+            return PollResult::Done(results);
         }
         PollResult::Pending
     }

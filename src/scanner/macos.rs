@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use rayon::iter::IntoParallelIterator;
 use rayon::prelude::ParallelIterator;
@@ -37,7 +37,9 @@ struct DropFd(std::os::unix::io::RawFd);
 
 impl Drop for DropFd {
     fn drop(&mut self) {
-        unsafe { libc::close(self.0); }
+        unsafe {
+            libc::close(self.0);
+        }
     }
 }
 
@@ -71,7 +73,7 @@ mod bulk_attrs {
         pub forkattr: u32,
     }
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn getattrlistbulk(
             dirfd: c_int,
             alist: *const AttrList,
@@ -125,10 +127,7 @@ pub fn walk_dir_bulk(
     static ATTRLIST: AttrList = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: ATTR_CMN_RETURNED_ATTRS
-            | ATTR_CMN_NAME
-            | ATTR_CMN_OBJTYPE
-            | ATTR_CMN_FLAGS,
+        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_FLAGS,
         volattr: 0,
         dirattr: 0,
         fileattr: ATTR_FILE_ALLOCSIZE,
@@ -197,11 +196,15 @@ pub fn walk_dir_bulk(
                 let mut off = 0usize;
                 let (mut nfiles, mut ndirs) = (0usize, 0usize);
                 for _ in 0..count as usize {
-                    if off + 40 > BUF_SIZE { break; }
+                    if off + 40 > BUF_SIZE {
+                        break;
+                    }
                     unsafe {
                         let base = buf.as_ptr().add(off);
                         let entry_len = *(base as *const u32) as usize;
-                        if entry_len == 0 || off + entry_len > BUF_SIZE { break; }
+                        if entry_len == 0 || off + entry_len > BUF_SIZE {
+                            break;
+                        }
                         let objtype = *(base.add(32) as *const u32);
                         match objtype {
                             VREG => nfiles += 1,
@@ -266,11 +269,9 @@ pub fn walk_dir_bulk(
                         std::slice::from_raw_parts(name_ptr, name_bytelen.saturating_sub(1));
                     let name: Box<str> = match std::str::from_utf8(name_slice) {
                         Ok(s) => Box::from(s),
-                        Err(_) => {
-                            String::from_utf8_lossy(name_slice)
-                                .into_owned()
-                                .into_boxed_str()
-                        }
+                        Err(_) => String::from_utf8_lossy(name_slice)
+                            .into_owned()
+                            .into_boxed_str(),
                     };
 
                     let objtype = *(base.add(32) as *const u32);
@@ -304,8 +305,12 @@ pub fn walk_dir_bulk(
     // Flush batched progress counters (one atomic pair per directory
     // instead of per file).
     if batch_file_count > 0 {
-        progress.file_count.fetch_add(batch_file_count, Ordering::Relaxed);
-        progress.total_size.fetch_add(batch_total_size, Ordering::Relaxed);
+        progress
+            .file_count
+            .fetch_add(batch_file_count, Ordering::Relaxed);
+        progress
+            .total_size
+            .fetch_add(batch_total_size, Ordering::Relaxed);
     }
 
     // Recurse into subdirectories.  Each child opens itself with

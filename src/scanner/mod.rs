@@ -16,9 +16,9 @@ use rayon::iter::IntoParallelIterator;
 #[cfg(not(target_os = "macos"))]
 use rayon::prelude::ParallelIterator;
 
-use crate::tree::{DirNode, FileNode};
 #[cfg(not(target_os = "macos"))]
 use crate::tree::FileLeaf;
+use crate::tree::{DirNode, FileNode};
 
 /// Information about a mounted volume.
 pub struct VolumeInfo {
@@ -80,17 +80,17 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             let path = entry.path();
 
             // Skip the root volume alias (symlink to /)
-            if let Ok(target) = std::fs::read_link(&path) {
-                if target == Path::new("/") {
-                    continue;
-                }
+            if let Ok(target) = std::fs::read_link(&path)
+                && target == Path::new("/")
+            {
+                continue;
             }
 
             // Skip if it resolves to root
-            if let Ok(canonical) = std::fs::canonicalize(&path) {
-                if canonical == Path::new("/") {
-                    continue;
-                }
+            if let Ok(canonical) = std::fs::canonicalize(&path)
+                && canonical == Path::new("/")
+            {
+                continue;
             }
 
             if path.is_dir() {
@@ -279,8 +279,6 @@ fn scan_directory_inner(
     root_node
 }
 
-
-
 /// Convert an OsString to Box<str>, reusing the OsString allocation when
 /// the name is valid UTF-8 (the common case on macOS/Linux). `into_string()`
 /// transfers ownership of the inner buffer instead of copying the bytes.
@@ -449,10 +447,7 @@ mod tests {
         // Both small files fit in one block each, so they report the same on-disk size.
         #[cfg(unix)]
         {
-            let expected_per_file = fs::metadata(tmp.path().join("a.txt"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let expected_per_file = fs::metadata(tmp.path().join("a.txt")).unwrap().blocks() * 512;
             assert_eq!(root.size(), expected_per_file * 2);
         }
         #[cfg(not(unix))]
@@ -478,10 +473,7 @@ mod tests {
         // Both small files use one block each on unix, so same on-disk size
         #[cfg(unix)]
         {
-            let block_size = fs::metadata(sub.join("file.bin"))
-                .unwrap()
-                .blocks()
-                * 512;
+            let block_size = fs::metadata(sub.join("file.bin")).unwrap().blocks() * 512;
             assert_eq!(root.size(), block_size * 2);
         }
         #[cfg(not(unix))]
@@ -525,7 +517,9 @@ mod tests {
         let file = fs::File::create(&sparse_path).unwrap();
         use std::io::{Seek, Write};
         let mut writer = std::io::BufWriter::new(file);
-        writer.seek(std::io::SeekFrom::Start(1_000_000_000)).unwrap();
+        writer
+            .seek(std::io::SeekFrom::Start(1_000_000_000))
+            .unwrap();
         writer.write_all(b"\0").unwrap();
         writer.flush().unwrap();
         drop(writer);
@@ -584,7 +578,10 @@ mod tests {
             .iter()
             .find(|c| c.name() == "visible_name.txt")
             .expect("hidden file should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN file should be marked hidden");
+        assert!(
+            hidden_node.is_hidden(),
+            "UF_HIDDEN file should be marked hidden"
+        );
 
         let normal_node = root
             .children()
@@ -616,8 +613,15 @@ mod tests {
             .iter()
             .find(|c| c.name() == "secret_dir")
             .expect("hidden dir should appear in scan");
-        assert!(hidden_node.is_hidden(), "UF_HIDDEN dir should be marked hidden");
-        assert_eq!(hidden_node.children().len(), 1, "hidden dir contents should still be scanned");
+        assert!(
+            hidden_node.is_hidden(),
+            "UF_HIDDEN dir should be marked hidden"
+        );
+        assert_eq!(
+            hidden_node.children().len(),
+            1,
+            "hidden dir contents should still be scanned"
+        );
 
         let normal_node = root
             .children()

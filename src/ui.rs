@@ -244,9 +244,17 @@ fn emit_file_group(
         for child in files {
             current_path.push(child.name());
             collect_cached_rows_inner(
-                child, depth + 2, file_size, current_path,
-                filter, category_filter, show_hidden,
-                text_cache, cat_cache, expanded_file_groups, result,
+                child,
+                depth + 2,
+                file_size,
+                current_path,
+                filter,
+                category_filter,
+                show_hidden,
+                text_cache,
+                cat_cache,
+                expanded_file_groups,
+                result,
             );
             current_path.pop();
         }
@@ -283,10 +291,10 @@ fn collect_cached_rows_inner(
         if !cc.contains(current_path.as_path()) {
             return;
         }
-    } else if let Some(cat) = category_filter {
-        if !crate::categories::node_matches_category(node, cat) {
-            return;
-        }
+    } else if let Some(cat) = category_filter
+        && !crate::categories::node_matches_category(node, cat)
+    {
+        return;
     }
 
     result.push(CachedRow {
@@ -317,14 +325,13 @@ fn collect_cached_rows_inner(
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
             .collect();
-        let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
-            && filter.is_empty()
-            && category_filter.is_none();
+        let should_group_files =
+            files.len() >= FILE_GROUP_THRESHOLD && filter.is_empty() && category_filter.is_none();
 
         if should_group_files {
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
-            let group_expanded = expanded_file_groups
-                .is_some_and(|s| s.contains(current_path.as_path()));
+            let group_expanded =
+                expanded_file_groups.is_some_and(|s| s.contains(current_path.as_path()));
             let file_count = files.len();
             let mut file_group_emitted = false;
 
@@ -334,28 +341,56 @@ fn collect_cached_rows_inner(
                 // Emit file group before the first dir that is smaller
                 if !file_group_emitted && child.size() < file_size {
                     emit_file_group(
-                        result, current_path, file_count, file_size,
-                        group_expanded, depth, node.size(), &files,
-                        filter, category_filter, show_hidden,
-                        text_cache, cat_cache, expanded_file_groups,
+                        result,
+                        current_path,
+                        file_count,
+                        file_size,
+                        group_expanded,
+                        depth,
+                        node.size(),
+                        &files,
+                        filter,
+                        category_filter,
+                        show_hidden,
+                        text_cache,
+                        cat_cache,
+                        expanded_file_groups,
                     );
                     file_group_emitted = true;
                 }
                 current_path.push(child.name());
                 collect_cached_rows_inner(
-                    child, depth + 1, node.size(), current_path,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups, result,
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
                 );
                 current_path.pop();
             }
             // If all dirs were larger, emit file group at the end
             if !file_group_emitted {
                 emit_file_group(
-                    result, current_path, file_count, file_size,
-                    group_expanded, depth, node.size(), &files,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups,
+                    result,
+                    current_path,
+                    file_count,
+                    file_size,
+                    group_expanded,
+                    depth,
+                    node.size(),
+                    &files,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
                 );
             }
         } else {
@@ -366,9 +401,17 @@ fn collect_cached_rows_inner(
                 }
                 current_path.push(child.name());
                 collect_cached_rows_inner(
-                    child, depth + 1, node.size(), current_path,
-                    filter, category_filter, show_hidden,
-                    text_cache, cat_cache, expanded_file_groups, result,
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
                 );
                 current_path.pop();
             }
@@ -399,13 +442,11 @@ pub fn render_tree(
     let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
 
     // Scroll to focused row when arrow keys move focus
-    if scroll_to_focus {
-        if let Some(idx) = focused_idx {
-            let target_y = idx as f32 * row_total;
-            let viewport_h = ui.available_height();
-            scroll_area = scroll_area
-                .vertical_scroll_offset((target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0));
-        }
+    if scroll_to_focus && let Some(idx) = focused_idx {
+        let target_y = idx as f32 * row_total;
+        let viewport_h = ui.available_height();
+        scroll_area = scroll_area
+            .vertical_scroll_offset((target_y - viewport_h / 2.0 + row_height / 2.0).max(0.0));
     }
 
     scroll_area.show_rows(ui, row_height, total_rows, |ui, range| {
@@ -471,17 +512,14 @@ pub fn render_tree(
                 let size_text = format!("{:>10}", size_str);
                 let font_id =
                     egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
-                let text_galley = ui.painter().layout_no_wrap(
-                    size_text,
-                    font_id,
-                    ui.visuals().text_color(),
-                );
+                let text_galley =
+                    ui.painter()
+                        .layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
                 let right_reserved = text_margin + text_width + bar_gap + bar_width;
 
                 // Name — truncate so it never overlaps the size bar area.
-                let name_max_w =
-                    (ui.available_width() - right_reserved - 4.0).max(20.0);
+                let name_max_w = (ui.available_width() - right_reserved - 4.0).max(20.0);
                 let name_text = if row.is_hidden || row.is_file_group {
                     egui::RichText::new(&*row.name).monospace().weak()
                 } else {
@@ -518,8 +556,7 @@ pub fn render_tree(
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
                 let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
-                let fill_rect =
-                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
+                let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
                 toggle_right
@@ -536,35 +573,34 @@ pub fn render_tree(
             let row_interact = ui.interact(row_rect, row_id, egui::Sense::click());
 
             // Use PointingHand only when hovering over the disclosure triangle area
-            if row_interact.hovered() {
-                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                    if (row.is_dir || row.is_file_group) && pos.x <= toggle_right {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                }
+            if row_interact.hovered()
+                && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+                && (row.is_dir || row.is_file_group)
+                && pos.x <= toggle_right
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
-            if row_interact.clicked() {
-                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                    if row.is_file_group {
-                        // Any click on file group row → toggle expand
-                        actions.push(TreeAction::ToggleFileGroup(row.path.clone()));
-                        actions.push(TreeAction::Focus(row.path.clone()));
-                    } else if row.is_dir && pos.x <= toggle_right {
-                        // Click on disclosure triangle area → toggle expand + focus
-                        actions.push(TreeAction::ToggleExpand(row.path.clone()));
-                        actions.push(TreeAction::Focus(row.path.clone()));
-                    } else {
-                        // Click on content area → select/focus
-                        let (shift, toggle) =
-                            ui.input(|i| (i.modifiers.shift, i.modifiers.command));
-                        actions.push(TreeAction::Click {
-                            path: row.path.clone(),
-                            shift,
-                            toggle,
-                        });
-                        actions.push(TreeAction::Focus(row.path.clone()));
-                    }
+            if row_interact.clicked()
+                && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+            {
+                if row.is_file_group {
+                    // Any click on file group row → toggle expand
+                    actions.push(TreeAction::ToggleFileGroup(row.path.clone()));
+                    actions.push(TreeAction::Focus(row.path.clone()));
+                } else if row.is_dir && pos.x <= toggle_right {
+                    // Click on disclosure triangle area → toggle expand + focus
+                    actions.push(TreeAction::ToggleExpand(row.path.clone()));
+                    actions.push(TreeAction::Focus(row.path.clone()));
+                } else {
+                    // Click on content area → select/focus
+                    let (shift, toggle) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+                    actions.push(TreeAction::Click {
+                        path: row.path.clone(),
+                        shift,
+                        toggle,
+                    });
+                    actions.push(TreeAction::Focus(row.path.clone()));
                 }
             }
 
@@ -719,15 +755,15 @@ fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) ->
         node.set_expanded(new_val);
         return true;
     }
-    if let FileNode::Dir(d) = node {
-        if let Some(next) = next_component_name(target, buf) {
-            for child in &mut d.children {
-                if child.name() == next {
-                    buf.push(child.name());
-                    let found = toggle_expand_inner(child, target, buf);
-                    buf.pop();
-                    return found;
-                }
+    if let FileNode::Dir(d) = node
+        && let Some(next) = next_component_name(target, buf)
+    {
+        for child in &mut d.children {
+            if child.name() == next {
+                buf.push(child.name());
+                let found = toggle_expand_inner(child, target, buf);
+                buf.pop();
+                return found;
             }
         }
     }
@@ -851,16 +887,16 @@ fn set_expanded_inner(
         node.set_expanded(expanded);
         return true;
     }
-    if let FileNode::Dir(d) = node {
-        if let Some(next) = next_component_name(target, buf) {
-            let next_str = next;
-            for child in &mut d.children {
-                if child.name() == next_str {
-                    buf.push(child.name());
-                    let found = set_expanded_inner(child, target, expanded, buf);
-                    buf.pop();
-                    return found;
-                }
+    if let FileNode::Dir(d) = node
+        && let Some(next) = next_component_name(target, buf)
+    {
+        let next_str = next;
+        for child in &mut d.children {
+            if child.name() == next_str {
+                buf.push(child.name());
+                let found = set_expanded_inner(child, target, expanded, buf);
+                buf.pop();
+                return found;
             }
         }
     }

@@ -333,7 +333,7 @@ pub fn build_treemap_cache(
     let root_path = PathBuf::from(root.name());
 
     // Resolve the node we're viewing and its full path
-    let (view_node, view_path) = if let Some(ref zp) = zoom_path {
+    let (view_node, view_path) = if let Some(zp) = zoom_path {
         match find_node(root, zp) {
             Some(n) => (n, zp.clone()),
             None => (root, root_path.clone()),
@@ -639,7 +639,7 @@ pub fn render_treemap(
     let size_label = if let Some(l) = view_size_label {
         l
     } else {
-        let view_size = if let Some(ref zp) = zoom_path {
+        let view_size = if let Some(zp) = zoom_path {
             find_node(root, zp).map_or(root.size(), |n| n.size())
         } else {
             root.size()

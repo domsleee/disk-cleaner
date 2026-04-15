@@ -753,20 +753,20 @@ pub fn render_treemap(
             paint_cached_leaf(&painter, tile, is_focused, alpha, &font_leaf);
         }
 
-        if let Some(pos) = hover_pos {
-            if tile.rect.contains(pos) {
-                hovered_tile = Some(idx);
-            }
+        if let Some(pos) = hover_pos
+            && tile.rect.contains(pos)
+        {
+            hovered_tile = Some(idx);
         }
     }
 
     // Paint Other bucket
     if let Some(ref other) = cache.other {
         paint_other_bucket(&painter, other, alpha, &font_leaf);
-        if let Some(pos) = hover_pos {
-            if other.rect.contains(pos) {
-                hovered_other = true;
-            }
+        if let Some(pos) = hover_pos
+            && other.rect.contains(pos)
+        {
+            hovered_other = true;
         }
     }
 
@@ -788,32 +788,30 @@ pub fn render_treemap(
             }
             ui.label(tile.path.display().to_string());
         });
-    } else if hovered_other {
-        if let Some(ref other) = cache.other {
-            egui::Tooltip::always_open(
-                ui.ctx().clone(),
-                ui.layer_id(),
-                ui.id().with("treemap_tip"),
-                egui::PopupAnchor::Pointer,
-            )
-            .gap(12.0)
-            .show(|ui| {
-                ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
-                ui.label(ByteSize::b(other.size).to_string());
-                ui.label("Small files collapsed into one block");
-            });
-        }
+    } else if hovered_other && let Some(ref other) = cache.other {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            ui.id().with("treemap_tip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
+            ui.label(ByteSize::b(other.size).to_string());
+            ui.label("Small files collapsed into one block");
+        });
     }
 
     // Handle click — reuse hovered_tile instead of re-scanning
-    if response.clicked() {
-        if let Some(idx) = hovered_tile {
-            let tile = &cache.tiles[idx];
-            if tile.is_dir {
-                actions.push(TreemapAction::ZoomTo(tile.path.clone()));
-            }
-            actions.push(TreemapAction::Focus(tile.path.clone()));
+    if response.clicked()
+        && let Some(idx) = hovered_tile
+    {
+        let tile = &cache.tiles[idx];
+        if tile.is_dir {
+            actions.push(TreemapAction::ZoomTo(tile.path.clone()));
         }
+        actions.push(TreemapAction::Focus(tile.path.clone()));
     }
 
     actions

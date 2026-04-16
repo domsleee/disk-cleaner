@@ -281,14 +281,7 @@ fn scan_directory_inner(
             .unwrap_or_else(|_| root_name.starts_with('.'));
 
         match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
-            windows::walk_dir_bulk(
-                root_dir,
-                root,
-                root_name.clone(),
-                root_hidden,
-                &progress,
-                &skip,
-            )
+            windows::walk_dir_bulk(root_dir, root_name.clone(), root_hidden, &progress, &skip)
         }) {
             Ok(node) => node,
             Err(_) => walk_dir(root, &progress, &skip),

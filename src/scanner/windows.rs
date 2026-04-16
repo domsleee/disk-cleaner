@@ -190,11 +190,10 @@ impl DirectoryHandle {
 
 pub fn walk_dir_bulk(
     dir_handle: DirectoryHandle,
-    dir: &Path,
     dir_name: Box<str>,
     dir_hidden: bool,
     progress: &Arc<ScanProgress>,
-    skip: &Arc<HashSet<PathBuf>>,
+    _skip: &Arc<HashSet<PathBuf>>,
 ) -> io::Result<FileNode> {
     if progress.cancelled.load(Ordering::Relaxed) {
         return Ok(empty_dir(dir_name, dir_hidden));
@@ -218,6 +217,66 @@ pub fn walk_dir_bulk(
                 break;
             }
             restart = false;
+
+            {
+                let mut offset = 0usize;
+                let mut nfiles = 0usize;
+                let mut ndirs = 0usize;
+
+                loop {
+                    if offset + FILE_ID_EXTD_DIR_INFO_HEADER > buf.len() {
+                        break;
+                    }
+
+                    let parsed = unsafe {
+                        let info = buf.as_ptr().add(offset).cast::<FILE_ID_EXTD_DIR_INFO>();
+                        let next_entry =
+                            (&raw const (*info).NextEntryOffset).read_unaligned() as usize;
+                        let name_len =
+                            (&raw const (*info).FileNameLength).read_unaligned() as usize;
+                        let attrs = (&raw const (*info).FileAttributes).read_unaligned();
+                        let reparse_tag = (&raw const (*info).ReparsePointTag).read_unaligned();
+                        let entry_len = if next_entry == 0 {
+                            buf.len() - offset
+                        } else {
+                            next_entry
+                        };
+
+                        if entry_len < FILE_ID_EXTD_DIR_INFO_HEADER
+                            || name_len > entry_len - FILE_ID_EXTD_DIR_INFO_HEADER
+                        {
+                            None
+                        } else {
+                            let name_ptr = (&raw const (*info).FileName).cast::<u16>();
+                            let name_wide =
+                                from_maybe_unaligned(name_ptr, name_len / size_of::<u16>());
+                            let is_directory = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+                            let is_symlink = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                                && reparse_tag & REPARSE_TAG_NAME_SURROGATE != 0;
+                            Some((next_entry, name_wide, is_directory, is_symlink))
+                        }
+                    };
+                    let Some((next_entry, name, is_directory, is_symlink)) = parsed else {
+                        break;
+                    };
+
+                    if !matches!(&name[..], [DOT] | [DOT, DOT]) && !is_symlink {
+                        if is_directory {
+                            ndirs += 1;
+                        } else {
+                            nfiles += 1;
+                        }
+                    }
+
+                    if next_entry == 0 {
+                        break;
+                    }
+                    offset += next_entry;
+                }
+
+                file_children.reserve(nfiles + ndirs);
+                sub_dirs.reserve(ndirs);
+            }
 
             let mut offset = 0usize;
             loop {
@@ -306,17 +365,15 @@ pub fn walk_dir_bulk(
             .fetch_add(batch_total_size, Ordering::Relaxed);
     }
 
+    file_children.reserve(sub_dirs.len());
+
     let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
         let mut children = Vec::with_capacity(sub_dirs.len());
         for (name, hidden) in sub_dirs {
-            let path = dir.join(&*name);
-            if skip.contains(&path) {
-                continue;
-            }
             let child = match dir_handle.open_relative(&name) {
                 Ok(child_handle) => {
                     let fallback_name = name.clone();
-                    match walk_dir_bulk(child_handle, &path, name, hidden, progress, skip) {
+                    match walk_dir_bulk(child_handle, name, hidden, progress, _skip) {
                         Ok(node) => node,
                         Err(_) => empty_dir(fallback_name, hidden),
                     }
@@ -330,14 +387,10 @@ pub fn walk_dir_bulk(
         sub_dirs
             .into_par_iter()
             .filter_map(|(name, hidden)| {
-                let path = dir.join(&*name);
-                if skip.contains(&path) {
-                    return None;
-                }
                 let child = match dir_handle.open_relative(&name) {
                     Ok(child_handle) => {
                         let fallback_name = name.clone();
-                        match walk_dir_bulk(child_handle, &path, name, hidden, progress, skip) {
+                        match walk_dir_bulk(child_handle, name, hidden, progress, _skip) {
                             Ok(node) => node,
                             Err(_) => empty_dir(fallback_name, hidden),
                         }

@@ -4,6 +4,10 @@ version = "0.3.0"
 edition = "2024"
 default-run = "disk-cleaner"
 
+[features]
+default = []
+internal-tools = []
+
 [dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 bytesize = "2"
@@ -57,3 +61,26 @@ panic = "abort"
 [profile.release-dist]
 inherits = "release"
 lto = true
+
+[[bin]]
+name = "disk-cleaner"
+path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "scan_only"
+path = "src/bin/scan_only.rs"
+bench = false
+required-features = ["internal-tools"]
+
+[[bin]]
+name = "gen_icon"
+path = "src/bin/gen_icon.rs"
+bench = false
+required-features = ["internal-tools"]
+
+[[bin]]
+name = "bench_perf"
+path = "src/bin/bench_perf.rs"
+bench = false
+required-features = ["internal-tools"]

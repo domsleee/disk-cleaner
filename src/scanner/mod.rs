@@ -281,7 +281,7 @@ fn scan_directory_inner(
             .unwrap_or_else(|_| root_name.starts_with('.'));
 
         match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
-            windows::walk_dir_bulk(root_dir, root_name.clone(), root_hidden, &progress, &skip)
+            windows::walk_dir_bulk(root_dir, root, root_name.clone(), root_hidden, &progress, &skip)
         }) {
             Ok(node) => node,
             Err(_) => walk_dir(root, &progress, &skip),
@@ -703,6 +703,37 @@ mod tests {
             .find(|c| c.name() == "normal.txt")
             .expect("normal file should appear in scan");
         assert!(!normal_node.is_hidden(), "normal file should not be hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_bulk_child_open_failure_falls_back_to_generic_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("nested.txt"), "fallback").unwrap();
+        fs::write(tmp.path().join("root.txt"), "root").unwrap();
+
+        let _guard = windows::fail_open_relative_for_name("sub");
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        let sub_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "sub")
+            .expect("sub directory should appear in scan");
+        assert!(sub_node.is_dir(), "sub should remain a directory");
+        assert_eq!(
+            sub_node.children().len(),
+            1,
+            "failed Windows bulk child open should fall back and still scan contents"
+        );
+        assert_eq!(
+            progress.file_count.load(Ordering::Relaxed),
+            2,
+            "fallback scan should still count the nested file"
+        );
     }
 
     #[test]

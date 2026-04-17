@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use rayon::iter::IntoParallelIterator;
 use rayon::prelude::ParallelIterator;
@@ -52,6 +54,9 @@ const PAR_THRESHOLD: usize = 4;
 thread_local! {
     static DIR_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; BUF_SIZE]);
 }
+
+#[cfg(test)]
+static FAIL_OPEN_RELATIVE_FOR: OnceLock<Mutex<Option<Box<str>>>> = OnceLock::new();
 
 #[repr(C)]
 struct IoStatusBlock {
@@ -117,6 +122,11 @@ impl DirectoryHandle {
     }
 
     fn open_relative(&self, name: &str) -> io::Result<Self> {
+        #[cfg(test)]
+        if should_fail_open_relative(name) {
+            return Err(io::Error::other("injected open_relative failure"));
+        }
+
         let mut name_utf16: Vec<u16> = name.encode_utf16().collect();
         let mut unicode = UNICODE_STRING {
             Length: (name_utf16.len() * size_of::<u16>()) as u16,
@@ -190,6 +200,7 @@ impl DirectoryHandle {
 
 pub fn walk_dir_bulk(
     dir_handle: DirectoryHandle,
+    dir_path: &Path,
     dir_name: Box<str>,
     dir_hidden: bool,
     progress: &Arc<ScanProgress>,
@@ -370,35 +381,14 @@ pub fn walk_dir_bulk(
     let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
         let mut children = Vec::with_capacity(sub_dirs.len());
         for (name, hidden) in sub_dirs {
-            let child = match dir_handle.open_relative(&name) {
-                Ok(child_handle) => {
-                    let fallback_name = name.clone();
-                    match walk_dir_bulk(child_handle, name, hidden, progress, _skip) {
-                        Ok(node) => node,
-                        Err(_) => empty_dir(fallback_name, hidden),
-                    }
-                }
-                Err(_) => empty_dir(name, hidden),
-            };
+            let child = walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip);
             children.push(child);
         }
         children
     } else {
         sub_dirs
             .into_par_iter()
-            .filter_map(|(name, hidden)| {
-                let child = match dir_handle.open_relative(&name) {
-                    Ok(child_handle) => {
-                        let fallback_name = name.clone();
-                        match walk_dir_bulk(child_handle, name, hidden, progress, _skip) {
-                            Ok(node) => node,
-                            Err(_) => empty_dir(fallback_name, hidden),
-                        }
-                    }
-                    Err(_) => empty_dir(name, hidden),
-                };
-                Some(child)
-            })
+            .map(|(name, hidden)| walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip))
             .collect()
     };
 
@@ -422,6 +412,61 @@ fn empty_dir(name: Box<str>, hidden: bool) -> FileNode {
         expanded: false,
         hidden,
     }))
+}
+
+fn walk_child_dir(
+    dir_handle: &DirectoryHandle,
+    dir_path: &Path,
+    name: Box<str>,
+    hidden: bool,
+    progress: &Arc<ScanProgress>,
+    skip: &Arc<HashSet<PathBuf>>,
+) -> FileNode {
+    let child_path = dir_path.join(name.as_ref());
+    match dir_handle.open_relative(&name) {
+        Ok(child_handle) => match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
+            Ok(node) => node,
+            Err(_) => super::walk_dir(&child_path, progress, skip),
+        },
+        Err(_) => super::walk_dir(&child_path, progress, skip),
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct OpenRelativeFailureGuard;
+
+#[cfg(test)]
+impl Drop for OpenRelativeFailureGuard {
+    fn drop(&mut self) {
+        clear_open_relative_failure();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_open_relative_for_name(name: &str) -> OpenRelativeFailureGuard {
+    let slot = FAIL_OPEN_RELATIVE_FOR.get_or_init(|| Mutex::new(None));
+    *slot.lock().expect("open_relative failure lock poisoned") = Some(name.into());
+    OpenRelativeFailureGuard
+}
+
+#[cfg(test)]
+fn clear_open_relative_failure() {
+    if let Some(slot) = FAIL_OPEN_RELATIVE_FOR.get() {
+        *slot.lock().expect("open_relative failure lock poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn should_fail_open_relative(name: &str) -> bool {
+    FAIL_OPEN_RELATIVE_FOR
+        .get()
+        .and_then(|slot| {
+            slot.lock()
+                .expect("open_relative failure lock poisoned")
+                .as_deref()
+                .map(|target| target == name)
+        })
+        .unwrap_or(false)
 }
 
 fn to_verbatim_wide(path: &Path) -> Vec<u16> {

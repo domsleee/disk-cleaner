@@ -351,7 +351,8 @@ fn category_filter_shows_only_matching_files() {
     // Root is already expanded by scanner
 
     // Filter to videos only
-    let rows = ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true, None, None, None);
+    let rows =
+        ui::collect_cached_rows(&tree, "", Some(FileCategory::Video), true, None, None, None);
     let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
 
     let video_path = root.join("video.mp4");
@@ -387,7 +388,9 @@ fn hidden_files_excluded_by_default() {
     // With show_hidden, both files are visible but grouped into "[2 files]"
     let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
     // Root + "[2 files]" group (both files visible → grouped since ≥ threshold)
-    assert!(rows.iter().any(|r| r.is_file_group && r.name.as_ref() == "[2 files]"));
+    assert!(rows
+        .iter()
+        .any(|r| r.is_file_group && r.name.as_ref() == "[2 files]"));
 
     // When file group is expanded, individual files become visible
     let mut expanded = std::collections::HashSet::new();

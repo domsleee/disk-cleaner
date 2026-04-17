@@ -3,9 +3,12 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
+use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
+
 /// Bit 63 of the size field stores the hidden flag.
 /// Max representable size: 2^63 − 1 ≈ 9.2 EB (more than enough).
 const HIDDEN_BIT: u64 = 1 << 63;
+const PAR_SORT_THRESHOLD: usize = 128;
 
 #[derive(Clone)]
 pub struct FileLeaf {
@@ -108,8 +111,12 @@ pub fn sort_children_recursive(node: &mut FileNode) {
     if let FileNode::Dir(d) = node {
         d.children
             .sort_unstable_by_key(|c| std::cmp::Reverse(c.size()));
-        for child in &mut d.children {
-            sort_children_recursive(child);
+        if d.children.len() >= PAR_SORT_THRESHOLD {
+            d.children.par_iter_mut().for_each(sort_children_recursive);
+        } else {
+            for child in &mut d.children {
+                sort_children_recursive(child);
+            }
         }
     }
 }

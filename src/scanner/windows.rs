@@ -88,12 +88,6 @@ unsafe extern "system" {
 
 pub struct DirectoryHandle(HANDLE);
 
-struct SubDirEntry {
-    name_wide: Box<[u16]>,
-    name: Box<str>,
-    hidden: bool,
-}
-
 unsafe impl Send for DirectoryHandle {}
 unsafe impl Sync for DirectoryHandle {}
 
@@ -128,19 +122,16 @@ impl DirectoryHandle {
     }
 
     fn open_relative(&self, name: &str) -> io::Result<Self> {
-        let name_utf16: Vec<u16> = name.encode_utf16().collect();
-        self.open_relative_wide(&name_utf16, name)
-    }
-
-    fn open_relative_wide(&self, name_utf16: &[u16], _debug_name: &str) -> io::Result<Self> {
         #[cfg(test)]
-        if should_fail_open_relative(_debug_name) {
+        if should_fail_open_relative(name) {
             return Err(io::Error::other("injected open_relative failure"));
         }
+
+        let mut name_utf16: Vec<u16> = name.encode_utf16().collect();
         let mut unicode = UNICODE_STRING {
             Length: (name_utf16.len() * size_of::<u16>()) as u16,
             MaximumLength: (name_utf16.len() * size_of::<u16>()) as u16,
-            Buffer: name_utf16.as_ptr().cast_mut(),
+            Buffer: name_utf16.as_mut_ptr(),
         };
         let mut io_status = IoStatusBlock {
             status: 0,
@@ -220,7 +211,7 @@ pub fn walk_dir_bulk(
     }
 
     let mut file_children: Vec<FileNode> = Vec::new();
-    let mut sub_dirs: Vec<SubDirEntry> = Vec::new();
+    let mut sub_dirs: Vec<(Box<str>, bool)> = Vec::new();
     let mut batch_file_count = 0u64;
     let mut batch_total_size = 0u64;
 
@@ -352,19 +343,14 @@ pub fn walk_dir_bulk(
                     continue;
                 }
 
-                let name_wide = name.into_owned();
-                let name = String::from_utf16_lossy(&name_wide).into_boxed_str();
+                let name = String::from_utf16_lossy(&name).into_boxed_str();
                 let hidden = name.starts_with('.') || attrs & FILE_ATTRIBUTE_HIDDEN != 0;
 
                 if is_symlink {
                     // Match std's file_type semantics: name-surrogate reparse points
                     // are not treated as regular files/directories for scanning.
                 } else if is_directory {
-                    sub_dirs.push(SubDirEntry {
-                        name_wide: name_wide.into_boxed_slice(),
-                        name,
-                        hidden,
-                    });
+                    sub_dirs.push((name, hidden));
                 } else {
                     batch_file_count += 1;
                     batch_total_size += logical_size;
@@ -394,15 +380,15 @@ pub fn walk_dir_bulk(
 
     let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
         let mut children = Vec::with_capacity(sub_dirs.len());
-        for sub_dir in sub_dirs {
-            let child = walk_child_dir(&dir_handle, dir_path, sub_dir, progress, _skip);
+        for (name, hidden) in sub_dirs {
+            let child = walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip);
             children.push(child);
         }
         children
     } else {
         sub_dirs
             .into_par_iter()
-            .map(|sub_dir| walk_child_dir(&dir_handle, dir_path, sub_dir, progress, _skip))
+            .map(|(name, hidden)| walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip))
             .collect()
     };
 
@@ -431,20 +417,14 @@ fn empty_dir(name: Box<str>, hidden: bool) -> FileNode {
 fn walk_child_dir(
     dir_handle: &DirectoryHandle,
     dir_path: &Path,
-    sub_dir: SubDirEntry,
+    name: Box<str>,
+    hidden: bool,
     progress: &Arc<ScanProgress>,
     skip: &Arc<HashSet<PathBuf>>,
 ) -> FileNode {
-    let child_path = dir_path.join(sub_dir.name.as_ref());
-    match dir_handle.open_relative_wide(&sub_dir.name_wide, &sub_dir.name) {
-        Ok(child_handle) => match walk_dir_bulk(
-            child_handle,
-            &child_path,
-            sub_dir.name,
-            sub_dir.hidden,
-            progress,
-            skip,
-        ) {
+    let child_path = dir_path.join(name.as_ref());
+    match dir_handle.open_relative(&name) {
+        Ok(child_handle) => match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
             Ok(node) => node,
             Err(_) => super::walk_dir(&child_path, progress, skip),
         },

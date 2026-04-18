@@ -48,6 +48,7 @@ const NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE: usize = size_of::<i64>() + size_of::<
 const FILE_RECORD_FLAG_IN_USE: u16 = 0x0001;
 const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 const FILE_NAME_VALUE_MIN_SIZE: usize = 0x42;
+const NTFS_VOLUME_ROOT_RECORD_NUMBER: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct NtfsEligibility {
@@ -142,11 +143,55 @@ pub struct RawMftSummary {
     pub invalid_records: u64,
     pub directories: u64,
     pub files: u64,
+    pub entries_without_data_size: u64,
+    pub files_without_data_size: u64,
+    pub dirs_without_data_size: u64,
     pub hidden: u64,
     pub named_records: u64,
     pub parse_errors: u64,
     pub truncated: bool,
     pub samples: Vec<RawMftRecordSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawMftIndexEntry {
+    pub record_number: u64,
+    pub parent_record_number: u64,
+    pub attributes: u32,
+    pub name: Box<str>,
+    pub is_directory: bool,
+    pub logical_size: u64,
+    pub allocated_size: u64,
+    pub subtree_logical_size: u64,
+    pub subtree_allocated_size: u64,
+    pub subtree_file_count: u64,
+    pub subtree_dir_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RawMftIndexSummary {
+    pub volume_root: PathBuf,
+    pub volume_device: String,
+    pub bytes_per_file_record: u32,
+    pub records_scanned: u64,
+    pub in_use_records: u64,
+    pub invalid_records: u64,
+    pub parse_errors: u64,
+    pub indexed_entries: usize,
+    pub root_entries: usize,
+    pub total_file_entries: usize,
+    pub total_dir_entries: usize,
+    pub entries_without_data_size: usize,
+    pub files_without_data_size: usize,
+    pub dirs_without_data_size: usize,
+    pub total_logical_size: u64,
+    pub total_allocated_size: u64,
+    pub sample_entries: Vec<RawMftIndexEntry>,
+}
+
+pub struct RawMftIndex {
+    pub summary: RawMftIndexSummary,
+    pub entries: Vec<RawMftIndexEntry>,
 }
 
 pub fn ntfs_eligibility(path: &Path) -> io::Result<NtfsEligibility> {
@@ -376,6 +421,7 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
         probe_raw_mft_from_file(
             &mut file,
             record_size,
+            volume_data.BytesPerSector as usize,
             target_records,
             &mut summary,
             mft_valid_data_length,
@@ -386,6 +432,7 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
             volume_handle.0,
             &volume_data,
             record_size,
+            volume_data.BytesPerSector as usize,
             target_records,
             &mut summary,
         )?;
@@ -393,6 +440,68 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
 
     summary.truncated = limit.is_some_and(|cap| cap < total_records);
     Ok(summary)
+}
+
+pub fn build_raw_mft_index_for_path(path: &Path, limit: Option<usize>) -> io::Result<RawMftIndex> {
+    let eligibility = ntfs_eligibility(path)?;
+    if !eligibility.is_ntfs() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{} is on {}, not NTFS",
+                path.display(),
+                eligibility.filesystem_name
+            ),
+        ));
+    }
+
+    let volume_handle = open_volume(&eligibility.volume_device)?;
+    let volume_data = ntfs_volume_data(volume_handle.0)?;
+    let record_size = volume_data.BytesPerFileRecordSegment as usize;
+    if record_size < FILE_RECORD_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid NTFS file record size: {}",
+                volume_data.BytesPerFileRecordSegment
+            ),
+        ));
+    }
+
+    let mft_path = eligibility.volume_root.join("$MFT");
+    let valid_len = u64::try_from(volume_data.MftValidDataLength).unwrap_or_default();
+    let total_records = (valid_len / record_size as u64) as usize;
+    let target_records = limit.unwrap_or(total_records).min(total_records);
+
+    let mut raw = RawMftIndexBuild::new(
+        eligibility.volume_root.clone(),
+        eligibility.volume_device.clone(),
+        volume_data.BytesPerFileRecordSegment,
+    );
+
+    if let Ok(mut file) = open_raw_ntfs_file(&mft_path) {
+        build_raw_mft_index_from_file(
+            &mut file,
+            record_size,
+            volume_data.BytesPerSector as usize,
+            target_records,
+            valid_len,
+            &mut raw,
+        )?;
+    } else {
+        build_raw_mft_index_via_volume(
+            &eligibility.volume_device,
+            volume_handle.0,
+            &volume_data,
+            record_size,
+            volume_data.BytesPerSector as usize,
+            target_records,
+            valid_len,
+            &mut raw,
+        )?;
+    }
+
+    Ok(raw.finish())
 }
 
 struct HandleGuard(HANDLE);
@@ -796,6 +905,142 @@ struct ParsedRawMftRecord {
     allocated_size: Option<u64>,
 }
 
+struct RawMftIndexBuild {
+    summary: RawMftIndexSummary,
+    entries: Vec<RawMftIndexEntry>,
+}
+
+impl RawMftIndexBuild {
+    fn new(volume_root: PathBuf, volume_device: String, bytes_per_file_record: u32) -> Self {
+        Self {
+            summary: RawMftIndexSummary {
+                volume_root,
+                volume_device,
+                bytes_per_file_record,
+                ..RawMftIndexSummary::default()
+            },
+            entries: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, record: ParsedRawMftRecord) {
+        self.summary.in_use_records += 1;
+        if record.logical_size.is_none() {
+            self.summary.entries_without_data_size += 1;
+            if record.is_directory {
+                self.summary.dirs_without_data_size += 1;
+            } else {
+                self.summary.files_without_data_size += 1;
+            }
+        }
+        let entry = RawMftIndexEntry {
+            record_number: record.record_number,
+            parent_record_number: record.parent_record_number,
+            attributes: record.attributes,
+            name: record.name.into_boxed_str(),
+            is_directory: record.is_directory,
+            logical_size: record.logical_size.unwrap_or(0),
+            allocated_size: record.allocated_size.unwrap_or(0),
+            subtree_logical_size: record.logical_size.unwrap_or(0),
+            subtree_allocated_size: record.allocated_size.unwrap_or(0),
+            subtree_file_count: u64::from(!record.is_directory),
+            subtree_dir_count: u64::from(record.is_directory),
+        };
+        self.entries.push(entry);
+    }
+
+    fn finish(mut self) -> RawMftIndex {
+        self.entries.sort_unstable_by_key(|entry| entry.record_number);
+        let mut parent_indices = vec![None; self.entries.len()];
+        let mut pending_children = vec![0usize; self.entries.len()];
+        let mut root_entries = 0usize;
+
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.record_number == entry.parent_record_number {
+                root_entries += 1;
+                continue;
+            }
+            if let Ok(parent_idx) = self.entries.binary_search_by_key(
+                &entry.parent_record_number,
+                |candidate| candidate.record_number,
+            ) {
+                parent_indices[idx] = Some(parent_idx);
+                pending_children[parent_idx] += 1;
+            } else {
+                root_entries += 1;
+            }
+        }
+
+        let mut ready = Vec::with_capacity(self.entries.len());
+        for (idx, child_count) in pending_children.iter().enumerate() {
+            if *child_count == 0 {
+                ready.push(idx);
+            }
+        }
+
+        while let Some(child_idx) = ready.pop() {
+            let Some(parent_idx) = parent_indices[child_idx] else {
+                continue;
+            };
+
+            let child_logical = self.entries[child_idx].subtree_logical_size;
+            let child_allocated = self.entries[child_idx].subtree_allocated_size;
+            let child_files = self.entries[child_idx].subtree_file_count;
+            let child_dirs = self.entries[child_idx].subtree_dir_count;
+
+            let parent = &mut self.entries[parent_idx];
+            parent.subtree_logical_size = parent.subtree_logical_size.saturating_add(child_logical);
+            parent.subtree_allocated_size =
+                parent.subtree_allocated_size.saturating_add(child_allocated);
+            parent.subtree_file_count = parent.subtree_file_count.saturating_add(child_files);
+            parent.subtree_dir_count = parent.subtree_dir_count.saturating_add(child_dirs);
+
+            pending_children[parent_idx] -= 1;
+            if pending_children[parent_idx] == 0 {
+                ready.push(parent_idx);
+            }
+        }
+
+        self.summary.indexed_entries = self.entries.len();
+        self.summary.total_file_entries = self.entries.iter().filter(|entry| !entry.is_directory).count();
+        self.summary.total_dir_entries = self.entries.iter().filter(|entry| entry.is_directory).count();
+        self.summary.root_entries = root_entries;
+
+        let root_entry = self
+            .entries
+            .binary_search_by_key(&NTFS_VOLUME_ROOT_RECORD_NUMBER, |entry| entry.record_number)
+            .ok()
+            .map(|root_idx| &self.entries[root_idx]);
+
+        self.summary.total_logical_size = if let Some(root) = root_entry {
+            root.subtree_logical_size
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| parent_indices[*idx].is_none())
+                .map(|(_, entry)| entry.subtree_logical_size)
+                .sum()
+        };
+        self.summary.total_allocated_size = if let Some(root) = root_entry {
+            root.subtree_allocated_size
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| parent_indices[*idx].is_none())
+                .map(|(_, entry)| entry.subtree_allocated_size)
+                .sum()
+        };
+        self.summary.sample_entries = self.entries.iter().take(SAMPLE_LIMIT).cloned().collect();
+
+        RawMftIndex {
+            summary: self.summary,
+            entries: self.entries,
+        }
+    }
+}
+
 fn parse_raw_mft_record(record: &[u8], record_number: u64) -> io::Result<Option<ParsedRawMftRecord>> {
     if record.len() < FILE_RECORD_HEADER_SIZE {
         return Err(io::Error::new(
@@ -924,6 +1169,14 @@ fn file_name_namespace_rank(namespace: u8) -> u8 {
 fn update_raw_mft_summary(summary: &mut RawMftSummary, record: ParsedRawMftRecord) {
     summary.in_use_records += 1;
     summary.named_records += 1;
+    if record.logical_size.is_none() {
+        summary.entries_without_data_size += 1;
+        if record.is_directory {
+            summary.dirs_without_data_size += 1;
+        } else {
+            summary.files_without_data_size += 1;
+        }
+    }
     if record.attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
         summary.hidden += 1;
     }
@@ -946,9 +1199,14 @@ fn update_raw_mft_summary(summary: &mut RawMftSummary, record: ParsedRawMftRecor
     }
 }
 
+fn update_raw_mft_index(build: &mut RawMftIndexBuild, record: ParsedRawMftRecord) {
+    build.push(record);
+}
+
 fn probe_raw_mft_from_file(
     file: &mut File,
     record_size: usize,
+    bytes_per_sector: usize,
     target_records: usize,
     summary: &mut RawMftSummary,
     mut bytes_remaining: u64,
@@ -978,9 +1236,61 @@ fn probe_raw_mft_from_file(
         }
 
         process_raw_mft_records(
-            &buf[..complete_records * record_size],
+            &mut buf[..complete_records * record_size],
+            bytes_per_sector,
             &mut next_record_number,
             summary,
+        );
+
+        let consumed = complete_records * record_size;
+        remaining_records = remaining_records.saturating_sub(complete_records);
+        bytes_remaining = bytes_remaining.saturating_sub(consumed as u64);
+        if complete_records * record_size < bytes_to_read {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_raw_mft_index_from_file(
+    file: &mut File,
+    record_size: usize,
+    bytes_per_sector: usize,
+    target_records: usize,
+    mut bytes_remaining: u64,
+    build: &mut RawMftIndexBuild,
+) -> io::Result<()> {
+    let records_per_chunk = (1024 * 1024 / record_size).max(1);
+    let mut buf = vec![0u8; records_per_chunk * record_size];
+    let mut next_record_number = 0u64;
+    let mut remaining_records = target_records;
+
+    while remaining_records > 0 && bytes_remaining > 0 {
+        let records_this_chunk = remaining_records.min(records_per_chunk);
+        let bytes_this_chunk = records_this_chunk * record_size;
+        let bytes_to_read = bytes_this_chunk.min(bytes_remaining as usize);
+        let mut filled = 0usize;
+
+        while filled < bytes_to_read {
+            let read = file.read(&mut buf[filled..bytes_to_read])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+
+        let complete_records = filled / record_size;
+        if complete_records == 0 {
+            break;
+        }
+
+        process_raw_mft_index_records(
+            &mut buf[..complete_records * record_size],
+            record_size,
+            bytes_per_sector,
+            &mut next_record_number,
+            build,
         );
 
         let consumed = complete_records * record_size;
@@ -999,6 +1309,7 @@ fn probe_raw_mft_via_volume(
     volume_handle: HANDLE,
     volume_data: &NTFS_VOLUME_DATA_BUFFER,
     record_size: usize,
+    bytes_per_sector: usize,
     target_records: usize,
     summary: &mut RawMftSummary,
 ) -> io::Result<()> {
@@ -1051,7 +1362,12 @@ fn probe_raw_mft_via_volume(
             }
 
             let ready_bytes = ready_records * record_size;
-            process_raw_mft_records(&partial[..ready_bytes], &mut next_record_number, summary);
+            process_raw_mft_records(
+                &mut partial[..ready_bytes],
+                bytes_per_sector,
+                &mut next_record_number,
+                summary,
+            );
             partial = partial.split_off(ready_bytes);
         }
     }
@@ -1059,18 +1375,180 @@ fn probe_raw_mft_via_volume(
     Ok(())
 }
 
-fn process_raw_mft_records(buf: &[u8], next_record_number: &mut u64, summary: &mut RawMftSummary) {
-    for record in buf.chunks_exact(summary.bytes_per_file_record as usize) {
+fn build_raw_mft_index_via_volume(
+    volume_device: &str,
+    volume_handle: HANDLE,
+    volume_data: &NTFS_VOLUME_DATA_BUFFER,
+    record_size: usize,
+    bytes_per_sector: usize,
+    target_records: usize,
+    valid_len: u64,
+    build: &mut RawMftIndexBuild,
+) -> io::Result<()> {
+    let mut output_buf =
+        vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + volume_data.BytesPerFileRecordSegment as usize];
+    let mft_record = query_file_record_bytes(volume_handle, 0, &mut output_buf)?;
+    let data_runs = parse_nonresident_data_runs(mft_record)?;
+    let bytes_per_cluster = volume_data.BytesPerCluster as u64;
+    let mut volume_file = open_raw_volume_file(volume_device)?;
+    let mut next_record_number = 0u64;
+    let mut bytes_remaining = valid_len;
+    let mut partial = Vec::<u8>::new();
+    let mut io_buf = vec![0u8; 4 * 1024 * 1024];
+
+    for run in data_runs {
+        if bytes_remaining == 0 || next_record_number as usize >= target_records {
+            break;
+        }
+        if run.start_lcn < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("negative LCN in MFT runlist: {}", run.start_lcn),
+            ));
+        }
+
+        let run_offset = run.start_lcn as u64 * bytes_per_cluster;
+        let mut run_bytes_left = run.cluster_len.saturating_mul(bytes_per_cluster);
+        volume_file.seek(SeekFrom::Start(run_offset))?;
+
+        while run_bytes_left > 0
+            && bytes_remaining > 0
+            && (next_record_number as usize) < target_records
+        {
+            let chunk = usize::try_from(run_bytes_left.min(bytes_remaining))
+                .unwrap_or(usize::MAX)
+                .min(io_buf.len());
+            let read = volume_file.read(&mut io_buf[..chunk])?;
+            if read == 0 {
+                break;
+            }
+
+            run_bytes_left = run_bytes_left.saturating_sub(read as u64);
+            bytes_remaining = bytes_remaining.saturating_sub(read as u64);
+            partial.extend_from_slice(&io_buf[..read]);
+
+            let ready_records =
+                (partial.len() / record_size).min(target_records.saturating_sub(next_record_number as usize));
+            if ready_records == 0 {
+                continue;
+            }
+
+            let ready_bytes = ready_records * record_size;
+            process_raw_mft_index_records(
+                &mut partial[..ready_bytes],
+                record_size,
+                bytes_per_sector,
+                &mut next_record_number,
+                build,
+            );
+            partial = partial.split_off(ready_bytes);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_raw_mft_records(
+    buf: &mut [u8],
+    bytes_per_sector: usize,
+    next_record_number: &mut u64,
+    summary: &mut RawMftSummary,
+) {
+    for record in buf.chunks_exact_mut(summary.bytes_per_file_record as usize) {
         summary.records_scanned += 1;
         let record_number = *next_record_number;
         *next_record_number += 1;
 
-        match parse_raw_mft_record(record, record_number) {
+        match apply_update_sequence_fixup(record, bytes_per_sector)
+            .and_then(|fixed| parse_raw_mft_record(fixed, record_number))
+        {
             Ok(Some(parsed)) => update_raw_mft_summary(summary, parsed),
             Ok(None) => {}
             Err(_) => summary.parse_errors += 1,
         }
     }
+}
+
+fn process_raw_mft_index_records(
+    buf: &mut [u8],
+    record_size: usize,
+    bytes_per_sector: usize,
+    next_record_number: &mut u64,
+    build: &mut RawMftIndexBuild,
+) {
+    for record in buf.chunks_exact_mut(record_size) {
+        build.summary.records_scanned += 1;
+        let record_number = *next_record_number;
+        *next_record_number += 1;
+
+        match apply_update_sequence_fixup(record, bytes_per_sector)
+            .and_then(|fixed| parse_raw_mft_record(fixed, record_number))
+        {
+            Ok(Some(parsed)) => update_raw_mft_index(build, parsed),
+            Ok(None) => {}
+            Err(_) => build.summary.parse_errors += 1,
+        }
+    }
+}
+
+fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io::Result<&[u8]> {
+    if bytes_per_sector < size_of::<u16>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid NTFS sector size for fixup",
+        ));
+    }
+    if record.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short NTFS record header for fixup",
+        ));
+    }
+
+    let usa_offset = u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize;
+    let usa_count = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
+    if usa_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid NTFS USA count",
+        ));
+    }
+
+    let usa_len = usa_count
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NTFS USA length overflow"))?;
+    if usa_offset + usa_len > record.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NTFS USA extends past record end",
+        ));
+    }
+
+    let sequence_value = [record[usa_offset], record[usa_offset + 1]];
+    for sector_idx in 0..usa_count.saturating_sub(1) {
+        let fixup_pos = (sector_idx + 1)
+            .checked_mul(bytes_per_sector)
+            .and_then(|pos| pos.checked_sub(size_of::<u16>()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "NTFS fixup offset overflow"))?;
+        if fixup_pos + size_of::<u16>() > record.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NTFS fixup position extends past record end",
+            ));
+        }
+        if record[fixup_pos..fixup_pos + 2] != sequence_value {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NTFS update sequence mismatch",
+            ));
+        }
+
+        let replacement_offset = usa_offset + size_of::<u16>() * (sector_idx + 1);
+        let replacement = [record[replacement_offset], record[replacement_offset + 1]];
+        record[fixup_pos..fixup_pos + 2].copy_from_slice(&replacement);
+    }
+
+    Ok(record)
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
@@ -44,6 +45,7 @@ const ATTR_TYPE_END: u32 = 0xFFFF_FFFF;
 const FILE_RECORD_HEADER_SIZE: usize = 0x30;
 const FILE_RECORD_ATTR_OFFSET: usize = 0x14;
 const FILE_RECORD_FLAGS_OFFSET: usize = 0x16;
+const FILE_RECORD_BASE_RECORD_OFFSET: usize = 0x20;
 const NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE: usize = size_of::<i64>() + size_of::<u32>();
 const FILE_RECORD_FLAG_IN_USE: u16 = 0x0001;
 const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
@@ -181,6 +183,10 @@ pub struct RawMftIndexSummary {
     pub root_entries: usize,
     pub total_file_entries: usize,
     pub total_dir_entries: usize,
+    pub multi_name_entries: usize,
+    pub extra_primary_names: u64,
+    pub extra_primary_name_logical_size: u64,
+    pub extra_primary_name_allocated_size: u64,
     pub entries_without_data_size: usize,
     pub files_without_data_size: usize,
     pub dirs_without_data_size: usize,
@@ -905,9 +911,33 @@ struct ParsedRawMftRecord {
     allocated_size: Option<u64>,
 }
 
+#[derive(Debug)]
+struct RawMftRecordFragment {
+    record_number: u64,
+    owner_record_number: u64,
+    file_name: Option<ParsedFileNameAttribute>,
+    primary_name_count: u16,
+    is_directory: bool,
+    logical_size: Option<u64>,
+    allocated_size: Option<u64>,
+}
+
+#[derive(Debug)]
+struct RawMftIndexAggregate {
+    record_number: u64,
+    best_file_name: Option<ParsedFileNameAttribute>,
+    best_name_from_owner: bool,
+    primary_name_count: u32,
+    is_directory: bool,
+    logical_size: Option<u64>,
+    allocated_size: Option<u64>,
+    size_from_owner: bool,
+}
+
 struct RawMftIndexBuild {
     summary: RawMftIndexSummary,
-    entries: Vec<RawMftIndexEntry>,
+    entries: Vec<RawMftIndexAggregate>,
+    entry_index: HashMap<u64, usize>,
 }
 
 impl RawMftIndexBuild {
@@ -920,47 +950,119 @@ impl RawMftIndexBuild {
                 ..RawMftIndexSummary::default()
             },
             entries: Vec::new(),
+            entry_index: HashMap::new(),
         }
     }
 
-    fn push(&mut self, record: ParsedRawMftRecord) {
+    fn push_fragment(&mut self, fragment: RawMftRecordFragment) {
         self.summary.in_use_records += 1;
-        if record.logical_size.is_none() {
-            self.summary.entries_without_data_size += 1;
-            if record.is_directory {
-                self.summary.dirs_without_data_size += 1;
-            } else {
-                self.summary.files_without_data_size += 1;
+        let entry_idx = if let Some(existing) = self.entry_index.get(&fragment.owner_record_number) {
+            *existing
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(RawMftIndexAggregate {
+                record_number: fragment.owner_record_number,
+                best_file_name: None,
+                best_name_from_owner: false,
+                primary_name_count: 0,
+                is_directory: false,
+                logical_size: None,
+                allocated_size: None,
+                size_from_owner: false,
+            });
+            self.entry_index.insert(fragment.owner_record_number, idx);
+            idx
+        };
+
+        let entry = &mut self.entries[entry_idx];
+        entry.is_directory |= fragment.is_directory;
+        entry.primary_name_count = entry
+            .primary_name_count
+            .saturating_add(u32::from(fragment.primary_name_count));
+
+        if let Some(file_name) = fragment.file_name {
+            let from_owner = fragment.record_number == fragment.owner_record_number;
+            let replace = entry.best_file_name.as_ref().is_none_or(|current| {
+                (from_owner, file_name.namespace_rank) > (entry.best_name_from_owner, current.namespace_rank)
+            });
+            if replace {
+                entry.best_name_from_owner = from_owner;
+                entry.best_file_name = Some(file_name);
             }
         }
-        let entry = RawMftIndexEntry {
-            record_number: record.record_number,
-            parent_record_number: record.parent_record_number,
-            attributes: record.attributes,
-            name: record.name.into_boxed_str(),
-            is_directory: record.is_directory,
-            logical_size: record.logical_size.unwrap_or(0),
-            allocated_size: record.allocated_size.unwrap_or(0),
-            subtree_logical_size: record.logical_size.unwrap_or(0),
-            subtree_allocated_size: record.allocated_size.unwrap_or(0),
-            subtree_file_count: u64::from(!record.is_directory),
-            subtree_dir_count: u64::from(record.is_directory),
-        };
-        self.entries.push(entry);
+
+        if let (Some(logical_size), Some(allocated_size)) =
+            (fragment.logical_size, fragment.allocated_size)
+        {
+            let from_owner = fragment.record_number == fragment.owner_record_number;
+            if entry.logical_size.is_none() || (from_owner && !entry.size_from_owner) {
+                entry.logical_size = Some(logical_size);
+                entry.allocated_size = Some(allocated_size);
+                entry.size_from_owner = from_owner;
+            }
+        }
     }
 
     fn finish(mut self) -> RawMftIndex {
-        self.entries.sort_unstable_by_key(|entry| entry.record_number);
-        let mut parent_indices = vec![None; self.entries.len()];
-        let mut pending_children = vec![0usize; self.entries.len()];
+        let mut entries_without_data_size = 0usize;
+        let mut files_without_data_size = 0usize;
+        let mut dirs_without_data_size = 0usize;
+        let mut final_entries = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.into_iter() {
+            let Some(file_name) = entry.best_file_name else {
+                continue;
+            };
+            if entry.logical_size.is_none() {
+                entries_without_data_size += 1;
+                if entry.is_directory {
+                    dirs_without_data_size += 1;
+                } else {
+                    files_without_data_size += 1;
+                }
+            }
+            if entry.primary_name_count > 1 {
+                self.summary.multi_name_entries += 1;
+                let extra_names = u64::from(entry.primary_name_count - 1);
+                self.summary.extra_primary_names += extra_names;
+                if !entry.is_directory {
+                    self.summary.extra_primary_name_logical_size = self
+                        .summary
+                        .extra_primary_name_logical_size
+                        .saturating_add(extra_names.saturating_mul(entry.logical_size.unwrap_or(0)));
+                    self.summary.extra_primary_name_allocated_size = self
+                        .summary
+                        .extra_primary_name_allocated_size
+                        .saturating_add(extra_names.saturating_mul(entry.allocated_size.unwrap_or(0)));
+                }
+            }
+            let logical_size = entry.logical_size.unwrap_or(0);
+            let allocated_size = entry.allocated_size.unwrap_or(0);
+            final_entries.push(RawMftIndexEntry {
+                record_number: entry.record_number,
+                parent_record_number: file_name.parent_record_number,
+                attributes: file_name.attributes,
+                name: file_name.name.into_boxed_str(),
+                is_directory: entry.is_directory,
+                logical_size,
+                allocated_size,
+                subtree_logical_size: logical_size,
+                subtree_allocated_size: allocated_size,
+                subtree_file_count: u64::from(!entry.is_directory),
+                subtree_dir_count: u64::from(entry.is_directory),
+            });
+        }
+
+        final_entries.sort_unstable_by_key(|entry| entry.record_number);
+        let mut parent_indices = vec![None; final_entries.len()];
+        let mut pending_children = vec![0usize; final_entries.len()];
         let mut root_entries = 0usize;
 
-        for (idx, entry) in self.entries.iter().enumerate() {
+        for (idx, entry) in final_entries.iter().enumerate() {
             if entry.record_number == entry.parent_record_number {
                 root_entries += 1;
                 continue;
             }
-            if let Ok(parent_idx) = self.entries.binary_search_by_key(
+            if let Ok(parent_idx) = final_entries.binary_search_by_key(
                 &entry.parent_record_number,
                 |candidate| candidate.record_number,
             ) {
@@ -971,7 +1073,7 @@ impl RawMftIndexBuild {
             }
         }
 
-        let mut ready = Vec::with_capacity(self.entries.len());
+        let mut ready = Vec::with_capacity(final_entries.len());
         for (idx, child_count) in pending_children.iter().enumerate() {
             if *child_count == 0 {
                 ready.push(idx);
@@ -983,12 +1085,12 @@ impl RawMftIndexBuild {
                 continue;
             };
 
-            let child_logical = self.entries[child_idx].subtree_logical_size;
-            let child_allocated = self.entries[child_idx].subtree_allocated_size;
-            let child_files = self.entries[child_idx].subtree_file_count;
-            let child_dirs = self.entries[child_idx].subtree_dir_count;
+            let child_logical = final_entries[child_idx].subtree_logical_size;
+            let child_allocated = final_entries[child_idx].subtree_allocated_size;
+            let child_files = final_entries[child_idx].subtree_file_count;
+            let child_dirs = final_entries[child_idx].subtree_dir_count;
 
-            let parent = &mut self.entries[parent_idx];
+            let parent = &mut final_entries[parent_idx];
             parent.subtree_logical_size = parent.subtree_logical_size.saturating_add(child_logical);
             parent.subtree_allocated_size =
                 parent.subtree_allocated_size.saturating_add(child_allocated);
@@ -1001,21 +1103,23 @@ impl RawMftIndexBuild {
             }
         }
 
-        self.summary.indexed_entries = self.entries.len();
-        self.summary.total_file_entries = self.entries.iter().filter(|entry| !entry.is_directory).count();
-        self.summary.total_dir_entries = self.entries.iter().filter(|entry| entry.is_directory).count();
+        self.summary.indexed_entries = final_entries.len();
+        self.summary.total_file_entries = final_entries.iter().filter(|entry| !entry.is_directory).count();
+        self.summary.total_dir_entries = final_entries.iter().filter(|entry| entry.is_directory).count();
+        self.summary.entries_without_data_size = entries_without_data_size;
+        self.summary.files_without_data_size = files_without_data_size;
+        self.summary.dirs_without_data_size = dirs_without_data_size;
         self.summary.root_entries = root_entries;
 
-        let root_entry = self
-            .entries
+        let root_entry = final_entries
             .binary_search_by_key(&NTFS_VOLUME_ROOT_RECORD_NUMBER, |entry| entry.record_number)
             .ok()
-            .map(|root_idx| &self.entries[root_idx]);
+            .map(|root_idx| &final_entries[root_idx]);
 
         self.summary.total_logical_size = if let Some(root) = root_entry {
             root.subtree_logical_size
         } else {
-            self.entries
+            final_entries
                 .iter()
                 .enumerate()
                 .filter(|(idx, _)| parent_indices[*idx].is_none())
@@ -1025,18 +1129,18 @@ impl RawMftIndexBuild {
         self.summary.total_allocated_size = if let Some(root) = root_entry {
             root.subtree_allocated_size
         } else {
-            self.entries
+            final_entries
                 .iter()
                 .enumerate()
                 .filter(|(idx, _)| parent_indices[*idx].is_none())
                 .map(|(_, entry)| entry.subtree_allocated_size)
                 .sum()
         };
-        self.summary.sample_entries = self.entries.iter().take(SAMPLE_LIMIT).cloned().collect();
+        self.summary.sample_entries = final_entries.iter().take(SAMPLE_LIMIT).cloned().collect();
 
         RawMftIndex {
             summary: self.summary,
-            entries: self.entries,
+            entries: final_entries,
         }
     }
 }
@@ -1078,7 +1182,58 @@ fn parse_raw_mft_record(record: &[u8], record_number: u64) -> io::Result<Option<
     }))
 }
 
-#[derive(Debug)]
+fn parse_raw_mft_record_fragment(
+    record: &[u8],
+    record_number: u64,
+) -> io::Result<Option<RawMftRecordFragment>> {
+    if record.len() < FILE_RECORD_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short raw MFT record",
+        ));
+    }
+    if &record[..4] != b"FILE" {
+        return Ok(None);
+    }
+
+    let flags = u16::from_le_bytes(
+        record[FILE_RECORD_FLAGS_OFFSET..FILE_RECORD_FLAGS_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
+    if flags & FILE_RECORD_FLAG_IN_USE == 0 {
+        return Ok(None);
+    }
+
+    let base_record_number = u64::from_le_bytes(
+        record[FILE_RECORD_BASE_RECORD_OFFSET..FILE_RECORD_BASE_RECORD_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    ) & 0x0000_FFFF_FFFF_FFFF;
+
+    let file_names = parse_file_name_attributes(record)?;
+    let data_sizes = parse_data_attribute_sizes(record).ok();
+    Ok(Some(RawMftRecordFragment {
+        record_number,
+        owner_record_number: if base_record_number == 0 {
+            record_number
+        } else {
+            base_record_number
+        },
+        file_name: choose_best_file_name_attribute(&file_names),
+        primary_name_count: file_names
+            .iter()
+            .filter(|file_name| file_name.namespace_rank > 1)
+            .count()
+            .try_into()
+            .unwrap_or(u16::MAX),
+        is_directory: flags & FILE_RECORD_FLAG_DIRECTORY != 0,
+        logical_size: data_sizes.as_ref().map(|sizes| sizes.0),
+        allocated_size: data_sizes.as_ref().map(|sizes| sizes.1),
+    }))
+}
+
+#[derive(Debug, Clone)]
 struct ParsedFileNameAttribute {
     parent_record_number: u64,
     attributes: u32,
@@ -1087,6 +1242,20 @@ struct ParsedFileNameAttribute {
 }
 
 fn parse_best_file_name_attribute(record: &[u8]) -> io::Result<Option<ParsedFileNameAttribute>> {
+    let file_names = parse_file_name_attributes(record)?;
+    Ok(choose_best_file_name_attribute(&file_names))
+}
+
+fn choose_best_file_name_attribute(
+    file_names: &[ParsedFileNameAttribute],
+) -> Option<ParsedFileNameAttribute> {
+    file_names
+        .iter()
+        .max_by_key(|candidate| candidate.namespace_rank)
+        .cloned()
+}
+
+fn parse_file_name_attributes(record: &[u8]) -> io::Result<Vec<ParsedFileNameAttribute>> {
     if record.len() < FILE_RECORD_HEADER_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -1094,7 +1263,7 @@ fn parse_best_file_name_attribute(record: &[u8]) -> io::Result<Option<ParsedFile
         ));
     }
 
-    let mut best: Option<ParsedFileNameAttribute> = None;
+    let mut file_names = Vec::new();
     let mut offset = u16::from_le_bytes(
         record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2]
             .try_into()
@@ -1139,12 +1308,7 @@ fn parse_best_file_name_attribute(record: &[u8]) -> io::Result<Option<ParsedFile
                             name,
                             namespace_rank: file_name_namespace_rank(namespace),
                         };
-                        if best
-                            .as_ref()
-                            .is_none_or(|current| candidate.namespace_rank > current.namespace_rank)
-                        {
-                            best = Some(candidate);
-                        }
+                        file_names.push(candidate);
                     }
                 }
             }
@@ -1153,7 +1317,7 @@ fn parse_best_file_name_attribute(record: &[u8]) -> io::Result<Option<ParsedFile
         offset += attr_len;
     }
 
-    Ok(best)
+    Ok(file_names)
 }
 
 fn file_name_namespace_rank(namespace: u8) -> u8 {
@@ -1197,10 +1361,6 @@ fn update_raw_mft_summary(summary: &mut RawMftSummary, record: ParsedRawMftRecor
             allocated_size: record.allocated_size,
         });
     }
-}
-
-fn update_raw_mft_index(build: &mut RawMftIndexBuild, record: ParsedRawMftRecord) {
-    build.push(record);
 }
 
 fn probe_raw_mft_from_file(
@@ -1482,9 +1642,9 @@ fn process_raw_mft_index_records(
         *next_record_number += 1;
 
         match apply_update_sequence_fixup(record, bytes_per_sector)
-            .and_then(|fixed| parse_raw_mft_record(fixed, record_number))
+            .and_then(|fixed| parse_raw_mft_record_fragment(fixed, record_number))
         {
-            Ok(Some(parsed)) => update_raw_mft_index(build, parsed),
+            Ok(Some(fragment)) => build.push_fragment(fragment),
             Ok(None) => {}
             Err(_) => build.summary.parse_errors += 1,
         }
@@ -1852,6 +2012,12 @@ fn parse_data_attribute_sizes(record: &[u8]) -> io::Result<(u64, u64, bool)> {
                         "short nonresident NTFS data attribute",
                     ));
                 }
+                let lowest_vcn =
+                    u64::from_le_bytes(record[offset + 0x10..offset + 0x18].try_into().unwrap());
+                if lowest_vcn != 0 {
+                    offset += attr_len;
+                    continue;
+                }
                 let allocated_size =
                     u64::from_le_bytes(record[offset + 0x28..offset + 0x30].try_into().unwrap());
                 let logical_size =
@@ -2029,6 +2195,15 @@ fn trim_wide_nul(buf: &[u16]) -> String {
 mod tests {
     use super::*;
 
+    fn file_name(parent_record_number: u64, name: &str, namespace_rank: u8) -> ParsedFileNameAttribute {
+        ParsedFileNameAttribute {
+            parent_record_number,
+            attributes: 0,
+            name: name.to_owned(),
+            namespace_rank,
+        }
+    }
+
     #[test]
     fn volume_device_from_drive_root() {
         assert_eq!(
@@ -2043,5 +2218,68 @@ mod tests {
             volume_device_from_root(Path::new("\\\\server\\share\\")),
             None
         );
+    }
+
+    #[test]
+    fn raw_mft_index_merges_extension_record_sizes_into_base() {
+        let mut build = RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024);
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 42,
+            owner_record_number: 42,
+            file_name: Some(file_name(5, "base.txt", 3)),
+            primary_name_count: 1,
+            is_directory: false,
+            logical_size: None,
+            allocated_size: None,
+        });
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 400,
+            owner_record_number: 42,
+            file_name: None,
+            primary_name_count: 0,
+            is_directory: false,
+            logical_size: Some(1234),
+            allocated_size: Some(4096),
+        });
+
+        let index = build.finish();
+        assert_eq!(index.entries.len(), 1);
+        let entry = &index.entries[0];
+        assert_eq!(entry.record_number, 42);
+        assert_eq!(entry.name.as_ref(), "base.txt");
+        assert_eq!(entry.logical_size, 1234);
+        assert_eq!(entry.allocated_size, 4096);
+        assert_eq!(index.summary.files_without_data_size, 0);
+    }
+
+    #[test]
+    fn raw_mft_index_uses_extension_name_when_base_record_has_none() {
+        let mut build = RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024);
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 77,
+            owner_record_number: 77,
+            file_name: None,
+            primary_name_count: 0,
+            is_directory: false,
+            logical_size: Some(7),
+            allocated_size: Some(8),
+        });
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 88,
+            owner_record_number: 77,
+            file_name: Some(file_name(5, "fallback.bin", 3)),
+            primary_name_count: 1,
+            is_directory: false,
+            logical_size: None,
+            allocated_size: None,
+        });
+
+        let index = build.finish();
+        assert_eq!(index.entries.len(), 1);
+        let entry = &index.entries[0];
+        assert_eq!(entry.record_number, 77);
+        assert_eq!(entry.name.as_ref(), "fallback.bin");
+        assert_eq!(entry.logical_size, 7);
+        assert_eq!(entry.allocated_size, 8);
     }
 }

@@ -2,6 +2,8 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+pub mod windows_ntfs;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

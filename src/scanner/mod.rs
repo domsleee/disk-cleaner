@@ -1,5 +1,9 @@
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub mod windows_ntfs;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -268,7 +272,25 @@ fn scan_directory_inner(
             macos::walk_dir_bulk(root_fd, root, root_name, root_hidden, &progress, &skip)
         }
     };
+    #[cfg(target_os = "windows")]
+    let mut root_node = {
+        let root_name: Box<str> = root
+            .file_name()
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| root.to_string_lossy().into_owned().into_boxed_str());
+        let root_hidden = std::fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&root_name, &m))
+            .unwrap_or_else(|_| root_name.starts_with('.'));
+
+        match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
+            windows::walk_dir_bulk(root_dir, root_name.clone(), root_hidden, &progress, &skip)
+        }) {
+            Ok(node) => node,
+            Err(_) => walk_dir(root, &progress, &skip),
+        }
+    };
     #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
@@ -292,7 +314,16 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
 #[cfg(target_os = "macos")]
 use macos::is_hidden_from_metadata;
 
+#[cfg(target_os = "windows")]
+fn is_hidden_from_metadata(name: &str, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    name.starts_with('.') || metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
 #[cfg(not(target_os = "macos"))]
+#[cfg(not(target_os = "windows"))]
 fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
@@ -629,6 +660,51 @@ mod tests {
             .find(|c| c.name() == "normal_dir")
             .expect("normal dir should appear in scan");
         assert!(!normal_node.is_hidden(), "normal dir should not be hidden");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_hidden_attribute(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let rc = unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) };
+        assert_ne!(rc, 0, "SetFileAttributesW failed");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_hidden_attribute_detected_as_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden_file = tmp.path().join("visible_name.txt");
+        fs::write(&hidden_file, "secret").unwrap();
+        set_hidden_attribute(&hidden_file);
+
+        fs::write(tmp.path().join("normal.txt"), "hello").unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        let hidden_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "visible_name.txt")
+            .expect("hidden file should appear in scan");
+        assert!(
+            hidden_node.is_hidden(),
+            "FILE_ATTRIBUTE_HIDDEN file should be marked hidden"
+        );
+
+        let normal_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "normal.txt")
+            .expect("normal file should appear in scan");
+        assert!(!normal_node.is_hidden(), "normal file should not be hidden");
     }
 
     #[test]

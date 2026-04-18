@@ -133,11 +133,7 @@ pub fn auto_expand(node: &mut FileNode, depth: usize, max_depth: usize) {
 
 #[cfg(test)]
 pub fn leaf(name: &str, size: u64) -> FileNode {
-    FileNode::File(FileLeaf::new(
-        name.into(),
-        size,
-        name.starts_with('.'),
-    ))
+    FileNode::File(FileLeaf::new(name.into(), size, name.starts_with('.')))
 }
 
 #[cfg(test)]

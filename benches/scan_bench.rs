@@ -8,10 +8,16 @@
 //! ```
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use disk_cleaner::categories;
 use disk_cleaner::scanner::{self, ScanProgress};
+use disk_cleaner::treemap;
 use disk_cleaner::tree::FileNode;
+use disk_cleaner::ui;
+use eframe::egui;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashSet;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -62,6 +68,130 @@ fn new_progress() -> Arc<ScanProgress> {
 
 fn count_nodes(node: &FileNode) -> usize {
     1 + node.children().iter().map(count_nodes).sum::<usize>()
+}
+
+fn count_treemap_tiles(cache: &treemap::TreemapCache) -> usize {
+    cache.tiles.len()
+        + cache.other.iter().count()
+        + cache.tiles.iter().map(|tile| tile.nested.len()).sum::<usize>()
+}
+
+fn measure_retained<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+    let before = ALLOCATED.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let value = f();
+    let after = ALLOCATED.load(Ordering::SeqCst);
+    let peak = PEAK.load(Ordering::SeqCst);
+    (
+        value,
+        after.saturating_sub(before),
+        peak.saturating_sub(before),
+    )
+}
+
+fn print_memory_line(
+    label: &str,
+    delta: usize,
+    peak: usize,
+    node_count: usize,
+    extra: impl std::fmt::Display,
+) {
+    eprintln!(
+        "    {label:22} | {:>10} delta | {:>10} peak | {:.0} b/node | {extra}",
+        bytesize::ByteSize::b(delta as u64),
+        bytesize::ByteSize::b(peak as u64),
+        delta as f64 / node_count as f64,
+    );
+}
+
+fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
+    reset_tracking();
+
+    let progress = new_progress();
+    let (mut tree, tree_delta, tree_peak) =
+        measure_retained(|| scanner::scan_directory(path, progress.clone()));
+    let node_count = count_nodes(&tree);
+    let file_count = progress.file_count.load(Ordering::Relaxed);
+    let scan_size = progress.total_size.load(Ordering::Relaxed);
+
+    disk_cleaner::tree::auto_expand(&mut tree, 0, 2);
+
+    eprintln!(
+        "  {label:8} | {file_count:>9} files | {node_count:>9} nodes | scanned {}",
+        bytesize::ByteSize::b(scan_size),
+    );
+    print_memory_line(
+        "scanner tree",
+        tree_delta,
+        tree_peak,
+        node_count,
+        format_args!("{file_count} files"),
+    );
+
+    let expanded_file_groups: HashSet<PathBuf> = HashSet::new();
+    let (rows, rows_delta, rows_peak) = measure_retained(|| {
+        ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded_file_groups))
+    });
+    print_memory_line(
+        "row cache (unfiltered)",
+        rows_delta,
+        rows_peak,
+        node_count,
+        format_args!("{} rows", rows.len()),
+    );
+    drop(rows);
+
+    if let Some((cat, _, _)) = categories::compute_stats(&tree).entries.first().copied() {
+        let (cat_cache, cache_delta, cache_peak) =
+            measure_retained(|| ui::build_category_match_cache(&tree, cat));
+        print_memory_line(
+            &format!("category cache ({})", cat.label()),
+            cache_delta,
+            cache_peak,
+            node_count,
+            format_args!("{} cached paths", cat_cache.len()),
+        );
+
+        let (filtered_rows, filtered_rows_delta, filtered_rows_peak) = measure_retained(|| {
+            ui::collect_cached_rows(
+                &tree,
+                "",
+                Some(cat),
+                true,
+                None,
+                Some(&cat_cache),
+                Some(&expanded_file_groups),
+            )
+        });
+        print_memory_line(
+            &format!("rows ({})", cat.label()),
+            filtered_rows_delta,
+            filtered_rows_peak,
+            node_count,
+            format_args!("{} rows", filtered_rows.len()),
+        );
+        drop(filtered_rows);
+        drop(cat_cache);
+    }
+
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+    let (treemap_cache, treemap_delta, treemap_peak) =
+        measure_retained(|| treemap::build_treemap_cache(&tree, &None, None, true, full_rect));
+    print_memory_line(
+        "treemap cache",
+        treemap_delta,
+        treemap_peak,
+        node_count,
+        format_args!(
+            "{} tiles / {} crumbs",
+            count_treemap_tiles(&treemap_cache),
+            treemap_cache.breadcrumbs.len()
+        ),
+    );
+    drop(treemap_cache);
+
+    eprintln!("    text cache                | skipped by default (search UI currently hidden)");
+    std::hint::black_box(tree);
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -258,7 +388,7 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
 
     // One-time memory report for each real directory (only when selected).
     if should_emit_side_reports() {
-        eprintln!("\n=== Real Scan Memory Report ===");
+        eprintln!("\n=== Real Scan Memory Breakdown ===");
         for (label, id, path) in [
             (
                 "~/git",
@@ -277,22 +407,7 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
                 continue;
             }
             if let Some(ref p) = path {
-                reset_tracking();
-                let before = ALLOCATED.load(Ordering::SeqCst);
-                let progress = new_progress();
-                let tree = scanner::scan_directory(p, progress.clone());
-                let after = ALLOCATED.load(Ordering::SeqCst);
-                let peak = PEAK.load(Ordering::SeqCst);
-                let delta = after.saturating_sub(before);
-                let nodes = count_nodes(&tree);
-                let files = progress.file_count.load(Ordering::Relaxed);
-                eprintln!(
-                    "  {label:8} | {files:>9} files | {nodes:>9} nodes | {:>6.1} MB delta | {:>6.1} MB peak | {:.0} b/node",
-                    delta as f64 / 1e6,
-                    peak as f64 / 1e6,
-                    delta as f64 / nodes as f64,
-                );
-                std::hint::black_box(tree);
+                print_real_scan_breakdown(label, p);
             }
         }
         eprintln!("===============================\n");

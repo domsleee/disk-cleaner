@@ -1,19 +1,29 @@
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
+use std::io::Read;
+use std::io::{Seek, SeekFrom};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE,
-    ERROR_NO_MORE_FILES, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LUID,
+};
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_NAME_NORMALIZED, FileIdType,
-    FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_DESCRIPTOR,
+    FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_NAME_NORMALIZED, FileIdType, FileStandardInfo,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, OpenFileById, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -22,16 +32,22 @@ use windows_sys::Win32::System::Ioctl::{
     MFT_ENUM_DATA_V0, NTFS_FILE_RECORD_INPUT_BUFFER, NTFS_FILE_RECORD_OUTPUT_BUFFER,
     NTFS_VOLUME_DATA_BUFFER, USN_RECORD_V2, USN_RECORD_V3,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const DRIVE_FIXED: u32 = 3;
 const OUT_BUF_SIZE: usize = 1024 * 1024;
 const SAMPLE_LIMIT: usize = 16;
 const USN_PAGE_HEADER_SIZE: usize = size_of::<u64>();
 const ATTR_TYPE_DATA: u32 = 0x80;
+const ATTR_TYPE_FILE_NAME: u32 = 0x30;
 const ATTR_TYPE_END: u32 = 0xFFFF_FFFF;
 const FILE_RECORD_HEADER_SIZE: usize = 0x30;
 const FILE_RECORD_ATTR_OFFSET: usize = 0x14;
+const FILE_RECORD_FLAGS_OFFSET: usize = 0x16;
 const NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE: usize = size_of::<i64>() + size_of::<u32>();
+const FILE_RECORD_FLAG_IN_USE: u16 = 0x0001;
+const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
+const FILE_NAME_VALUE_MIN_SIZE: usize = 0x42;
 
 #[derive(Debug, Clone)]
 pub struct NtfsEligibility {
@@ -101,6 +117,36 @@ pub struct NtfsEnumSummary {
     pub next_file_reference_number: u64,
     pub truncated: bool,
     pub samples: Vec<NtfsRecordSample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawMftRecordSample {
+    pub record_number: u64,
+    pub parent_record_number: u64,
+    pub attributes: u32,
+    pub name: String,
+    pub is_directory: bool,
+    pub logical_size: Option<u64>,
+    pub allocated_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RawMftSummary {
+    pub volume_root: PathBuf,
+    pub volume_device: String,
+    pub mft_path: PathBuf,
+    pub bytes_per_file_record: u32,
+    pub mft_valid_data_length: u64,
+    pub records_scanned: u64,
+    pub in_use_records: u64,
+    pub invalid_records: u64,
+    pub directories: u64,
+    pub files: u64,
+    pub hidden: u64,
+    pub named_records: u64,
+    pub parse_errors: u64,
+    pub truncated: bool,
+    pub samples: Vec<RawMftRecordSample>,
 }
 
 pub fn ntfs_eligibility(path: &Path) -> io::Result<NtfsEligibility> {
@@ -283,6 +329,70 @@ pub fn query_size_from_file_record_for_sample(
     let mut output_buf =
         vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_size as usize];
     query_sizes_from_file_record(volume_handle.0, sample, &mut output_buf)
+}
+
+pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<RawMftSummary> {
+    let eligibility = ntfs_eligibility(path)?;
+    if !eligibility.is_ntfs() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{} is on {}, not NTFS",
+                path.display(),
+                eligibility.filesystem_name
+            ),
+        ));
+    }
+
+    let volume_handle = open_volume(&eligibility.volume_device)?;
+    let volume_data = ntfs_volume_data(volume_handle.0)?;
+    let record_size = volume_data.BytesPerFileRecordSegment as usize;
+    if record_size < FILE_RECORD_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid NTFS file record size: {}",
+                volume_data.BytesPerFileRecordSegment
+            ),
+        ));
+    }
+
+    let mft_path = eligibility.volume_root.join("$MFT");
+    let valid_len = u64::try_from(volume_data.MftValidDataLength).unwrap_or_default();
+    let total_records = (valid_len / record_size as u64) as usize;
+    let target_records = limit.unwrap_or(total_records).min(total_records);
+
+    let mut summary = RawMftSummary {
+        volume_root: eligibility.volume_root,
+        volume_device: eligibility.volume_device.clone(),
+        mft_path,
+        bytes_per_file_record: volume_data.BytesPerFileRecordSegment,
+        mft_valid_data_length: valid_len,
+        ..RawMftSummary::default()
+    };
+
+    let mft_valid_data_length = summary.mft_valid_data_length;
+    if let Ok(mut file) = open_raw_ntfs_file(&summary.mft_path) {
+        probe_raw_mft_from_file(
+            &mut file,
+            record_size,
+            target_records,
+            &mut summary,
+            mft_valid_data_length,
+        )?;
+    } else {
+        probe_raw_mft_via_volume(
+            &eligibility.volume_device,
+            volume_handle.0,
+            &volume_data,
+            record_size,
+            target_records,
+            &mut summary,
+        )?;
+    }
+
+    summary.truncated = limit.is_some_and(|cap| cap < total_records);
+    Ok(summary)
 }
 
 struct HandleGuard(HANDLE);
@@ -567,6 +677,508 @@ fn ntfs_volume_data(volume_handle: HANDLE) -> io::Result<NTFS_VOLUME_DATA_BUFFER
     Ok(volume_data)
 }
 
+fn open_raw_ntfs_file(path: &Path) -> io::Result<File> {
+    let wide = wide_null(path.as_os_str());
+    let handle = open_raw_ntfs_file_handle(&wide);
+    if handle == INVALID_HANDLE_VALUE {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+            return Err(err);
+        }
+
+        enable_backup_privilege()?;
+        let handle = open_raw_ntfs_file_handle(&wide);
+        if handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+    } else {
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+}
+
+fn open_raw_volume_file(device: &str) -> io::Result<File> {
+    let wide = wide_null(OsStr::new(device));
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+}
+
+fn open_raw_ntfs_file_handle(wide: &[u16]) -> HANDLE {
+    unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    }
+}
+
+fn enable_backup_privilege() -> io::Result<()> {
+    let mut token = INVALID_HANDLE_VALUE;
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = HandleGuard(token);
+
+    let mut luid = LUID::default();
+    let privilege = wide_null(OsStr::new("SeBackupPrivilege"));
+    let ok = unsafe { LookupPrivilegeValueW(ptr::null(), privilege.as_ptr(), &mut luid) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let ok = unsafe {
+        AdjustTokenPrivileges(
+            token.0,
+            0,
+            &mut privileges,
+            size_of::<TOKEN_PRIVILEGES>() as u32,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let err = unsafe { GetLastError() };
+    if err == ERROR_NOT_ALL_ASSIGNED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SeBackupPrivilege is not available on this token",
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ParsedRawMftRecord {
+    record_number: u64,
+    parent_record_number: u64,
+    attributes: u32,
+    name: String,
+    is_directory: bool,
+    logical_size: Option<u64>,
+    allocated_size: Option<u64>,
+}
+
+fn parse_raw_mft_record(record: &[u8], record_number: u64) -> io::Result<Option<ParsedRawMftRecord>> {
+    if record.len() < FILE_RECORD_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short raw MFT record",
+        ));
+    }
+    if &record[..4] != b"FILE" {
+        return Ok(None);
+    }
+
+    let flags = u16::from_le_bytes(
+        record[FILE_RECORD_FLAGS_OFFSET..FILE_RECORD_FLAGS_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    );
+    if flags & FILE_RECORD_FLAG_IN_USE == 0 {
+        return Ok(None);
+    }
+
+    let file_name = parse_best_file_name_attribute(record)?;
+    let Some(file_name) = file_name else {
+        return Ok(None);
+    };
+
+    let data_sizes = parse_data_attribute_sizes(record).ok();
+    Ok(Some(ParsedRawMftRecord {
+        record_number,
+        parent_record_number: file_name.parent_record_number,
+        attributes: file_name.attributes,
+        name: file_name.name,
+        is_directory: flags & FILE_RECORD_FLAG_DIRECTORY != 0,
+        logical_size: data_sizes.as_ref().map(|sizes| sizes.0),
+        allocated_size: data_sizes.as_ref().map(|sizes| sizes.1),
+    }))
+}
+
+#[derive(Debug)]
+struct ParsedFileNameAttribute {
+    parent_record_number: u64,
+    attributes: u32,
+    name: String,
+    namespace_rank: u8,
+}
+
+fn parse_best_file_name_attribute(record: &[u8]) -> io::Result<Option<ParsedFileNameAttribute>> {
+    if record.len() < FILE_RECORD_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short NTFS file record header",
+        ));
+    }
+
+    let mut best: Option<ParsedFileNameAttribute> = None;
+    let mut offset = u16::from_le_bytes(
+        record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+
+    while offset + 8 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+        if attr_type == ATTR_TYPE_END {
+            break;
+        }
+
+        let attr_len = u32::from_le_bytes(record[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if attr_len < 0x18 || offset + attr_len > record.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid NTFS attribute length in raw MFT record",
+            ));
+        }
+
+        let nonresident = record[offset + 8] != 0;
+        if attr_type == ATTR_TYPE_FILE_NAME && !nonresident {
+            let value_len =
+                u32::from_le_bytes(record[offset + 0x10..offset + 0x14].try_into().unwrap()) as usize;
+            let value_offset =
+                u16::from_le_bytes(record[offset + 0x14..offset + 0x16].try_into().unwrap()) as usize;
+            if value_offset + value_len <= attr_len {
+                let value = &record[offset + value_offset..offset + value_offset + value_len];
+                if value.len() >= FILE_NAME_VALUE_MIN_SIZE {
+                    let name_len = value[0x40] as usize;
+                    let namespace = value[0x41];
+                    let name_bytes = name_len * size_of::<u16>();
+                    if FILE_NAME_VALUE_MIN_SIZE + name_bytes <= value.len() {
+                        let name = wide_name_from_record(value, FILE_NAME_VALUE_MIN_SIZE, name_bytes)?;
+                        let parent_ref =
+                            u64::from_le_bytes(value[..8].try_into().unwrap()) & 0x0000_FFFF_FFFF_FFFF;
+                        let attributes =
+                            u32::from_le_bytes(value[0x38..0x3C].try_into().unwrap());
+                        let candidate = ParsedFileNameAttribute {
+                            parent_record_number: parent_ref,
+                            attributes,
+                            name,
+                            namespace_rank: file_name_namespace_rank(namespace),
+                        };
+                        if best
+                            .as_ref()
+                            .is_none_or(|current| candidate.namespace_rank > current.namespace_rank)
+                        {
+                            best = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        offset += attr_len;
+    }
+
+    Ok(best)
+}
+
+fn file_name_namespace_rank(namespace: u8) -> u8 {
+    match namespace {
+        3 => 4, // Win32 + DOS
+        1 => 3, // Win32
+        0 => 2, // POSIX
+        2 => 1, // DOS only
+        _ => 0,
+    }
+}
+
+fn update_raw_mft_summary(summary: &mut RawMftSummary, record: ParsedRawMftRecord) {
+    summary.in_use_records += 1;
+    summary.named_records += 1;
+    if record.attributes & FILE_ATTRIBUTE_HIDDEN != 0 {
+        summary.hidden += 1;
+    }
+    if record.is_directory {
+        summary.directories += 1;
+    } else {
+        summary.files += 1;
+    }
+
+    if summary.samples.len() < SAMPLE_LIMIT {
+        summary.samples.push(RawMftRecordSample {
+            record_number: record.record_number,
+            parent_record_number: record.parent_record_number,
+            attributes: record.attributes,
+            name: record.name,
+            is_directory: record.is_directory,
+            logical_size: record.logical_size,
+            allocated_size: record.allocated_size,
+        });
+    }
+}
+
+fn probe_raw_mft_from_file(
+    file: &mut File,
+    record_size: usize,
+    target_records: usize,
+    summary: &mut RawMftSummary,
+    mut bytes_remaining: u64,
+) -> io::Result<()> {
+    let records_per_chunk = (1024 * 1024 / record_size).max(1);
+    let mut buf = vec![0u8; records_per_chunk * record_size];
+    let mut next_record_number = 0u64;
+    let mut remaining_records = target_records;
+
+    while remaining_records > 0 && bytes_remaining > 0 {
+        let records_this_chunk = remaining_records.min(records_per_chunk);
+        let bytes_this_chunk = records_this_chunk * record_size;
+        let bytes_to_read = bytes_this_chunk.min(bytes_remaining as usize);
+        let mut filled = 0usize;
+
+        while filled < bytes_to_read {
+            let read = file.read(&mut buf[filled..bytes_to_read])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+
+        let complete_records = filled / record_size;
+        if complete_records == 0 {
+            break;
+        }
+
+        process_raw_mft_records(
+            &buf[..complete_records * record_size],
+            &mut next_record_number,
+            summary,
+        );
+
+        let consumed = complete_records * record_size;
+        remaining_records = remaining_records.saturating_sub(complete_records);
+        bytes_remaining = bytes_remaining.saturating_sub(consumed as u64);
+        if complete_records * record_size < bytes_to_read {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn probe_raw_mft_via_volume(
+    volume_device: &str,
+    volume_handle: HANDLE,
+    volume_data: &NTFS_VOLUME_DATA_BUFFER,
+    record_size: usize,
+    target_records: usize,
+    summary: &mut RawMftSummary,
+) -> io::Result<()> {
+    let mut output_buf =
+        vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + volume_data.BytesPerFileRecordSegment as usize];
+    let mft_record = query_file_record_bytes(volume_handle, 0, &mut output_buf)?;
+    let data_runs = parse_nonresident_data_runs(mft_record)?;
+    let bytes_per_cluster = volume_data.BytesPerCluster as u64;
+    let mut volume_file = open_raw_volume_file(volume_device)?;
+    let mut next_record_number = 0u64;
+    let mut bytes_remaining = summary.mft_valid_data_length;
+    let mut partial = Vec::<u8>::new();
+    let mut io_buf = vec![0u8; 4 * 1024 * 1024];
+
+    for run in data_runs {
+        if bytes_remaining == 0 || next_record_number as usize >= target_records {
+            break;
+        }
+        if run.start_lcn < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("negative LCN in MFT runlist: {}", run.start_lcn),
+            ));
+        }
+
+        let run_offset = run.start_lcn as u64 * bytes_per_cluster;
+        let mut run_bytes_left = run.cluster_len.saturating_mul(bytes_per_cluster);
+        volume_file.seek(SeekFrom::Start(run_offset))?;
+
+        while run_bytes_left > 0
+            && bytes_remaining > 0
+            && (next_record_number as usize) < target_records
+        {
+            let chunk = usize::try_from(run_bytes_left.min(bytes_remaining))
+                .unwrap_or(usize::MAX)
+                .min(io_buf.len());
+            let read = volume_file.read(&mut io_buf[..chunk])?;
+            if read == 0 {
+                break;
+            }
+
+            run_bytes_left = run_bytes_left.saturating_sub(read as u64);
+            bytes_remaining = bytes_remaining.saturating_sub(read as u64);
+            partial.extend_from_slice(&io_buf[..read]);
+
+            let ready_records =
+                (partial.len() / record_size).min(target_records.saturating_sub(next_record_number as usize));
+            if ready_records == 0 {
+                continue;
+            }
+
+            let ready_bytes = ready_records * record_size;
+            process_raw_mft_records(&partial[..ready_bytes], &mut next_record_number, summary);
+            partial = partial.split_off(ready_bytes);
+        }
+    }
+
+    Ok(())
+}
+
+fn process_raw_mft_records(buf: &[u8], next_record_number: &mut u64, summary: &mut RawMftSummary) {
+    for record in buf.chunks_exact(summary.bytes_per_file_record as usize) {
+        summary.records_scanned += 1;
+        let record_number = *next_record_number;
+        *next_record_number += 1;
+
+        match parse_raw_mft_record(record, record_number) {
+            Ok(Some(parsed)) => update_raw_mft_summary(summary, parsed),
+            Ok(None) => {}
+            Err(_) => summary.parse_errors += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DataRun {
+    start_lcn: i64,
+    cluster_len: u64,
+}
+
+fn parse_nonresident_data_runs(record: &[u8]) -> io::Result<Vec<DataRun>> {
+    let mut offset = u16::from_le_bytes(
+        record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+
+    while offset + 8 <= record.len() {
+        let attr_type = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+        if attr_type == ATTR_TYPE_END {
+            break;
+        }
+
+        let attr_len = u32::from_le_bytes(record[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if attr_len < 0x18 || offset + attr_len > record.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid NTFS attribute length in runlist parse",
+            ));
+        }
+
+        let nonresident = record[offset + 8] != 0;
+        let name_len = record[offset + 9];
+        if attr_type == ATTR_TYPE_DATA && nonresident && name_len == 0 {
+            let data_run_offset =
+                u16::from_le_bytes(record[offset + 0x20..offset + 0x22].try_into().unwrap()) as usize;
+            if data_run_offset >= attr_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid NTFS data run offset",
+                ));
+            }
+            return parse_data_runs(&record[offset + data_run_offset..offset + attr_len]);
+        }
+
+        offset += attr_len;
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "default nonresident NTFS data attribute not found",
+    ))
+}
+
+fn parse_data_runs(buf: &[u8]) -> io::Result<Vec<DataRun>> {
+    let mut runs = Vec::new();
+    let mut offset = 0usize;
+    let mut current_lcn = 0i64;
+
+    while offset < buf.len() {
+        let header = buf[offset];
+        offset += 1;
+        if header == 0 {
+            break;
+        }
+
+        let len_size = (header & 0x0F) as usize;
+        let off_size = (header >> 4) as usize;
+        if len_size == 0 || offset + len_size + off_size > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid NTFS data run header",
+            ));
+        }
+
+        let cluster_len = le_unsigned(&buf[offset..offset + len_size]);
+        offset += len_size;
+        let lcn_delta = le_signed(&buf[offset..offset + off_size]);
+        offset += off_size;
+        current_lcn = current_lcn.saturating_add(lcn_delta);
+
+        runs.push(DataRun {
+            start_lcn: current_lcn,
+            cluster_len,
+        });
+    }
+
+    Ok(runs)
+}
+
+fn le_unsigned(buf: &[u8]) -> u64 {
+    let mut out = 0u64;
+    for (idx, byte) in buf.iter().copied().enumerate() {
+        out |= (byte as u64) << (idx * 8);
+    }
+    out
+}
+
+fn le_signed(buf: &[u8]) -> i64 {
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut out = 0i64;
+    for (idx, byte) in buf.iter().copied().enumerate() {
+        out |= (byte as i64) << (idx * 8);
+    }
+    let shift = (8 - buf.len()) * 8;
+    (out << shift) >> shift
+}
+
 fn query_sizes_from_file_record(
     volume_handle: HANDLE,
     sample: &NtfsRecordSample,
@@ -588,8 +1200,22 @@ fn query_sizes_from_file_record(
             format!("file id does not fit in i64: 0x{:x}", sample.file_id),
         )
     })?;
+    let record = query_file_record_bytes(volume_handle, file_id, output_buf)?;
+    let (logical_size, allocated_size, resident_data) = parse_data_attribute_sizes(record)?;
+    Ok(FileRecordSizeSample {
+        logical_size,
+        allocated_size,
+        resident_data,
+    })
+}
+
+fn query_file_record_bytes<'a>(
+    volume_handle: HANDLE,
+    file_reference_number: i64,
+    output_buf: &'a mut [u8],
+) -> io::Result<&'a [u8]> {
     let mut input = NTFS_FILE_RECORD_INPUT_BUFFER {
-        FileReferenceNumber: file_id,
+        FileReferenceNumber: file_reference_number,
     };
     let mut bytes_returned = 0u32;
     let ok = unsafe {
@@ -632,14 +1258,8 @@ fn query_sizes_from_file_record(
         ));
     }
 
-    let record = &output_buf
-        [NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE..NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_length];
-    let (logical_size, allocated_size, resident_data) = parse_data_attribute_sizes(record)?;
-    Ok(FileRecordSizeSample {
-        logical_size,
-        allocated_size,
-        resident_data,
-    })
+    Ok(&output_buf
+        [NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE..NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_length])
 }
 
 fn open_handle_by_id(volume_handle: HANDLE, sample: &NtfsRecordSample) -> io::Result<HandleGuard> {

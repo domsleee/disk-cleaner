@@ -25,7 +25,7 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSData"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -85,5 +85,17 @@ required-features = ["internal-tools"]
 [[bin]]
 name = "bench_perf"
 path = "src/bin/bench_perf.rs"
+bench = false
+required-features = ["internal-tools"]
+
+[[bin]]
+name = "ntfs_probe"
+path = "src/bin/ntfs_probe.rs"
+bench = false
+required-features = ["internal-tools"]
+
+[[bin]]
+name = "ntfs_size_probe"
+path = "src/bin/ntfs_size_probe.rs"
 bench = false
 required-features = ["internal-tools"]

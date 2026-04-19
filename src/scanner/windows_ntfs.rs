@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use rayon::iter::IntoParallelIterator;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use smallvec::SmallVec;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE,
     ERROR_NO_MORE_FILES, ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, GetLastError, HANDLE,
@@ -62,6 +63,8 @@ const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 const FILE_NAME_VALUE_MIN_SIZE: usize = 0x42;
 const NTFS_VOLUME_ROOT_RECORD_NUMBER: u64 = 5;
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+type ParsedFileNameList = SmallVec<[ParsedFileNameAttribute; 2]>;
 
 #[derive(Debug, Clone)]
 pub struct NtfsEligibility {
@@ -486,19 +489,28 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
 }
 
 pub fn build_raw_mft_index_for_path(path: &Path, limit: Option<usize>) -> io::Result<RawMftIndex> {
-    Ok(build_raw_mft_index_for_path_impl(path, limit)?.0)
+    Ok(build_raw_mft_index_for_path_impl(path, limit, true)?.0)
 }
 
 pub fn build_raw_mft_index_for_path_profiled(
     path: &Path,
     limit: Option<usize>,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
-    build_raw_mft_index_for_path_impl(path, limit)
+    build_raw_mft_index_for_path_impl(path, limit, true)
+}
+
+pub fn build_raw_mft_index_for_path_profiled_with_preference(
+    path: &Path,
+    limit: Option<usize>,
+    prefer_volume: bool,
+) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
+    build_raw_mft_index_for_path_impl(path, limit, prefer_volume)
 }
 
 fn build_raw_mft_index_for_path_impl(
     path: &Path,
     limit: Option<usize>,
+    prefer_volume: bool,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
     let start = Instant::now();
     let eligibility = ntfs_eligibility(path)?;
@@ -542,16 +554,30 @@ fn build_raw_mft_index_for_path_impl(
         ..RawMftBuildTimings::default()
     };
 
-    if let Ok(mut file) = open_raw_ntfs_file(&mft_path) {
-        build_raw_mft_index_from_file(
-            &mut file,
-            record_size,
-            volume_data.BytesPerSector as usize,
-            target_records,
-            valid_len,
-            &mut raw,
-            &mut timings,
-        )?;
+    if !prefer_volume {
+        if let Ok(mut file) = open_raw_ntfs_file(&mft_path) {
+            build_raw_mft_index_from_file(
+                &mut file,
+                record_size,
+                volume_data.BytesPerSector as usize,
+                target_records,
+                valid_len,
+                &mut raw,
+                &mut timings,
+            )?;
+        } else {
+            build_raw_mft_index_via_volume(
+                &eligibility.volume_device,
+                volume_handle.0,
+                &volume_data,
+                record_size,
+                volume_data.BytesPerSector as usize,
+                target_records,
+                valid_len,
+                &mut raw,
+                &mut timings,
+            )?;
+        }
     } else {
         build_raw_mft_index_via_volume(
             &eligibility.volume_device,
@@ -1096,7 +1122,7 @@ struct ParsedRawMftRecord {
 struct RawMftRecordFragment {
     record_number: u64,
     owner_record_number: u64,
-    file_names: Vec<ParsedFileNameAttribute>,
+    file_names: ParsedFileNameList,
     is_directory: bool,
     logical_size: Option<u64>,
     allocated_size: Option<u64>,
@@ -1107,7 +1133,7 @@ struct RawMftRecordFragment {
 #[derive(Debug)]
 struct RawMftIndexAggregate {
     record_number: u64,
-    file_names: Vec<ParsedFileNameAttribute>,
+    file_names: ParsedFileNameList,
     is_directory: bool,
     logical_size: Option<u64>,
     allocated_size: Option<u64>,
@@ -1513,7 +1539,7 @@ struct ParsedFileNameAttribute {
 }
 
 struct ScannedRawMftAttributes {
-    file_names: Vec<ParsedFileNameAttribute>,
+    file_names: ParsedFileNameList,
     data_sizes: Option<(u64, u64, bool)>,
     is_name_surrogate_reparse: bool,
 }
@@ -1528,14 +1554,18 @@ fn choose_best_file_name_attribute(
 }
 
 fn materialized_file_names(
-    mut file_names: Vec<ParsedFileNameAttribute>,
+    mut file_names: ParsedFileNameList,
     max_names: usize,
-) -> Vec<ParsedFileNameAttribute> {
+) -> ParsedFileNameList {
     if file_names.is_empty() {
         return file_names;
     }
     if file_names.len() == 1 {
-        return if max_names == 0 { Vec::new() } else { file_names };
+        return if max_names == 0 {
+            SmallVec::new()
+        } else {
+            file_names
+        };
     }
     if file_names.len() == 2 {
         return materialized_file_names_pair(file_names, max_names);
@@ -1550,7 +1580,7 @@ fn materialized_file_names(
         ))
     });
 
-    let mut materialized: Vec<ParsedFileNameAttribute> = Vec::with_capacity(file_names.len());
+    let mut materialized: ParsedFileNameList = SmallVec::with_capacity(file_names.len());
     for candidate in file_names.into_iter() {
         if let Some(existing) = materialized.last_mut() {
             if existing.parent_record_number == candidate.parent_record_number
@@ -1587,11 +1617,11 @@ fn materialized_file_names(
 }
 
 fn materialized_file_names_pair(
-    mut file_names: Vec<ParsedFileNameAttribute>,
+    mut file_names: ParsedFileNameList,
     max_names: usize,
-) -> Vec<ParsedFileNameAttribute> {
+) -> ParsedFileNameList {
     if max_names == 0 {
-        return Vec::new();
+        return SmallVec::new();
     }
 
     let b = file_names.pop().unwrap();
@@ -1603,10 +1633,12 @@ fn materialized_file_names_pair(
     };
 
     if a.parent_record_number == b.parent_record_number && a.name == b.name {
-        return vec![if a.namespace_rank >= b.namespace_rank { a } else { b }];
+        let mut out = ParsedFileNameList::new();
+        out.push(if a.namespace_rank >= b.namespace_rank { a } else { b });
+        return out;
     }
 
-    let mut materialized = Vec::with_capacity(2);
+    let mut materialized = ParsedFileNameList::new();
     if a.namespace_rank > 1 {
         materialized.push(a);
     }
@@ -1615,7 +1647,9 @@ fn materialized_file_names_pair(
     }
 
     if materialized.is_empty() {
-        return vec![fallback_best];
+        let mut out = ParsedFileNameList::new();
+        out.push(fallback_best);
+        return out;
     }
     if materialized.len() == 1 {
         return materialized;
@@ -1630,7 +1664,9 @@ fn materialized_file_names_pair(
         } else {
             1
         };
-        return vec![materialized.swap_remove(best_idx)];
+        let mut out = ParsedFileNameList::new();
+        out.push(materialized.swap_remove(best_idx));
+        return out;
     }
 
     materialized
@@ -1662,7 +1698,7 @@ fn scan_raw_mft_attributes(record: &[u8]) -> io::Result<ScannedRawMftAttributes>
         ));
     }
 
-    let mut file_names = Vec::new();
+    let mut file_names = ParsedFileNameList::new();
     let mut data_sizes = None;
     let mut is_name_surrogate_reparse = false;
     let mut offset = u16::from_le_bytes(
@@ -1992,6 +2028,25 @@ fn probe_raw_mft_via_volume(
 
             run_bytes_left = run_bytes_left.saturating_sub(read as u64);
             bytes_remaining = bytes_remaining.saturating_sub(read as u64);
+
+            if partial.is_empty() {
+                let ready_records =
+                    (read / record_size).min(target_records.saturating_sub(next_record_number as usize));
+                let ready_bytes = ready_records * record_size;
+                if ready_bytes > 0 {
+                    process_raw_mft_records(
+                        &mut io_buf[..ready_bytes],
+                        bytes_per_sector,
+                        &mut next_record_number,
+                        summary,
+                    );
+                }
+                if ready_bytes < read {
+                    partial.extend_from_slice(&io_buf[ready_bytes..read]);
+                }
+                continue;
+            }
+
             partial.extend_from_slice(&io_buf[..read]);
 
             let ready_records =
@@ -2007,7 +2062,13 @@ fn probe_raw_mft_via_volume(
                 &mut next_record_number,
                 summary,
             );
-            partial = partial.split_off(ready_bytes);
+            let leftover = partial.len() - ready_bytes;
+            if leftover == 0 {
+                partial.clear();
+            } else {
+                partial.copy_within(ready_bytes.., 0);
+                partial.truncate(leftover);
+            }
         }
     }
 
@@ -2067,6 +2128,29 @@ fn build_raw_mft_index_via_volume(
 
             run_bytes_left = run_bytes_left.saturating_sub(read as u64);
             bytes_remaining = bytes_remaining.saturating_sub(read as u64);
+
+            if partial.is_empty() {
+                let ready_records =
+                    (read / record_size).min(target_records.saturating_sub(next_record_number as usize));
+                let ready_bytes = ready_records * record_size;
+                if ready_bytes > 0 {
+                    let process_start = Instant::now();
+                    process_raw_mft_index_records(
+                        &mut io_buf[..ready_bytes],
+                        record_size,
+                        bytes_per_sector,
+                        &mut next_record_number,
+                        build,
+                        timings,
+                    );
+                    timings.process += process_start.elapsed();
+                }
+                if ready_bytes < read {
+                    partial.extend_from_slice(&io_buf[ready_bytes..read]);
+                }
+                continue;
+            }
+
             partial.extend_from_slice(&io_buf[..read]);
 
             let ready_records =
@@ -2086,7 +2170,13 @@ fn build_raw_mft_index_via_volume(
                 timings,
             );
             timings.process += process_start.elapsed();
-            partial = partial.split_off(ready_bytes);
+            let leftover = partial.len() - ready_bytes;
+            if leftover == 0 {
+                partial.clear();
+            } else {
+                partial.copy_within(ready_bytes.., 0);
+                partial.truncate(leftover);
+            }
         }
     }
 
@@ -2151,6 +2241,38 @@ fn process_raw_mft_index_records(
 }
 
 fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io::Result<&[u8]> {
+    if bytes_per_sector == 512 && record.len() == 1024 {
+        return apply_update_sequence_fixup_1k(record);
+    }
+    apply_update_sequence_fixup_generic(record, bytes_per_sector)
+}
+
+fn apply_update_sequence_fixup_1k(record: &mut [u8]) -> io::Result<&[u8]> {
+    let usa_offset = u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize;
+    let usa_count = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
+    if usa_count == 3 && usa_offset + 6 <= record.len() {
+        let sequence_value = [record[usa_offset], record[usa_offset + 1]];
+        if record[510..512] != sequence_value || record[1022..1024] != sequence_value {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NTFS update sequence mismatch",
+            ));
+        }
+
+        record[510] = record[usa_offset + 2];
+        record[511] = record[usa_offset + 3];
+        record[1022] = record[usa_offset + 4];
+        record[1023] = record[usa_offset + 5];
+        return Ok(record);
+    }
+
+    apply_update_sequence_fixup_generic(record, 512)
+}
+
+fn apply_update_sequence_fixup_generic(
+    record: &mut [u8],
+    bytes_per_sector: usize,
+) -> io::Result<&[u8]> {
     if bytes_per_sector < size_of::<u16>() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2740,7 +2862,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 42,
             owner_record_number: 42,
-            file_names: vec![file_name(5, "base.txt", 3)],
+            file_names: vec![file_name(5, "base.txt", 3)].into(),
             is_directory: false,
             logical_size: None,
             allocated_size: None,
@@ -2750,7 +2872,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 400,
             owner_record_number: 42,
-            file_names: Vec::new(),
+            file_names: SmallVec::new(),
             is_directory: false,
             logical_size: Some(1234),
             allocated_size: Some(4096),
@@ -2774,7 +2896,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 77,
             owner_record_number: 77,
-            file_names: Vec::new(),
+            file_names: SmallVec::new(),
             is_directory: false,
             logical_size: Some(7),
             allocated_size: Some(8),
@@ -2784,7 +2906,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 88,
             owner_record_number: 77,
-            file_names: vec![file_name(5, "fallback.bin", 3)],
+            file_names: vec![file_name(5, "fallback.bin", 3)].into(),
             is_directory: false,
             logical_size: None,
             allocated_size: None,
@@ -2807,7 +2929,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 99,
             owner_record_number: 99,
-            file_names: vec![file_name(5, "one.txt", 3), file_name(6, "two.txt", 3)],
+            file_names: vec![file_name(5, "one.txt", 3), file_name(6, "two.txt", 3)].into(),
             is_directory: false,
             logical_size: Some(10),
             allocated_size: Some(16),
@@ -2828,7 +2950,7 @@ mod tests {
         build.push_fragment(RawMftRecordFragment {
             record_number: 120,
             owner_record_number: 120,
-            file_names: vec![file_name(5, "junction", 3)],
+            file_names: vec![file_name(5, "junction", 3)].into(),
             is_directory: true,
             logical_size: None,
             allocated_size: None,
@@ -2850,7 +2972,8 @@ mod tests {
                 file_name(5, "one.txt", 3),
                 file_name(6, "two.txt", 3),
                 file_name(7, "three.txt", 2),
-            ],
+            ]
+            .into(),
             is_directory: false,
             logical_size: Some(10),
             allocated_size: Some(16),

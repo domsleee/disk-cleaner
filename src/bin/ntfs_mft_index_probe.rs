@@ -10,6 +10,7 @@ fn main() {
     let mut top_root: Option<usize> = None;
     let mut project_win32_root = false;
     let mut show_timings = false;
+    let mut prefer_volume = true;
     let mut path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -35,6 +36,8 @@ fn main() {
             project_win32_root = true;
         } else if arg == "--timings" {
             show_timings = true;
+        } else if arg == "--prefer-file" {
+            prefer_volume = false;
         } else if path.is_none() {
             path = Some(PathBuf::from(arg));
         } else {
@@ -45,7 +48,11 @@ fn main() {
 
     let path = path.unwrap_or_else(|| std::env::current_dir().expect("current dir"));
     let start = Instant::now();
-    let (index, timings) = match windows_ntfs::build_raw_mft_index_for_path_profiled(&path, limit) {
+    let (index, timings) = match windows_ntfs::build_raw_mft_index_for_path_profiled_with_preference(
+        &path,
+        limit,
+        prefer_volume,
+    ) {
         Ok(result) => result,
         Err(err) => {
             eprintln!("raw MFT index probe failed for {}: {err}", path.display());

@@ -78,7 +78,7 @@ pub fn compute_stats(tree: &FileNode) -> CategoryStats {
         .into_iter()
         .map(|(cat, (size, count))| (cat, size, count))
         .collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     CategoryStats { entries }
 }

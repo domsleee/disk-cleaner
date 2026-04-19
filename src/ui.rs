@@ -103,10 +103,10 @@ fn build_cat_match_inner(
         crate::categories::categorize(node.name()) == cat
     };
     // Must visit ALL children (not short-circuit) so every matching subtree is cached.
-    let child_matches = node
-        .children()
-        .iter()
-        .fold(false, |acc, c| build_cat_match_inner(c, cat, cache) || acc);
+    let mut child_matches = false;
+    for child in node.children() {
+        child_matches = build_cat_match_inner(child, cat, cache) || child_matches;
+    }
     let include = self_matches || child_matches;
     cache[index] = MatchEntry {
         include,

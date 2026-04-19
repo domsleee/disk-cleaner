@@ -76,34 +76,6 @@ impl MatchCache {
     }
 }
 
-/// Pre-compute which subtrees contain nodes matching the text query.
-pub fn build_text_match_cache(node: &FileNode, query: &str) -> MatchCache {
-    let mut cache = Vec::new();
-    build_text_match_inner(node, query, &mut cache);
-    MatchCache(cache)
-}
-
-fn build_text_match_inner(node: &FileNode, query: &str, cache: &mut Vec<MatchEntry>) -> bool {
-    let index = cache.len();
-    cache.push(MatchEntry {
-        include: false,
-        subtree_len: 0,
-    });
-
-    let self_matches = contains_case_insensitive(node.name(), query);
-    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
-    let child_matches = node
-        .children()
-        .iter()
-        .fold(false, |acc, c| build_text_match_inner(c, query, cache) || acc);
-    let include = self_matches || child_matches;
-    cache[index] = MatchEntry {
-        include,
-        subtree_len: cache.len() - index,
-    };
-    include
-}
-
 /// Pre-compute which subtrees contain nodes matching the given category.
 pub fn build_category_match_cache(
     node: &FileNode,
@@ -257,13 +229,11 @@ pub fn collect_cached_rows(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&MatchCache>,
     cat_cache: Option<&MatchCache>,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
     let mut path_buf = PathBuf::from(node.name());
-    let mut text_cursor = 0;
     let mut cat_cursor = 0;
     collect_cached_rows_inner(
         node,
@@ -273,9 +243,7 @@ pub fn collect_cached_rows(
         filter,
         category_filter,
         show_hidden,
-        text_cache,
         cat_cache,
-        &mut text_cursor,
         &mut cat_cursor,
         expanded_file_groups,
         &mut result,
@@ -296,9 +264,7 @@ fn emit_file_group(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&MatchCache>,
     cat_cache: Option<&MatchCache>,
-    text_cursor: &mut usize,
     cat_cursor: &mut usize,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) {
@@ -327,9 +293,7 @@ fn emit_file_group(
                 filter,
                 category_filter,
                 show_hidden,
-                text_cache,
                 cat_cache,
-                text_cursor,
                 cat_cursor,
                 expanded_file_groups,
                 result,
@@ -348,26 +312,20 @@ fn collect_cached_rows_inner(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&MatchCache>,
     cat_cache: Option<&MatchCache>,
-    text_cursor: &mut usize,
     cat_cursor: &mut usize,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.is_hidden() {
-        skip_cache_subtree(text_cache, text_cursor);
         skip_cache_subtree(cat_cache, cat_cursor);
         return;
     }
-    // Use pre-computed caches for O(1) lookup when available,
+    if !filter.is_empty() && !node_matches(node, filter) {
+        return;
+    }
+    // Use pre-computed category cache for O(1) lookup when available,
     // fall back to recursive match for backwards compatibility.
-    if !cache_allows_current(text_cache, text_cursor) {
-        return;
-    }
-    if text_cache.is_none() && !filter.is_empty() && !node_matches(node, filter) {
-        return;
-    }
     if !cache_allows_current(cat_cache, cat_cursor) {
         return;
     }
@@ -433,9 +391,7 @@ fn collect_cached_rows_inner(
                         filter,
                         category_filter,
                         show_hidden,
-                        text_cache,
                         cat_cache,
-                        text_cursor,
                         cat_cursor,
                         expanded_file_groups,
                     );
@@ -450,9 +406,7 @@ fn collect_cached_rows_inner(
                     filter,
                     category_filter,
                     show_hidden,
-                    text_cache,
                     cat_cache,
-                    text_cursor,
                     cat_cursor,
                     expanded_file_groups,
                     result,
@@ -473,9 +427,7 @@ fn collect_cached_rows_inner(
                     filter,
                     category_filter,
                     show_hidden,
-                    text_cache,
                     cat_cache,
-                    text_cursor,
                     cat_cursor,
                     expanded_file_groups,
                 );
@@ -495,9 +447,7 @@ fn collect_cached_rows_inner(
                     filter,
                     category_filter,
                     show_hidden,
-                    text_cache,
                     cat_cache,
-                    text_cursor,
                     cat_cursor,
                     expanded_file_groups,
                     result,
@@ -1074,8 +1024,8 @@ mod tests {
         // Expand "src" so its children are visible
         tree.as_dir_mut().unwrap().children[0].set_expanded(true);
 
-        let rows_a = collect_cached_rows(&tree, "", None, true, None, None, None);
-        let rows_b = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let rows_a = collect_cached_rows(&tree, "", None, true, None, None);
+        let rows_b = collect_cached_rows(&tree, "", None, true, None, None);
 
         assert_eq!(rows_a.len(), rows_b.len());
         for (a, b) in rows_a.iter().zip(rows_b.iter()) {
@@ -1095,52 +1045,16 @@ mod tests {
         let mut tree = dir("root", vec![leaf(".hidden", 5), leaf("visible.txt", 10)]);
         tree.set_expanded(true);
 
-        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        let rows = collect_cached_rows(&tree, "", None, false, None, None);
         // Root + visible.txt (hidden file excluded, 1 file = no grouping)
         assert_eq!(rows.len(), 2);
         assert_eq!(&*rows[1].name, "visible.txt");
 
-        let rows_all = collect_cached_rows(&tree, "", None, true, None, None, None);
+        let rows_all = collect_cached_rows(&tree, "", None, true, None, None);
         // Root + "2 files" group (both files visible → grouped)
         assert_eq!(rows_all.len(), 2);
         assert!(rows_all[1].is_file_group);
         assert_eq!(&*rows_all[1].name, "[2 files]");
-    }
-
-    #[test]
-    fn build_text_match_cache_marks_matching_subtrees() {
-        let tree = dir(
-            "root",
-            vec![
-                dir("src", vec![leaf("main.rs", 50)]),
-                dir("docs", vec![leaf("readme.md", 10)]),
-            ],
-        );
-        let cache = build_text_match_cache(&tree, "main");
-        let included = included_paths(&tree, &cache);
-        assert!(included.contains(&PathBuf::from("root"))); // has matching descendant
-        assert!(included.contains(&PathBuf::from("root/src"))); // has matching descendant
-        assert!(included.contains(&PathBuf::from("root/src/main.rs"))); // direct match
-        assert!(!included.contains(&PathBuf::from("root/docs"))); // no matching descendant
-        assert!(!included.contains(&PathBuf::from("root/docs/readme.md"))); // no match
-    }
-
-    #[test]
-    fn build_text_match_cache_visits_all_siblings() {
-        // Regression: any() short-circuits, so second matching sibling could be missed.
-        let tree = dir(
-            "root",
-            vec![
-                dir("a", vec![leaf("main.rs", 50)]),
-                dir("b", vec![leaf("main.py", 30)]),
-            ],
-        );
-        let cache = build_text_match_cache(&tree, "main");
-        let included = included_paths(&tree, &cache);
-        assert!(included.contains(&PathBuf::from("root/a")));
-        assert!(included.contains(&PathBuf::from("root/a/main.rs")));
-        assert!(included.contains(&PathBuf::from("root/b")));
-        assert!(included.contains(&PathBuf::from("root/b/main.py")));
     }
 
     #[test]
@@ -1179,28 +1093,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_rows_with_text_cache_matches_uncached() {
-        let tree = dir(
-            "root",
-            vec![
-                dir("src", vec![leaf("main.rs", 50), leaf("lib.rs", 30)]),
-                dir("docs", vec![leaf("readme.md", 10)]),
-            ],
-        );
-        let query = "main";
-        let cache = build_text_match_cache(&tree, query);
-
-        let rows_uncached = collect_cached_rows(&tree, query, None, true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, query, None, true, Some(&cache), None, None);
-
-        assert_eq!(rows_uncached.len(), rows_cached.len());
-        for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
-            assert_eq!(a.path, b.path);
-            assert_eq!(&*a.name, &*b.name);
-        }
-    }
-
-    #[test]
     fn cached_rows_with_cat_cache_matches_uncached() {
         let tree = dir(
             "root",
@@ -1212,8 +1104,8 @@ mod tests {
         let cat = crate::categories::FileCategory::Video;
         let cache = build_category_match_cache(&tree, cat);
 
-        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None, None);
-        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, None, Some(&cache), None);
+        let rows_uncached = collect_cached_rows(&tree, "", Some(cat), true, None, None);
+        let rows_cached = collect_cached_rows(&tree, "", Some(cat), true, Some(&cache), None);
 
         assert_eq!(rows_uncached.len(), rows_cached.len());
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {

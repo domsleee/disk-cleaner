@@ -203,13 +203,13 @@ fn platform_skip_paths(root: &Path) -> HashSet<PathBuf> {
     // /Volumes/ contains mount points like "Macintosh HD" (root alias) and
     // "Macintosh HD - Data" (Data volume alias) plus external drives.
     // When scanning root, traversing these re-counts the same data.
-    if !root.starts_with("/Volumes/") && root != Path::new("/Volumes") {
-        if let Ok(entries) = std::fs::read_dir("/Volumes") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path != root {
-                    skip.insert(path);
-                }
+    if !root.starts_with("/Volumes/") && root != Path::new("/Volumes")
+        && let Ok(entries) = std::fs::read_dir("/Volumes")
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != root {
+                skip.insert(path);
             }
         }
     }

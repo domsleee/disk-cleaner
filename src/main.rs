@@ -371,14 +371,6 @@ impl App {
             return;
         }
 
-        let text_cache = if !self.applied_search.is_empty() {
-            self.tree
-                .as_ref()
-                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
-        } else {
-            None
-        };
-
         let cat_cache = if let Some(cat) = self.category_filter {
             self.tree
                 .as_ref()
@@ -397,7 +389,6 @@ impl App {
                 &self.applied_search,
                 self.category_filter,
                 self.show_hidden,
-                text_cache.as_ref(),
                 cat_cache.as_ref(),
                 Some(&self.expanded_file_groups),
             );

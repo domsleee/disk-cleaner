@@ -7,6 +7,7 @@ use std::time::Instant;
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut limit: Option<usize> = None;
+    let mut top_root: Option<usize> = None;
     let mut path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -17,6 +18,15 @@ fn main() {
             });
             limit = Some(value.parse::<usize>().unwrap_or_else(|_| {
                 eprintln!("invalid --limit value: {value}");
+                std::process::exit(2);
+            }));
+        } else if arg == "--top-root" {
+            let value = args.next().unwrap_or_else(|| {
+                eprintln!("missing value after --top-root");
+                std::process::exit(2);
+            });
+            top_root = Some(value.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("invalid --top-root value: {value}");
                 std::process::exit(2);
             }));
         } else if path.is_none() {
@@ -81,6 +91,29 @@ fn main() {
                 entry.subtree_logical_size,
                 entry.subtree_file_count,
                 entry.subtree_dir_count,
+                entry.name
+            );
+        }
+    }
+
+    if let Some(count) = top_root {
+        let mut root_entries: Vec<_> = index
+            .entries
+            .iter()
+            .filter(|entry| entry.parent_record_number == 5 && entry.record_number != 5)
+            .collect();
+        root_entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.subtree_logical_size));
+        println!();
+        println!("Top root entries:");
+        for entry in root_entries.into_iter().take(count) {
+            println!(
+                "  subtree={} logical={} dir={} files={} dirs={} frn={} {}",
+                entry.subtree_logical_size,
+                entry.logical_size,
+                entry.is_directory,
+                entry.subtree_file_count,
+                entry.subtree_dir_count,
+                entry.record_number,
                 entry.name
             );
         }

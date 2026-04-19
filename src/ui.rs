@@ -56,73 +56,143 @@ pub fn node_matches(node: &FileNode, query: &str) -> bool {
         || node.children().iter().any(|c| node_matches(c, query))
 }
 
-/// Pre-compute which subtrees contain nodes matching the text query.
-/// Returns a set of paths that match or have matching descendants.
-pub fn build_text_match_cache(node: &FileNode, query: &str) -> HashSet<PathBuf> {
-    let mut cache = HashSet::new();
-    let mut buf = PathBuf::from(node.name());
-    build_text_match_inner(node, query, &mut buf, &mut cache);
-    cache
+/// Compact match cache aligned to a preorder tree walk.
+///
+/// Each entry records whether the node should be included plus the number of
+/// entries occupied by its subtree so callers can skip whole subtrees in O(1)
+/// without allocating per-node paths.
+#[derive(Clone, Debug)]
+pub struct MatchCache(Vec<MatchEntry>);
+
+#[derive(Clone, Copy, Debug)]
+struct MatchEntry {
+    include: bool,
+    subtree_len: usize,
 }
 
-fn build_text_match_inner(
-    node: &FileNode,
-    query: &str,
-    buf: &mut PathBuf,
-    cache: &mut HashSet<PathBuf>,
-) -> bool {
-    let self_matches = contains_case_insensitive(node.name(), query);
-    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
-    let child_matches = node.children().iter().fold(false, |acc, c| {
-        buf.push(c.name());
-        let m = build_text_match_inner(c, query, buf, cache);
-        buf.pop();
-        acc || m
-    });
-    if self_matches || child_matches {
-        cache.insert(buf.clone());
-        true
-    } else {
-        false
+impl MatchCache {
+    fn entry(&self, index: usize) -> MatchEntry {
+        self.0[index]
     }
 }
 
+/// Pre-compute which subtrees contain nodes matching the text query.
+pub fn build_text_match_cache(node: &FileNode, query: &str) -> MatchCache {
+    let mut cache = Vec::new();
+    build_text_match_inner(node, query, &mut cache);
+    MatchCache(cache)
+}
+
+fn build_text_match_inner(node: &FileNode, query: &str, cache: &mut Vec<MatchEntry>) -> bool {
+    let index = cache.len();
+    cache.push(MatchEntry {
+        include: false,
+        subtree_len: 0,
+    });
+
+    let self_matches = contains_case_insensitive(node.name(), query);
+    // Must visit ALL children (not short-circuit) so every matching subtree is cached.
+    let child_matches = node
+        .children()
+        .iter()
+        .fold(false, |acc, c| build_text_match_inner(c, query, cache) || acc);
+    let include = self_matches || child_matches;
+    cache[index] = MatchEntry {
+        include,
+        subtree_len: cache.len() - index,
+    };
+    include
+}
+
 /// Pre-compute which subtrees contain nodes matching the given category.
-/// Returns a set of paths that match or have matching descendants.
 pub fn build_category_match_cache(
     node: &FileNode,
     cat: crate::categories::FileCategory,
-) -> HashSet<PathBuf> {
-    let mut cache = HashSet::new();
-    let mut buf = PathBuf::from(node.name());
-    build_cat_match_inner(node, cat, &mut buf, &mut cache);
-    cache
+) -> MatchCache {
+    let mut cache = Vec::new();
+    build_cat_match_inner(node, cat, &mut cache);
+    MatchCache(cache)
 }
 
 fn build_cat_match_inner(
     node: &FileNode,
     cat: crate::categories::FileCategory,
-    buf: &mut PathBuf,
-    cache: &mut HashSet<PathBuf>,
+    cache: &mut Vec<MatchEntry>,
 ) -> bool {
+    let index = cache.len();
+    cache.push(MatchEntry {
+        include: false,
+        subtree_len: 0,
+    });
+
     let self_matches = if node.is_dir() {
         false
     } else {
         crate::categories::categorize(node.name()) == cat
     };
     // Must visit ALL children (not short-circuit) so every matching subtree is cached.
-    let child_matches = node.children().iter().fold(false, |acc, c| {
-        buf.push(c.name());
-        let m = build_cat_match_inner(c, cat, buf, cache);
-        buf.pop();
-        acc || m
-    });
-    if self_matches || child_matches {
-        cache.insert(buf.clone());
+    let child_matches = node
+        .children()
+        .iter()
+        .fold(false, |acc, c| build_cat_match_inner(c, cat, cache) || acc);
+    let include = self_matches || child_matches;
+    cache[index] = MatchEntry {
+        include,
+        subtree_len: cache.len() - index,
+    };
+    include
+}
+
+fn skip_cache_subtree(cache: Option<&MatchCache>, cursor: &mut usize) {
+    if let Some(cache) = cache {
+        *cursor += cache.entry(*cursor).subtree_len;
+    }
+}
+
+fn cache_allows_current(cache: Option<&MatchCache>, cursor: &mut usize) -> bool {
+    let Some(cache) = cache else {
+        return true;
+    };
+    let entry = cache.entry(*cursor);
+    if entry.include {
+        *cursor += 1;
         true
     } else {
+        *cursor += entry.subtree_len;
         false
     }
+}
+
+#[cfg(test)]
+fn collect_included_paths(
+    node: &FileNode,
+    current_path: &mut PathBuf,
+    cache: &MatchCache,
+    cursor: &mut usize,
+    out: &mut HashSet<PathBuf>,
+) {
+    let entry = cache.entry(*cursor);
+    *cursor += 1;
+    if !entry.include {
+        *cursor += entry.subtree_len - 1;
+        return;
+    }
+
+    out.insert(current_path.clone());
+    for child in node.children() {
+        current_path.push(child.name());
+        collect_included_paths(child, current_path, cache, cursor, out);
+        current_path.pop();
+    }
+}
+
+#[cfg(test)]
+fn included_paths(node: &FileNode, cache: &MatchCache) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    let mut path = PathBuf::from(node.name());
+    let mut cursor = 0;
+    collect_included_paths(node, &mut path, cache, &mut cursor, &mut out);
+    out
 }
 
 /// ASCII case-insensitive substring search without allocating.
@@ -187,12 +257,14 @@ pub fn collect_cached_rows(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&MatchCache>,
+    cat_cache: Option<&MatchCache>,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
     let mut result = Vec::new();
     let mut path_buf = PathBuf::from(node.name());
+    let mut text_cursor = 0;
+    let mut cat_cursor = 0;
     collect_cached_rows_inner(
         node,
         0,
@@ -203,6 +275,8 @@ pub fn collect_cached_rows(
         show_hidden,
         text_cache,
         cat_cache,
+        &mut text_cursor,
+        &mut cat_cursor,
         expanded_file_groups,
         &mut result,
     );
@@ -222,8 +296,10 @@ fn emit_file_group(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&MatchCache>,
+    cat_cache: Option<&MatchCache>,
+    text_cursor: &mut usize,
+    cat_cursor: &mut usize,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) {
     result.push(CachedRow {
@@ -253,6 +329,8 @@ fn emit_file_group(
                 show_hidden,
                 text_cache,
                 cat_cache,
+                text_cursor,
+                cat_cursor,
                 expanded_file_groups,
                 result,
             );
@@ -270,28 +348,31 @@ fn collect_cached_rows_inner(
     filter: &str,
     category_filter: Option<crate::categories::FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&HashSet<PathBuf>>,
-    cat_cache: Option<&HashSet<PathBuf>>,
+    text_cache: Option<&MatchCache>,
+    cat_cache: Option<&MatchCache>,
+    text_cursor: &mut usize,
+    cat_cursor: &mut usize,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
     if !show_hidden && node.is_hidden() {
+        skip_cache_subtree(text_cache, text_cursor);
+        skip_cache_subtree(cat_cache, cat_cursor);
         return;
     }
     // Use pre-computed caches for O(1) lookup when available,
     // fall back to recursive match for backwards compatibility.
-    if let Some(tc) = text_cache {
-        if !tc.contains(current_path.as_path()) {
-            return;
-        }
-    } else if !filter.is_empty() && !node_matches(node, filter) {
+    if !cache_allows_current(text_cache, text_cursor) {
         return;
     }
-    if let Some(cc) = cat_cache {
-        if !cc.contains(current_path.as_path()) {
-            return;
-        }
-    } else if let Some(cat) = category_filter
+    if text_cache.is_none() && !filter.is_empty() && !node_matches(node, filter) {
+        return;
+    }
+    if !cache_allows_current(cat_cache, cat_cursor) {
+        return;
+    }
+    if cat_cache.is_none()
+        && let Some(cat) = category_filter
         && !crate::categories::node_matches_category(node, cat)
     {
         return;
@@ -354,6 +435,8 @@ fn collect_cached_rows_inner(
                         show_hidden,
                         text_cache,
                         cat_cache,
+                        text_cursor,
+                        cat_cursor,
                         expanded_file_groups,
                     );
                     file_group_emitted = true;
@@ -369,6 +452,8 @@ fn collect_cached_rows_inner(
                     show_hidden,
                     text_cache,
                     cat_cache,
+                    text_cursor,
+                    cat_cursor,
                     expanded_file_groups,
                     result,
                 );
@@ -390,6 +475,8 @@ fn collect_cached_rows_inner(
                     show_hidden,
                     text_cache,
                     cat_cache,
+                    text_cursor,
+                    cat_cursor,
                     expanded_file_groups,
                 );
             }
@@ -410,6 +497,8 @@ fn collect_cached_rows_inner(
                     show_hidden,
                     text_cache,
                     cat_cache,
+                    text_cursor,
+                    cat_cursor,
                     expanded_file_groups,
                     result,
                 );
@@ -1028,11 +1117,12 @@ mod tests {
             ],
         );
         let cache = build_text_match_cache(&tree, "main");
-        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/src"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/src/main.rs"))); // direct match
-        assert!(!cache.contains(&PathBuf::from("root/docs"))); // no matching descendant
-        assert!(!cache.contains(&PathBuf::from("root/docs/readme.md"))); // no match
+        let included = included_paths(&tree, &cache);
+        assert!(included.contains(&PathBuf::from("root"))); // has matching descendant
+        assert!(included.contains(&PathBuf::from("root/src"))); // has matching descendant
+        assert!(included.contains(&PathBuf::from("root/src/main.rs"))); // direct match
+        assert!(!included.contains(&PathBuf::from("root/docs"))); // no matching descendant
+        assert!(!included.contains(&PathBuf::from("root/docs/readme.md"))); // no match
     }
 
     #[test]
@@ -1046,10 +1136,11 @@ mod tests {
             ],
         );
         let cache = build_text_match_cache(&tree, "main");
-        assert!(cache.contains(&PathBuf::from("root/a")));
-        assert!(cache.contains(&PathBuf::from("root/a/main.rs")));
-        assert!(cache.contains(&PathBuf::from("root/b")));
-        assert!(cache.contains(&PathBuf::from("root/b/main.py")));
+        let included = included_paths(&tree, &cache);
+        assert!(included.contains(&PathBuf::from("root/a")));
+        assert!(included.contains(&PathBuf::from("root/a/main.rs")));
+        assert!(included.contains(&PathBuf::from("root/b")));
+        assert!(included.contains(&PathBuf::from("root/b/main.py")));
     }
 
     #[test]
@@ -1062,10 +1153,11 @@ mod tests {
             ],
         );
         let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
-        assert!(cache.contains(&PathBuf::from("root/a")));
-        assert!(cache.contains(&PathBuf::from("root/a/clip1.mp4")));
-        assert!(cache.contains(&PathBuf::from("root/b")));
-        assert!(cache.contains(&PathBuf::from("root/b/clip2.mp4")));
+        let included = included_paths(&tree, &cache);
+        assert!(included.contains(&PathBuf::from("root/a")));
+        assert!(included.contains(&PathBuf::from("root/a/clip1.mp4")));
+        assert!(included.contains(&PathBuf::from("root/b")));
+        assert!(included.contains(&PathBuf::from("root/b/clip2.mp4")));
     }
 
     #[test]
@@ -1078,11 +1170,12 @@ mod tests {
             ],
         );
         let cache = build_category_match_cache(&tree, crate::categories::FileCategory::Video);
-        assert!(cache.contains(&PathBuf::from("root"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/media"))); // has matching descendant
-        assert!(cache.contains(&PathBuf::from("root/media/movie.mp4"))); // direct match
-        assert!(!cache.contains(&PathBuf::from("root/src"))); // no matching descendant
-        assert!(!cache.contains(&PathBuf::from("root/src/main.rs"))); // wrong category
+        let included = included_paths(&tree, &cache);
+        assert!(included.contains(&PathBuf::from("root"))); // has matching descendant
+        assert!(included.contains(&PathBuf::from("root/media"))); // has matching descendant
+        assert!(included.contains(&PathBuf::from("root/media/movie.mp4"))); // direct match
+        assert!(!included.contains(&PathBuf::from("root/src"))); // no matching descendant
+        assert!(!included.contains(&PathBuf::from("root/src/main.rs"))); // wrong category
     }
 
     #[test]

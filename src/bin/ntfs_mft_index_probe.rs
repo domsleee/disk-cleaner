@@ -9,6 +9,7 @@ fn main() {
     let mut limit: Option<usize> = None;
     let mut top_root: Option<usize> = None;
     let mut project_win32_root = false;
+    let mut show_timings = false;
     let mut path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -32,6 +33,8 @@ fn main() {
             }));
         } else if arg == "--project-win32-root" {
             project_win32_root = true;
+        } else if arg == "--timings" {
+            show_timings = true;
         } else if path.is_none() {
             path = Some(PathBuf::from(arg));
         } else {
@@ -42,8 +45,8 @@ fn main() {
 
     let path = path.unwrap_or_else(|| std::env::current_dir().expect("current dir"));
     let start = Instant::now();
-    let index = match windows_ntfs::build_raw_mft_index_for_path(&path, limit) {
-        Ok(index) => index,
+    let (index, timings) = match windows_ntfs::build_raw_mft_index_for_path_profiled(&path, limit) {
+        Ok(result) => result,
         Err(err) => {
             eprintln!("raw MFT index probe failed for {}: {err}", path.display());
             std::process::exit(1);
@@ -62,6 +65,14 @@ fn main() {
             "Avg/indexed entry    : {:.3?}",
             elapsed / summary.indexed_entries as u32
         );
+    }
+    if show_timings {
+        println!("Setup                : {:.3?}", timings.setup);
+        println!("Read                 : {:.3?}", timings.read);
+        println!("Process              : {:.3?}", timings.process);
+        println!("Parse/fixup          : {:.3?}", timings.parse_fixup);
+        println!("Merge                : {:.3?}", timings.merge);
+        println!("Finish               : {:.3?}", timings.finish);
     }
     println!();
     println!("Records scanned      : {}", summary.records_scanned);

@@ -203,6 +203,22 @@ pub struct RawMftIndex {
     pub entries: Vec<RawMftIndexEntry>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RawMftWin32RootProjection {
+    pub visible_root_entries: usize,
+    pub filtered_root_entries: usize,
+    pub blocked_root_dirs: usize,
+    pub total_logical_size: u64,
+    pub total_allocated_size: u64,
+    pub total_file_entries: u64,
+    pub total_dir_entries: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RootVisibilityEntry {
+    can_recurse: bool,
+}
+
 pub fn ntfs_eligibility(path: &Path) -> io::Result<NtfsEligibility> {
     let volume_root = volume_root_for_path(path)?;
     let volume_device = volume_device_from_root(&volume_root).ok_or_else(|| {
@@ -511,6 +527,79 @@ pub fn build_raw_mft_index_for_path(path: &Path, limit: Option<usize>) -> io::Re
     }
 
     Ok(raw.finish())
+}
+
+pub fn project_raw_mft_index_to_win32_root(
+    index: &RawMftIndex,
+    volume_root: &Path,
+) -> io::Result<RawMftWin32RootProjection> {
+    let _ = disable_backup_privilege();
+    let visibility = collect_win32_root_visibility(volume_root)?;
+    Ok(project_raw_mft_index_with_root_visibility(index, &visibility))
+}
+
+fn collect_win32_root_visibility(root: &Path) -> io::Result<HashMap<String, RootVisibilityEntry>> {
+    let mut visibility = HashMap::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let can_recurse = if file_type.is_dir() {
+            std::fs::read_dir(entry.path()).is_ok()
+        } else {
+            false
+        };
+        visibility.insert(name, RootVisibilityEntry { can_recurse });
+    }
+    Ok(visibility)
+}
+
+fn project_raw_mft_index_with_root_visibility(
+    index: &RawMftIndex,
+    visibility: &HashMap<String, RootVisibilityEntry>,
+) -> RawMftWin32RootProjection {
+    let mut projection = RawMftWin32RootProjection {
+        total_dir_entries: 1,
+        ..RawMftWin32RootProjection::default()
+    };
+
+    for entry in index.entries.iter().filter(|entry| {
+        entry.parent_record_number == NTFS_VOLUME_ROOT_RECORD_NUMBER
+            && entry.record_number != NTFS_VOLUME_ROOT_RECORD_NUMBER
+    }) {
+        let key = entry.name.to_lowercase();
+        let Some(root_state) = visibility.get(&key) else {
+            projection.filtered_root_entries += 1;
+            continue;
+        };
+
+        projection.visible_root_entries += 1;
+        if entry.is_directory && !root_state.can_recurse {
+            projection.blocked_root_dirs += 1;
+            projection.total_logical_size =
+                projection.total_logical_size.saturating_add(entry.logical_size);
+            projection.total_allocated_size = projection
+                .total_allocated_size
+                .saturating_add(entry.allocated_size);
+            projection.total_dir_entries = projection.total_dir_entries.saturating_add(1);
+            continue;
+        }
+
+        projection.total_logical_size = projection
+            .total_logical_size
+            .saturating_add(entry.subtree_logical_size);
+        projection.total_allocated_size = projection
+            .total_allocated_size
+            .saturating_add(entry.subtree_allocated_size);
+        projection.total_file_entries = projection
+            .total_file_entries
+            .saturating_add(entry.subtree_file_count);
+        projection.total_dir_entries = projection
+            .total_dir_entries
+            .saturating_add(entry.subtree_dir_count);
+    }
+
+    projection
 }
 
 struct HandleGuard(HANDLE);
@@ -898,6 +987,51 @@ fn enable_backup_privilege() -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "SeBackupPrivilege is not available on this token",
         ));
+    }
+
+    Ok(())
+}
+
+fn disable_backup_privilege() -> io::Result<()> {
+    let mut token = INVALID_HANDLE_VALUE;
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = HandleGuard(token);
+
+    let mut luid = LUID::default();
+    let privilege = wide_null(OsStr::new("SeBackupPrivilege"));
+    let ok = unsafe { LookupPrivilegeValueW(ptr::null(), privilege.as_ptr(), &mut luid) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: 0,
+        }],
+    };
+    let ok = unsafe {
+        AdjustTokenPrivileges(
+            token.0,
+            0,
+            &mut privileges,
+            size_of::<TOKEN_PRIVILEGES>() as u32,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
     }
 
     Ok(())
@@ -2456,5 +2590,97 @@ mod tests {
         let index = build.finish();
         assert_eq!(index.entries.len(), 2);
         assert_eq!(index.summary.total_file_entries, 2);
+    }
+
+    #[test]
+    fn root_projection_filters_invisible_root_entries() {
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries: vec![
+                RawMftIndexEntry {
+                    record_number: 5,
+                    parent_record_number: 5,
+                    attributes: 0,
+                    name: ".".into(),
+                    is_directory: true,
+                    logical_size: 0,
+                    allocated_size: 0,
+                    subtree_logical_size: 300,
+                    subtree_allocated_size: 400,
+                    subtree_file_count: 2,
+                    subtree_dir_count: 3,
+                },
+                RawMftIndexEntry {
+                    record_number: 10,
+                    parent_record_number: 5,
+                    attributes: 0,
+                    name: "Users".into(),
+                    is_directory: true,
+                    logical_size: 0,
+                    allocated_size: 0,
+                    subtree_logical_size: 200,
+                    subtree_allocated_size: 300,
+                    subtree_file_count: 2,
+                    subtree_dir_count: 2,
+                },
+                RawMftIndexEntry {
+                    record_number: 11,
+                    parent_record_number: 5,
+                    attributes: 0,
+                    name: "$MFT".into(),
+                    is_directory: false,
+                    logical_size: 100,
+                    allocated_size: 100,
+                    subtree_logical_size: 100,
+                    subtree_allocated_size: 100,
+                    subtree_file_count: 1,
+                    subtree_dir_count: 0,
+                },
+            ],
+        };
+        let visibility = HashMap::from([(
+            String::from("users"),
+            RootVisibilityEntry { can_recurse: true },
+        )]);
+
+        let projection = project_raw_mft_index_with_root_visibility(&index, &visibility);
+        assert_eq!(projection.visible_root_entries, 1);
+        assert_eq!(projection.filtered_root_entries, 1);
+        assert_eq!(projection.total_logical_size, 200);
+        assert_eq!(projection.total_allocated_size, 300);
+        assert_eq!(projection.total_file_entries, 2);
+        assert_eq!(projection.total_dir_entries, 3);
+    }
+
+    #[test]
+    fn root_projection_blocks_access_denied_root_dir_subtree() {
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries: vec![RawMftIndexEntry {
+                record_number: 20,
+                parent_record_number: 5,
+                attributes: 0,
+                name: "System Volume Information".into(),
+                is_directory: true,
+                logical_size: 0,
+                allocated_size: 0,
+                subtree_logical_size: 500,
+                subtree_allocated_size: 600,
+                subtree_file_count: 9,
+                subtree_dir_count: 4,
+            }],
+        };
+        let visibility = HashMap::from([(
+            String::from("system volume information"),
+            RootVisibilityEntry { can_recurse: false },
+        )]);
+
+        let projection = project_raw_mft_index_with_root_visibility(&index, &visibility);
+        assert_eq!(projection.visible_root_entries, 1);
+        assert_eq!(projection.blocked_root_dirs, 1);
+        assert_eq!(projection.total_logical_size, 0);
+        assert_eq!(projection.total_allocated_size, 0);
+        assert_eq!(projection.total_file_entries, 0);
+        assert_eq!(projection.total_dir_entries, 2);
     }
 }

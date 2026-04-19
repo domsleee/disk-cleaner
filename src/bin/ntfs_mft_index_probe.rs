@@ -8,6 +8,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut limit: Option<usize> = None;
     let mut top_root: Option<usize> = None;
+    let mut project_win32_root = false;
     let mut path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -29,6 +30,8 @@ fn main() {
                 eprintln!("invalid --top-root value: {value}");
                 std::process::exit(2);
             }));
+        } else if arg == "--project-win32-root" {
+            project_win32_root = true;
         } else if path.is_none() {
             path = Some(PathBuf::from(arg));
         } else {
@@ -116,6 +119,26 @@ fn main() {
                 entry.record_number,
                 entry.name
             );
+        }
+    }
+
+    if project_win32_root {
+        match windows_ntfs::project_raw_mft_index_to_win32_root(&index, &summary.volume_root) {
+            Ok(projection) => {
+                println!();
+                println!("Win32 root projection:");
+                println!("  visible roots   : {}", projection.visible_root_entries);
+                println!("  filtered roots  : {}", projection.filtered_root_entries);
+                println!("  blocked roots   : {}", projection.blocked_root_dirs);
+                println!("  logical total   : {}", projection.total_logical_size);
+                println!("  allocated total : {}", projection.total_allocated_size);
+                println!("  file count      : {}", projection.total_file_entries);
+                println!("  dir count       : {}", projection.total_dir_entries);
+            }
+            Err(err) => {
+                eprintln!("Win32 root projection failed: {err}");
+                std::process::exit(1);
+            }
         }
     }
 }

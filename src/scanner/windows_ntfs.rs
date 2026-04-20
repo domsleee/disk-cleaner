@@ -13,8 +13,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rayon::iter::IntoParallelIterator;
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use smallvec::SmallVec;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE,
@@ -63,6 +62,7 @@ const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 const FILE_NAME_VALUE_MIN_SIZE: usize = 0x42;
 const NTFS_VOLUME_ROOT_RECORD_NUMBER: u64 = 5;
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+const INVALID_INDEX: u32 = u32::MAX;
 
 type ParsedFileNameList = SmallVec<[ParsedFileNameAttribute; 2]>;
 
@@ -180,8 +180,8 @@ pub struct RawMftIndexEntry {
     pub allocated_size: u64,
     pub subtree_logical_size: u64,
     pub subtree_allocated_size: u64,
-    pub subtree_file_count: u64,
-    pub subtree_dir_count: u64,
+    pub subtree_file_count: u32,
+    pub subtree_dir_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -663,10 +663,10 @@ fn project_raw_mft_index_with_root_visibility(
             .saturating_add(entry.subtree_allocated_size);
         projection.total_file_entries = projection
             .total_file_entries
-            .saturating_add(entry.subtree_file_count);
+            .saturating_add(u64::from(entry.subtree_file_count));
         projection.total_dir_entries = projection
             .total_dir_entries
-            .saturating_add(entry.subtree_dir_count);
+            .saturating_add(u64::from(entry.subtree_dir_count));
     }
 
     projection
@@ -1145,12 +1145,12 @@ struct RawMftIndexAggregate {
 struct RawMftIndexBuild {
     summary: RawMftIndexSummary,
     entries: Vec<RawMftIndexAggregate>,
-    entry_index: Vec<usize>,
+    entry_index: Vec<u32>,
 }
 
 #[derive(Default)]
-struct MaterializedRawMftChunk {
-    entries: Vec<RawMftIndexEntry>,
+struct MaterializedRawMftSummary {
+    materialized_entries: usize,
     entries_without_data_size: usize,
     files_without_data_size: usize,
     dirs_without_data_size: usize,
@@ -1180,7 +1180,7 @@ impl RawMftIndexBuild {
                 ..RawMftIndexSummary::default()
             },
             entries: Vec::new(),
-            entry_index: vec![usize::MAX; expected_records.saturating_add(1)],
+            entry_index: vec![INVALID_INDEX; expected_records.saturating_add(1)],
         }
     }
 
@@ -1199,10 +1199,11 @@ impl RawMftIndexBuild {
         let from_owner = record_number == owner_record_number;
         let owner_idx = owner_record_number as usize;
         if owner_idx >= self.entry_index.len() {
-            self.entry_index.resize(owner_idx + 1, usize::MAX);
+            self.entry_index.resize(owner_idx + 1, INVALID_INDEX);
         }
-        if self.entry_index[owner_idx] == usize::MAX {
+        if self.entry_index[owner_idx] == INVALID_INDEX {
             let idx = self.entries.len();
+            let idx_u32 = u32::try_from(idx).expect("raw MFT entry index overflow");
             let (logical_size, allocated_size, size_from_owner) =
                 if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size) {
                     (Some(logical_size), Some(allocated_size), from_owner)
@@ -1219,11 +1220,11 @@ impl RawMftIndexBuild {
                 link_count: if from_owner { link_count } else { None },
                 is_name_surrogate_reparse,
             });
-            self.entry_index[owner_idx] = idx;
+            self.entry_index[owner_idx] = idx_u32;
             return;
         }
 
-        let entry = &mut self.entries[self.entry_index[owner_idx]];
+        let entry = &mut self.entries[self.entry_index[owner_idx] as usize];
         entry.is_directory |= is_directory;
         entry.is_name_surrogate_reparse |= is_name_surrogate_reparse;
         if from_owner {
@@ -1242,32 +1243,27 @@ impl RawMftIndexBuild {
     }
 
     fn finish(mut self) -> RawMftIndex {
-        let materialized_chunks: Vec<_> = self
+        let materialized_summaries: Vec<_> = self
             .entries
-            .into_par_iter()
-            .chunks(RAW_MFT_MATERIALIZE_CHUNK)
-            .map(|chunk: Vec<RawMftIndexAggregate>| {
-                let mut out = MaterializedRawMftChunk::default();
-                out.entries.reserve(chunk.len());
+            .par_chunks(RAW_MFT_MATERIALIZE_CHUNK)
+            .map(|chunk| {
+                let mut out = MaterializedRawMftSummary::default();
                 for entry in chunk {
-                    materialize_raw_mft_entry(entry, &mut out);
+                    accumulate_materialized_entry_summary(entry, &mut out);
                 }
                 out
             })
             .collect();
 
-        let mut entries_without_data_size = 0usize;
-        let mut files_without_data_size = 0usize;
-        let mut dirs_without_data_size = 0usize;
-        let total_materialized = materialized_chunks
+        let total_materialized = materialized_summaries
             .iter()
-            .map(|chunk| chunk.entries.len())
+            .map(|chunk| chunk.materialized_entries)
             .sum();
         let mut final_entries = Vec::with_capacity(total_materialized);
-        for mut chunk in materialized_chunks {
-            entries_without_data_size += chunk.entries_without_data_size;
-            files_without_data_size += chunk.files_without_data_size;
-            dirs_without_data_size += chunk.dirs_without_data_size;
+        for chunk in materialized_summaries {
+            self.summary.entries_without_data_size += chunk.entries_without_data_size;
+            self.summary.files_without_data_size += chunk.files_without_data_size;
+            self.summary.dirs_without_data_size += chunk.dirs_without_data_size;
             self.summary.multi_name_entries += chunk.multi_name_entries;
             self.summary.extra_primary_names = self
                 .summary
@@ -1281,7 +1277,10 @@ impl RawMftIndexBuild {
                 .summary
                 .extra_primary_name_allocated_size
                 .saturating_add(chunk.extra_primary_name_allocated_size);
-            final_entries.append(&mut chunk.entries);
+        }
+
+        for entry in self.entries.into_iter() {
+            materialize_raw_mft_entry(entry, &mut final_entries);
         }
 
         let max_record_number = final_entries
@@ -1289,15 +1288,16 @@ impl RawMftIndexBuild {
             .map(|entry| entry.record_number as usize)
             .max()
             .unwrap_or(0);
-        let mut canonical_parent_index = vec![usize::MAX; max_record_number.saturating_add(1)];
+        let mut canonical_parent_index = vec![INVALID_INDEX; max_record_number.saturating_add(1)];
         for (idx, entry) in final_entries.iter().enumerate() {
             let record_number = entry.record_number as usize;
-            if entry.is_directory && canonical_parent_index[record_number] == usize::MAX {
-                canonical_parent_index[record_number] = idx;
+            if entry.is_directory && canonical_parent_index[record_number] == INVALID_INDEX {
+                canonical_parent_index[record_number] =
+                    u32::try_from(idx).expect("raw MFT canonical parent index overflow");
             }
         }
-        let mut parent_indices = vec![usize::MAX; final_entries.len()];
-        let mut pending_children = vec![0usize; final_entries.len()];
+        let mut parent_indices = vec![INVALID_INDEX; final_entries.len()];
+        let mut pending_children = vec![0u32; final_entries.len()];
         let mut root_entries = 0usize;
 
         for (idx, entry) in final_entries.iter().enumerate() {
@@ -1307,11 +1307,11 @@ impl RawMftIndexBuild {
             }
             let parent_record_number = entry.parent_record_number as usize;
             if parent_record_number < canonical_parent_index.len()
-                && canonical_parent_index[parent_record_number] != usize::MAX
+                && canonical_parent_index[parent_record_number] != INVALID_INDEX
             {
                 let parent_idx = canonical_parent_index[parent_record_number];
                 parent_indices[idx] = parent_idx;
-                pending_children[parent_idx] += 1;
+                pending_children[parent_idx as usize] += 1;
             } else {
                 root_entries += 1;
             }
@@ -1320,15 +1320,17 @@ impl RawMftIndexBuild {
         let mut ready = Vec::with_capacity(final_entries.len());
         for (idx, child_count) in pending_children.iter().enumerate() {
             if *child_count == 0 {
-                ready.push(idx);
+                ready.push(u32::try_from(idx).expect("raw MFT ready index overflow"));
             }
         }
 
         while let Some(child_idx) = ready.pop() {
+            let child_idx = child_idx as usize;
             let parent_idx = parent_indices[child_idx];
-            if parent_idx == usize::MAX {
+            if parent_idx == INVALID_INDEX {
                 continue;
             }
+            let parent_idx = parent_idx as usize;
 
             let child_logical = final_entries[child_idx].subtree_logical_size;
             let child_allocated = final_entries[child_idx].subtree_allocated_size;
@@ -1344,16 +1346,13 @@ impl RawMftIndexBuild {
 
             pending_children[parent_idx] -= 1;
             if pending_children[parent_idx] == 0 {
-                ready.push(parent_idx);
+                ready.push(u32::try_from(parent_idx).expect("raw MFT ready parent index overflow"));
             }
         }
 
         self.summary.indexed_entries = final_entries.len();
         self.summary.total_file_entries = final_entries.iter().filter(|entry| !entry.is_directory).count();
         self.summary.total_dir_entries = final_entries.iter().filter(|entry| entry.is_directory).count();
-        self.summary.entries_without_data_size = entries_without_data_size;
-        self.summary.files_without_data_size = files_without_data_size;
-        self.summary.dirs_without_data_size = dirs_without_data_size;
         self.summary.root_entries = root_entries;
 
         let root_entry = final_entries
@@ -1366,7 +1365,7 @@ impl RawMftIndexBuild {
             final_entries
                 .iter()
                 .enumerate()
-                .filter(|(idx, _)| parent_indices[*idx] == usize::MAX)
+                .filter(|(idx, _)| parent_indices[*idx] == INVALID_INDEX)
                 .map(|(_, entry)| entry.subtree_logical_size)
                 .sum()
         };
@@ -1376,7 +1375,7 @@ impl RawMftIndexBuild {
             final_entries
                 .iter()
                 .enumerate()
-                .filter(|(idx, _)| parent_indices[*idx] == usize::MAX)
+                .filter(|(idx, _)| parent_indices[*idx] == INVALID_INDEX)
                 .map(|(_, entry)| entry.subtree_allocated_size)
                 .sum()
         };
@@ -1389,7 +1388,7 @@ impl RawMftIndexBuild {
     }
 }
 
-fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut MaterializedRawMftChunk) {
+fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut Vec<RawMftIndexEntry>) {
     if entry.is_name_surrogate_reparse {
         return;
     }
@@ -1402,9 +1401,46 @@ fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut Materialized
     if file_names.is_empty() {
         return;
     }
-    if file_names.len() > 1 {
+    let logical_size = entry.logical_size.unwrap_or(0);
+    let allocated_size = entry.allocated_size.unwrap_or(0);
+    for file_name in file_names {
+        out.push(RawMftIndexEntry {
+            record_number: entry.record_number,
+            parent_record_number: file_name.parent_record_number,
+            attributes: file_name.attributes,
+            name: file_name.name.into_boxed_str(),
+            is_directory: entry.is_directory,
+            logical_size,
+            allocated_size,
+            subtree_logical_size: logical_size,
+            subtree_allocated_size: allocated_size,
+            subtree_file_count: u32::from(!entry.is_directory),
+            subtree_dir_count: u32::from(entry.is_directory),
+        });
+    }
+}
+
+fn accumulate_materialized_entry_summary(
+    entry: &RawMftIndexAggregate,
+    out: &mut MaterializedRawMftSummary,
+) {
+    if entry.is_name_surrogate_reparse {
+        return;
+    }
+    let link_limit = if entry.is_directory {
+        1
+    } else {
+        usize::from(entry.link_count.unwrap_or(1).max(1))
+    };
+    let materialized_count = materialized_file_name_count(&entry.file_names, link_limit);
+    if materialized_count == 0 {
+        return;
+    }
+
+    out.materialized_entries += materialized_count;
+    if materialized_count > 1 {
         out.multi_name_entries += 1;
-        let extra_names = (file_names.len() - 1) as u64;
+        let extra_names = (materialized_count - 1) as u64;
         out.extra_primary_names += extra_names;
         if !entry.is_directory {
             out.extra_primary_name_logical_size = out
@@ -1415,31 +1451,41 @@ fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut Materialized
                 .saturating_add(extra_names.saturating_mul(entry.allocated_size.unwrap_or(0)));
         }
     }
-    let logical_size = entry.logical_size.unwrap_or(0);
-    let allocated_size = entry.allocated_size.unwrap_or(0);
-    for file_name in file_names {
-        if entry.logical_size.is_none() {
-            out.entries_without_data_size += 1;
-            if entry.is_directory {
-                out.dirs_without_data_size += 1;
-            } else {
-                out.files_without_data_size += 1;
-            }
+    if entry.logical_size.is_none() {
+        out.entries_without_data_size += materialized_count;
+        if entry.is_directory {
+            out.dirs_without_data_size += materialized_count;
+        } else {
+            out.files_without_data_size += materialized_count;
         }
-        out.entries.push(RawMftIndexEntry {
-            record_number: entry.record_number,
-            parent_record_number: file_name.parent_record_number,
-            attributes: file_name.attributes,
-            name: file_name.name.into_boxed_str(),
-            is_directory: entry.is_directory,
-            logical_size,
-            allocated_size,
-            subtree_logical_size: logical_size,
-            subtree_allocated_size: allocated_size,
-            subtree_file_count: u64::from(!entry.is_directory),
-            subtree_dir_count: u64::from(entry.is_directory),
-        });
     }
+}
+
+fn materialized_file_name_count(
+    file_names: &[ParsedFileNameAttribute],
+    max_names: usize,
+) -> usize {
+    if max_names == 0 || file_names.is_empty() {
+        return 0;
+    }
+    if file_names.len() == 1 {
+        return 1;
+    }
+    if file_names.len() == 2 {
+        let a = &file_names[0];
+        let b = &file_names[1];
+        if a.parent_record_number == b.parent_record_number && a.name == b.name {
+            return 1;
+        }
+        let mut count = usize::from(a.namespace_rank > 1) + usize::from(b.namespace_rank > 1);
+        if count == 0 {
+            count = 1;
+        }
+        return count.min(max_names);
+    }
+
+    let cloned: ParsedFileNameList = file_names.iter().cloned().collect();
+    materialized_file_names(cloned, max_names).len()
 }
 
 fn parse_raw_mft_record(record: &[u8], record_number: u64) -> io::Result<Option<ParsedRawMftRecord>> {

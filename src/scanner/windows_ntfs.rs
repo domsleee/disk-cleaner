@@ -602,7 +602,7 @@ pub fn project_raw_mft_index_to_win32_root(
     index: &RawMftIndex,
     volume_root: &Path,
 ) -> io::Result<RawMftWin32RootProjection> {
-    let _ = disable_backup_privilege();
+    let _backup_privilege = suspend_backup_privilege()?;
     let visibility = collect_win32_root_visibility(volume_root)?;
     Ok(project_raw_mft_index_with_root_visibility(index, &visibility))
 }
@@ -1056,7 +1056,51 @@ fn enable_backup_privilege() -> io::Result<()> {
     Ok(())
 }
 
-fn disable_backup_privilege() -> io::Result<()> {
+struct SuspendedBackupPrivilege {
+    token: Option<HandleGuard>,
+    previous_state: TOKEN_PRIVILEGES,
+    previous_state_len: u32,
+}
+
+impl SuspendedBackupPrivilege {
+    fn noop() -> Self {
+        Self {
+            token: None,
+            previous_state: TOKEN_PRIVILEGES {
+                PrivilegeCount: 0,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: LUID::default(),
+                    Attributes: 0,
+                }],
+            },
+            previous_state_len: 0,
+        }
+    }
+}
+
+impl Drop for SuspendedBackupPrivilege {
+    fn drop(&mut self) {
+        let Some(token) = &self.token else {
+            return;
+        };
+        if self.previous_state_len == 0 || self.previous_state.PrivilegeCount == 0 {
+            return;
+        }
+
+        let _ = unsafe {
+            AdjustTokenPrivileges(
+                token.0,
+                0,
+                &mut self.previous_state,
+                size_of::<TOKEN_PRIVILEGES>() as u32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+    }
+}
+
+fn suspend_backup_privilege() -> io::Result<SuspendedBackupPrivilege> {
     let mut token = INVALID_HANDLE_VALUE;
     let ok = unsafe {
         OpenProcessToken(
@@ -1084,21 +1128,38 @@ fn disable_backup_privilege() -> io::Result<()> {
             Attributes: 0,
         }],
     };
+    let mut previous_state = TOKEN_PRIVILEGES {
+        PrivilegeCount: 0,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: LUID::default(),
+            Attributes: 0,
+        }],
+    };
+    let mut previous_state_len = 0u32;
     let ok = unsafe {
         AdjustTokenPrivileges(
             token.0,
             0,
             &mut privileges,
             size_of::<TOKEN_PRIVILEGES>() as u32,
-            ptr::null_mut(),
-            ptr::null_mut(),
+            &mut previous_state,
+            &mut previous_state_len,
         )
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(())
+    let err = unsafe { GetLastError() };
+    if err == ERROR_NOT_ALL_ASSIGNED {
+        return Ok(SuspendedBackupPrivilege::noop());
+    }
+
+    Ok(SuspendedBackupPrivilege {
+        token: Some(token),
+        previous_state,
+        previous_state_len,
+    })
 }
 
 #[derive(Debug)]

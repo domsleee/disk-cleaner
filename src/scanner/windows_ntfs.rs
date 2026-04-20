@@ -45,6 +45,7 @@ const OUT_BUF_SIZE: usize = 1024 * 1024;
 const SAMPLE_LIMIT: usize = 16;
 const RAW_MFT_PIPELINE_DEPTH: usize = 2;
 const RAW_MFT_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const RAW_MFT_VOLUME_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const RAW_MFT_MATERIALIZE_CHUNK: usize = 16_384;
 const USN_PAGE_HEADER_SIZE: usize = size_of::<u64>();
 const ATTR_TYPE_DATA: u32 = 0x80;
@@ -171,13 +172,11 @@ pub struct RawMftSummary {
 
 #[derive(Debug, Clone)]
 pub struct RawMftIndexEntry {
-    pub record_number: u64,
-    pub parent_record_number: u64,
+    pub record_number: u32,
+    pub parent_record_number: u32,
     pub attributes: u32,
     pub name: Box<str>,
     pub is_directory: bool,
-    pub logical_size: u64,
-    pub allocated_size: u64,
     pub subtree_logical_size: u64,
     pub subtree_allocated_size: u64,
     pub subtree_file_count: u32,
@@ -634,8 +633,8 @@ fn project_raw_mft_index_with_root_visibility(
     };
 
     for entry in index.entries.iter().filter(|entry| {
-        entry.parent_record_number == NTFS_VOLUME_ROOT_RECORD_NUMBER
-            && entry.record_number != NTFS_VOLUME_ROOT_RECORD_NUMBER
+        u64::from(entry.parent_record_number) == NTFS_VOLUME_ROOT_RECORD_NUMBER
+            && u64::from(entry.record_number) != NTFS_VOLUME_ROOT_RECORD_NUMBER
     }) {
         let key = entry.name.to_lowercase();
         let Some(root_state) = visibility.get(&key) else {
@@ -646,11 +645,6 @@ fn project_raw_mft_index_with_root_visibility(
         projection.visible_root_entries += 1;
         if entry.is_directory && !root_state.can_recurse {
             projection.blocked_root_dirs += 1;
-            projection.total_logical_size =
-                projection.total_logical_size.saturating_add(entry.logical_size);
-            projection.total_allocated_size = projection
-                .total_allocated_size
-                .saturating_add(entry.allocated_size);
             projection.total_dir_entries = projection.total_dir_entries.saturating_add(1);
             continue;
         }
@@ -1172,6 +1166,8 @@ impl RawMftIndexBuild {
         bytes_per_file_record: u32,
         expected_records: usize,
     ) -> Self {
+        let mut entries = Vec::new();
+        let _ = entries.try_reserve_exact(expected_records);
         Self {
             summary: RawMftIndexSummary {
                 volume_root,
@@ -1179,7 +1175,7 @@ impl RawMftIndexBuild {
                 bytes_per_file_record,
                 ..RawMftIndexSummary::default()
             },
-            entries: Vec::new(),
+            entries,
             entry_index: vec![INVALID_INDEX; expected_records.saturating_add(1)],
         }
     }
@@ -1243,6 +1239,7 @@ impl RawMftIndexBuild {
     }
 
     fn finish(mut self) -> RawMftIndex {
+        let record_index_len = self.entry_index.len();
         let materialized_summaries: Vec<_> = self
             .entries
             .par_chunks(RAW_MFT_MATERIALIZE_CHUNK)
@@ -1280,15 +1277,12 @@ impl RawMftIndexBuild {
         }
 
         for entry in self.entries.into_iter() {
-            materialize_raw_mft_entry(entry, &mut final_entries);
+            let pushed =
+                materialize_raw_mft_entry(entry, &mut final_entries, total_materialized);
+            debug_assert!(pushed <= total_materialized);
         }
 
-        let max_record_number = final_entries
-            .iter()
-            .map(|entry| entry.record_number as usize)
-            .max()
-            .unwrap_or(0);
-        let mut canonical_parent_index = vec![INVALID_INDEX; max_record_number.saturating_add(1)];
+        let mut canonical_parent_index = vec![INVALID_INDEX; record_index_len];
         for (idx, entry) in final_entries.iter().enumerate() {
             let record_number = entry.record_number as usize;
             if entry.is_directory && canonical_parent_index[record_number] == INVALID_INDEX {
@@ -1357,7 +1351,10 @@ impl RawMftIndexBuild {
 
         let root_entry = final_entries
             .iter()
-            .find(|entry| entry.is_directory && entry.record_number == NTFS_VOLUME_ROOT_RECORD_NUMBER);
+            .find(|entry| {
+                entry.is_directory
+                    && u64::from(entry.record_number) == NTFS_VOLUME_ROOT_RECORD_NUMBER
+            });
 
         self.summary.total_logical_size = if let Some(root) = root_entry {
             root.subtree_logical_size
@@ -1388,9 +1385,13 @@ impl RawMftIndexBuild {
     }
 }
 
-fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut Vec<RawMftIndexEntry>) {
+fn materialize_raw_mft_entry(
+    entry: RawMftIndexAggregate,
+    out: &mut Vec<RawMftIndexEntry>,
+    total_materialized: usize,
+) -> usize {
     if entry.is_name_surrogate_reparse {
-        return;
+        return 0;
     }
     let link_limit = if entry.is_directory {
         1
@@ -1399,25 +1400,38 @@ fn materialize_raw_mft_entry(entry: RawMftIndexAggregate, out: &mut Vec<RawMftIn
     };
     let file_names = materialized_file_names(entry.file_names, link_limit);
     if file_names.is_empty() {
-        return;
+        return 0;
+    }
+    if out.len().saturating_add(file_names.len()) > total_materialized {
+        panic!(
+            "raw MFT materialization overflow: len={} + pushed={} > total={} record={} link_limit={} dir={}",
+            out.len(),
+            file_names.len(),
+            total_materialized,
+            entry.record_number,
+            link_limit,
+            entry.is_directory
+        );
     }
     let logical_size = entry.logical_size.unwrap_or(0);
     let allocated_size = entry.allocated_size.unwrap_or(0);
+    let pushed = file_names.len();
     for file_name in file_names {
         out.push(RawMftIndexEntry {
-            record_number: entry.record_number,
-            parent_record_number: file_name.parent_record_number,
+            record_number: u32::try_from(entry.record_number)
+                .expect("raw MFT record number exceeds u32"),
+            parent_record_number: u32::try_from(file_name.parent_record_number)
+                .expect("raw MFT parent record number exceeds u32"),
             attributes: file_name.attributes,
             name: file_name.name.into_boxed_str(),
             is_directory: entry.is_directory,
-            logical_size,
-            allocated_size,
             subtree_logical_size: logical_size,
             subtree_allocated_size: allocated_size,
             subtree_file_count: u32::from(!entry.is_directory),
             subtree_dir_count: u32::from(entry.is_directory),
         });
     }
+    pushed
 }
 
 fn accumulate_materialized_entry_summary(
@@ -2043,7 +2057,7 @@ fn probe_raw_mft_via_volume(
     let mut next_record_number = 0u64;
     let mut bytes_remaining = summary.mft_valid_data_length;
     let mut partial = Vec::<u8>::new();
-    let mut io_buf = vec![0u8; 4 * 1024 * 1024];
+    let mut io_buf = vec![0u8; RAW_MFT_VOLUME_READ_CHUNK_BYTES];
 
     for run in data_runs {
         if bytes_remaining == 0 || next_record_number as usize >= target_records {
@@ -2141,7 +2155,7 @@ fn build_raw_mft_index_via_volume(
     let mut next_record_number = 0u64;
     let mut bytes_remaining = valid_len;
     let mut partial = Vec::<u8>::new();
-    let mut io_buf = vec![0u8; 4 * 1024 * 1024];
+    let mut io_buf = vec![0u8; RAW_MFT_VOLUME_READ_CHUNK_BYTES];
 
     for run in data_runs {
         if bytes_remaining == 0 || next_record_number as usize >= target_records {
@@ -2931,8 +2945,8 @@ mod tests {
         let entry = &index.entries[0];
         assert_eq!(entry.record_number, 42);
         assert_eq!(entry.name.as_ref(), "base.txt");
-        assert_eq!(entry.logical_size, 1234);
-        assert_eq!(entry.allocated_size, 4096);
+        assert_eq!(entry.subtree_logical_size, 1234);
+        assert_eq!(entry.subtree_allocated_size, 4096);
         assert_eq!(index.summary.files_without_data_size, 0);
     }
 
@@ -2965,8 +2979,8 @@ mod tests {
         let entry = &index.entries[0];
         assert_eq!(entry.record_number, 77);
         assert_eq!(entry.name.as_ref(), "fallback.bin");
-        assert_eq!(entry.logical_size, 7);
-        assert_eq!(entry.allocated_size, 8);
+        assert_eq!(entry.subtree_logical_size, 7);
+        assert_eq!(entry.subtree_allocated_size, 8);
     }
 
     #[test]
@@ -3043,8 +3057,6 @@ mod tests {
                     attributes: 0,
                     name: ".".into(),
                     is_directory: true,
-                    logical_size: 0,
-                    allocated_size: 0,
                     subtree_logical_size: 300,
                     subtree_allocated_size: 400,
                     subtree_file_count: 2,
@@ -3056,8 +3068,6 @@ mod tests {
                     attributes: 0,
                     name: "Users".into(),
                     is_directory: true,
-                    logical_size: 0,
-                    allocated_size: 0,
                     subtree_logical_size: 200,
                     subtree_allocated_size: 300,
                     subtree_file_count: 2,
@@ -3069,8 +3079,6 @@ mod tests {
                     attributes: 0,
                     name: "$MFT".into(),
                     is_directory: false,
-                    logical_size: 100,
-                    allocated_size: 100,
                     subtree_logical_size: 100,
                     subtree_allocated_size: 100,
                     subtree_file_count: 1,
@@ -3102,8 +3110,6 @@ mod tests {
                 attributes: 0,
                 name: "System Volume Information".into(),
                 is_directory: true,
-                logical_size: 0,
-                allocated_size: 0,
                 subtree_logical_size: 500,
                 subtree_allocated_size: 600,
                 subtree_file_count: 9,

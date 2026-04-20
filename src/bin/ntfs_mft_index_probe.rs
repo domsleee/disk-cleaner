@@ -104,11 +104,10 @@ fn main() {
         println!("Samples:");
         for entry in &summary.sample_entries {
             println!(
-                "  frn={} parent={} dir={} logical={} subtree={} files={} dirs={} {}",
+                "  frn={} parent={} dir={} subtree={} files={} dirs={} {}",
                 entry.record_number,
                 entry.parent_record_number,
                 entry.is_directory,
-                entry.logical_size,
                 entry.subtree_logical_size,
                 entry.subtree_file_count,
                 entry.subtree_dir_count,
@@ -128,9 +127,8 @@ fn main() {
         println!("Top root entries:");
         for entry in root_entries.into_iter().take(count) {
             println!(
-                "  subtree={} logical={} dir={} files={} dirs={} frn={} {}",
+                "  subtree={} dir={} files={} dirs={} frn={} {}",
                 entry.subtree_logical_size,
-                entry.logical_size,
                 entry.is_directory,
                 entry.subtree_file_count,
                 entry.subtree_dir_count,

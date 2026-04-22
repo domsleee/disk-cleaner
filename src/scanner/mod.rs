@@ -167,6 +167,7 @@ pub struct ScanProgress {
 const MAX_FALLBACK_DETAILS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ScanFallbackKind {
     AccessDeniedOpen,
     OtherOpen,

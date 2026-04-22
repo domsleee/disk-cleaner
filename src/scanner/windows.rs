@@ -50,6 +50,7 @@ const N: u16 = b'N' as u16;
 const C: u16 = b'C' as u16;
 const DOT: u16 = b'.' as u16;
 const PAR_THRESHOLD: usize = 4;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 
 thread_local! {
     static DIR_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; BUF_SIZE]);
@@ -160,6 +161,11 @@ impl DirectoryHandle {
 
         if status >= 0 {
             Ok(Self(handle))
+        } else if status == STATUS_ACCESS_DENIED {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("NtOpenFile failed with NTSTATUS 0x{status:08x}"),
+            ))
         } else {
             Err(io::Error::other(format!(
                 "NtOpenFile failed with NTSTATUS 0x{status:08x}"
@@ -427,12 +433,12 @@ fn walk_child_dir(
         Ok(child_handle) => match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
             Ok(node) => node,
             Err(err) => {
-                progress.record_windows_fallback("child bulk scan", &child_path, &err);
+                progress.record_windows_bulk_scan_fallback("child bulk scan", &child_path, &err);
                 super::walk_dir(&child_path, progress, skip)
             }
         },
         Err(err) => {
-            progress.record_windows_fallback("child open", &child_path, &err);
+            progress.record_windows_child_open_fallback(&child_path, &err);
             super::walk_dir(&child_path, progress, skip)
         }
     }

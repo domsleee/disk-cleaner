@@ -6,6 +6,42 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+
+    let other_open = total
+        .saturating_sub(access_denied)
+        .saturating_sub(bulk_scan);
+
+    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
+        return Some(format!(
+            "{} access-denied fallback{}",
+            access_denied,
+            if access_denied == 1 { "" } else { "s" }
+        ));
+    }
+
+    let mut parts = Vec::new();
+    if access_denied > 0 {
+        parts.push(format!("{access_denied} access denied"));
+    }
+    if other_open > 0 {
+        parts.push(format!("{other_open} other open"));
+    }
+    if bulk_scan > 0 {
+        parts.push(format!("{bulk_scan} bulk scan"));
+    }
+
+    Some(format!(
+        "{} fallback{} ({})",
+        total,
+        if total == 1 { "" } else { "s" },
+        parts.join(", ")
+    ))
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -24,6 +60,8 @@ fn main() {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
         fallback_count: AtomicU64::new(0),
+        access_denied_fallback_count: AtomicU64::new(0),
+        bulk_scan_fallback_count: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
     });
 
@@ -32,14 +70,17 @@ fn main() {
     let files = progress.file_count.load(Ordering::Relaxed);
     let size = progress.total_size.load(Ordering::Relaxed);
     let fallbacks = progress.fallback_count.load(Ordering::Relaxed);
-    if fallbacks > 0 {
+    let access_denied = progress
+        .access_denied_fallback_count
+        .load(Ordering::Relaxed);
+    let bulk_scan = progress.bulk_scan_fallback_count.load(Ordering::Relaxed);
+    if let Some(fallback_summary) = format_fallback_summary(fallbacks, access_denied, bulk_scan) {
         println!(
-            "{} files, {} bytes ({}) [{} fallback{}]",
+            "{} files, {} bytes ({}) [{}]",
             files,
             size,
             bytesize::ByteSize::b(size),
-            fallbacks,
-            if fallbacks == 1 { "" } else { "s" }
+            fallback_summary,
         );
     } else {
         println!(

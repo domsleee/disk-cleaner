@@ -37,6 +37,55 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+fn format_fallback_summary(
+    total: u64,
+    access_denied: u64,
+    bulk_scan: u64,
+) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+
+    let other_open = total
+        .saturating_sub(access_denied)
+        .saturating_sub(bulk_scan);
+
+    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
+        return Some(format!(
+            "{} access-denied fallback{}",
+            access_denied,
+            if access_denied == 1 { "" } else { "s" }
+        ));
+    }
+
+    let mut parts = Vec::new();
+    if access_denied > 0 {
+        parts.push(format!(
+            "{} access denied",
+            access_denied
+        ));
+    }
+    if other_open > 0 {
+        parts.push(format!(
+            "{} other open",
+            other_open
+        ));
+    }
+    if bulk_scan > 0 {
+        parts.push(format!(
+            "{} bulk scan",
+            bulk_scan
+        ));
+    }
+
+    Some(format!(
+        "{} fallback{} ({})",
+        total,
+        if total == 1 { "" } else { "s" },
+        parts.join(", ")
+    ))
+}
+
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
@@ -255,6 +304,8 @@ struct App {
     last_scan_total_size: u64,
     last_scan_duration: Option<Duration>,
     last_scan_fallback_count: u64,
+    last_scan_access_denied_fallback_count: u64,
+    last_scan_bulk_scan_fallback_count: u64,
     show_categories: bool,
     tree_scroll_to_focus: bool,
     /// Cached visible row list for rendering; rebuilt when dirty.
@@ -296,6 +347,8 @@ impl Default for App {
                 file_count: 0.into(),
                 total_size: 0.into(),
                 fallback_count: 0.into(),
+                access_denied_fallback_count: 0.into(),
+                bulk_scan_fallback_count: 0.into(),
                 cancelled: false.into(),
             }),
             receiver: None,
@@ -322,6 +375,8 @@ impl Default for App {
             last_scan_total_size: 0,
             last_scan_duration: None,
             last_scan_fallback_count: 0,
+            last_scan_access_denied_fallback_count: 0,
+            last_scan_bulk_scan_fallback_count: 0,
             show_categories: false,
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
@@ -369,6 +424,8 @@ impl App {
             file_count: 0.into(),
             total_size: 0.into(),
             fallback_count: 0.into(),
+            access_denied_fallback_count: 0.into(),
+            bulk_scan_fallback_count: 0.into(),
             cancelled: false.into(),
         });
         self.scan_progress = progress.clone();
@@ -379,6 +436,8 @@ impl App {
         self.scan_start_time = Some(Instant::now());
         self.last_scan_duration = None;
         self.last_scan_fallback_count = 0;
+        self.last_scan_access_denied_fallback_count = 0;
+        self.last_scan_bulk_scan_fallback_count = 0;
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
@@ -541,6 +600,14 @@ impl eframe::App for App {
             self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
             self.last_scan_fallback_count =
                 self.scan_progress.fallback_count.load(Ordering::Relaxed);
+            self.last_scan_access_denied_fallback_count = self
+                .scan_progress
+                .access_denied_fallback_count
+                .load(Ordering::Relaxed);
+            self.last_scan_bulk_scan_fallback_count = self
+                .scan_progress
+                .bulk_scan_fallback_count
+                .load(Ordering::Relaxed);
             self.scanning = false;
             self.receiver = None;
             self.category_filter = None;
@@ -568,7 +635,12 @@ impl eframe::App for App {
                         if self.last_scan_fallback_count > 0 {
                             eprintln!(
                                 "[perf] windows bulk fallbacks: {}",
-                                self.last_scan_fallback_count
+                                format_fallback_summary(
+                                    self.last_scan_fallback_count,
+                                    self.last_scan_access_denied_fallback_count,
+                                    self.last_scan_bulk_scan_fallback_count
+                                )
+                                .unwrap_or_else(|| self.last_scan_fallback_count.to_string())
                             );
                         }
                         eprintln!(
@@ -1187,16 +1259,12 @@ impl eframe::App for App {
                     if self.tree.is_some() && !self.scanning {
                         if let Some(duration) = self.last_scan_duration {
                             let mut summary = format!("Scan: {}", format_elapsed(duration));
-                            if self.last_scan_fallback_count > 0 {
-                                let suffix = if self.last_scan_fallback_count == 1 {
-                                    "fallback"
-                                } else {
-                                    "fallbacks"
-                                };
-                                summary.push_str(&format!(
-                                    " • {} {suffix}",
-                                    self.last_scan_fallback_count
-                                ));
+                            if let Some(fallback_summary) = format_fallback_summary(
+                                self.last_scan_fallback_count,
+                                self.last_scan_access_denied_fallback_count,
+                                self.last_scan_bulk_scan_fallback_count,
+                            ) {
+                                summary.push_str(&format!(" • {fallback_summary}"));
                             }
                             ui.label(egui::RichText::new(summary).small().weak());
                             ui.separator();

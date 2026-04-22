@@ -156,19 +156,32 @@ pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
     pub fallback_count: AtomicU64,
+    pub access_denied_fallback_count: AtomicU64,
+    pub bulk_scan_fallback_count: AtomicU64,
     pub cancelled: AtomicBool,
 }
 
 impl ScanProgress {
     #[cfg(target_os = "windows")]
-    pub(crate) fn record_windows_fallback(&self, stage: &str, path: &Path, err: &io::Error) {
+    pub(crate) fn record_windows_bulk_scan_fallback(
+        &self,
+        stage: &str,
+        path: &Path,
+        err: &io::Error,
+    ) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
-        if windows_fallback_logging_enabled() {
-            eprintln!(
-                "[scan][windows] bulk fallback ({stage}) for {}: {err}",
-                path.display()
-            );
+        self.bulk_scan_fallback_count.fetch_add(1, Ordering::Relaxed);
+        log_windows_fallback(stage, path, err);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_child_open_fallback(&self, path: &Path, err: &io::Error) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            self.access_denied_fallback_count
+                .fetch_add(1, Ordering::Relaxed);
         }
+        log_windows_fallback("child open", path, err);
     }
 }
 
@@ -179,6 +192,16 @@ fn windows_fallback_logging_enabled() -> bool {
         std::env::var("DISK_CLEANER_LOG_WINDOWS_FALLBACKS")
             .is_ok_and(|value| value != "0")
     })
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_fallback(stage: &str, path: &Path, err: &io::Error) {
+    if windows_fallback_logging_enabled() {
+        eprintln!(
+            "[scan][windows] bulk fallback ({stage}) for {}: {err}",
+            path.display()
+        );
+    }
 }
 
 /// Build a set of paths to skip during scanning to avoid double-counting.
@@ -309,7 +332,7 @@ fn scan_directory_inner(
         }) {
             Ok(node) => node,
             Err(err) => {
-                progress.record_windows_fallback("root bulk scan", root, &err);
+                progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
                 walk_dir(root, &progress, &skip)
             }
         }
@@ -472,6 +495,8 @@ mod tests {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
             fallback_count: AtomicU64::new(0),
+            access_denied_fallback_count: AtomicU64::new(0),
+            bulk_scan_fallback_count: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -766,6 +791,16 @@ mod tests {
             progress.fallback_count.load(Ordering::Relaxed),
             1,
             "fallback counter should record the Windows child open fallback"
+        );
+        assert_eq!(
+            progress.access_denied_fallback_count.load(Ordering::Relaxed),
+            0,
+            "injected open failure should not be classified as access denied"
+        );
+        assert_eq!(
+            progress.bulk_scan_fallback_count.load(Ordering::Relaxed),
+            0,
+            "child open fallback should not be classified as a bulk scan failure"
         );
     }
 

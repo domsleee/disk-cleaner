@@ -31,6 +31,8 @@ fn progress() -> Arc<ScanProgress> {
         file_count: std::sync::atomic::AtomicU64::new(0),
         total_size: std::sync::atomic::AtomicU64::new(0),
         fallback_count: std::sync::atomic::AtomicU64::new(0),
+        access_denied_fallback_count: std::sync::atomic::AtomicU64::new(0),
+        bulk_scan_fallback_count: std::sync::atomic::AtomicU64::new(0),
         cancelled: std::sync::atomic::AtomicBool::new(false),
     })
 }

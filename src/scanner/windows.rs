@@ -426,9 +426,15 @@ fn walk_child_dir(
     match dir_handle.open_relative(&name) {
         Ok(child_handle) => match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
             Ok(node) => node,
-            Err(_) => super::walk_dir(&child_path, progress, skip),
+            Err(err) => {
+                progress.record_windows_fallback("child bulk scan", &child_path, &err);
+                super::walk_dir(&child_path, progress, skip)
+            }
         },
-        Err(_) => super::walk_dir(&child_path, progress, skip),
+        Err(err) => {
+            progress.record_windows_fallback("child open", &child_path, &err);
+            super::walk_dir(&child_path, progress, skip)
+        }
     }
 }
 

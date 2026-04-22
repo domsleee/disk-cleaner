@@ -56,6 +56,7 @@ fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
     })
 }

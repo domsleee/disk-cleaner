@@ -4,6 +4,7 @@ mod macos;
 mod windows;
 
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(any(not(target_os = "macos"), test))]
 use std::sync::atomic::Ordering;
@@ -154,7 +155,30 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
+    pub fallback_count: AtomicU64,
     pub cancelled: AtomicBool,
+}
+
+impl ScanProgress {
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_fallback(&self, stage: &str, path: &Path, err: &io::Error) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        if windows_fallback_logging_enabled() {
+            eprintln!(
+                "[scan][windows] bulk fallback ({stage}) for {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_fallback_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DISK_CLEANER_LOG_WINDOWS_FALLBACKS")
+            .is_ok_and(|value| value != "0")
+    })
 }
 
 /// Build a set of paths to skip during scanning to avoid double-counting.
@@ -284,7 +308,10 @@ fn scan_directory_inner(
             windows::walk_dir_bulk(root_dir, root, root_name.clone(), root_hidden, &progress, &skip)
         }) {
             Ok(node) => node,
-            Err(_) => walk_dir(root, &progress, &skip),
+            Err(err) => {
+                progress.record_windows_fallback("root bulk scan", root, &err);
+                walk_dir(root, &progress, &skip)
+            }
         }
     };
     #[cfg(not(target_os = "macos"))]
@@ -444,6 +471,7 @@ mod tests {
         Arc::new(ScanProgress {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -733,6 +761,11 @@ mod tests {
             progress.file_count.load(Ordering::Relaxed),
             2,
             "fallback scan should still count the nested file"
+        );
+        assert_eq!(
+            progress.fallback_count.load(Ordering::Relaxed),
+            1,
+            "fallback counter should record the Windows child open fallback"
         );
     }
 

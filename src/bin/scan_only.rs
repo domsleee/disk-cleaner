@@ -23,6 +23,7 @@ fn main() {
     let progress = Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
     });
 
@@ -30,11 +31,23 @@ fn main() {
 
     let files = progress.file_count.load(Ordering::Relaxed);
     let size = progress.total_size.load(Ordering::Relaxed);
-    println!(
-        "{} files, {} bytes ({})",
-        files,
-        size,
-        bytesize::ByteSize::b(size)
-    );
+    let fallbacks = progress.fallback_count.load(Ordering::Relaxed);
+    if fallbacks > 0 {
+        println!(
+            "{} files, {} bytes ({}) [{} fallback{}]",
+            files,
+            size,
+            bytesize::ByteSize::b(size),
+            fallbacks,
+            if fallbacks == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "{} files, {} bytes ({})",
+            files,
+            size,
+            bytesize::ByteSize::b(size)
+        );
+    }
     std::hint::black_box(tree);
 }

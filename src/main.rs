@@ -24,6 +24,19 @@ fn debug_enabled() -> bool {
     *DEBUG.get_or_init(|| std::env::var("DISK_CLEANER_DEBUG").is_ok_and(|v| v == "1"))
 }
 
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else if duration < Duration::from_secs(1) {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
@@ -240,6 +253,8 @@ struct App {
     icon_cache: Option<icons::IconCache>,
     last_scan_file_count: u64,
     last_scan_total_size: u64,
+    last_scan_duration: Option<Duration>,
+    last_scan_fallback_count: u64,
     show_categories: bool,
     tree_scroll_to_focus: bool,
     /// Cached visible row list for rendering; rebuilt when dirty.
@@ -280,6 +295,7 @@ impl Default for App {
             scan_progress: Arc::new(ScanProgress {
                 file_count: 0.into(),
                 total_size: 0.into(),
+                fallback_count: 0.into(),
                 cancelled: false.into(),
             }),
             receiver: None,
@@ -304,6 +320,8 @@ impl Default for App {
             icon_cache: None,
             last_scan_file_count: 0,
             last_scan_total_size: 0,
+            last_scan_duration: None,
+            last_scan_fallback_count: 0,
             show_categories: false,
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
@@ -329,6 +347,7 @@ impl App {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
+        self.scan_start_time = None;
     }
 
     fn start_scan(&mut self, path: PathBuf) {
@@ -349,6 +368,7 @@ impl App {
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
             total_size: 0.into(),
+            fallback_count: 0.into(),
             cancelled: false.into(),
         });
         self.scan_progress = progress.clone();
@@ -357,6 +377,8 @@ impl App {
         self.receiver = Some(rx);
 
         self.scan_start_time = Some(Instant::now());
+        self.last_scan_duration = None;
+        self.last_scan_fallback_count = 0;
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
@@ -517,6 +539,8 @@ impl eframe::App for App {
             }
             self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
             self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
+            self.last_scan_fallback_count =
+                self.scan_progress.fallback_count.load(Ordering::Relaxed);
             self.scanning = false;
             self.receiver = None;
             self.category_filter = None;
@@ -524,8 +548,9 @@ impl eframe::App for App {
 
             // Report frame-time stats for the scan
             if let Some(scan_start) = self.scan_start_time.take() {
+                let scan_dur = scan_start.elapsed();
+                self.last_scan_duration = Some(scan_dur);
                 if debug_enabled() {
-                    let scan_dur = scan_start.elapsed();
                     let ft = &mut self.scan_frame_times;
                     ft.sort();
                     let n = ft.len();
@@ -540,6 +565,12 @@ impl eframe::App for App {
                             "[perf] scan done in {scan_dur:?} ({} files)",
                             self.last_scan_file_count
                         );
+                        if self.last_scan_fallback_count > 0 {
+                            eprintln!(
+                                "[perf] windows bulk fallbacks: {}",
+                                self.last_scan_fallback_count
+                            );
+                        }
                         eprintln!(
                             "[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
                             ft[0],
@@ -1121,16 +1152,13 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new(status).small());
                     } else if selected_count > 0 {
                         ui.label(egui::RichText::new(format!("{selected_count} selected")).small());
-                    } else if let Some(ref path) = self.scan_path {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} files \u{2014} {}",
-                                self.last_scan_file_count,
-                                bytesize::ByteSize::b(self.last_scan_total_size)
-                            ))
-                            .small(),
+                    } else if self.scan_path.is_some() {
+                        let summary = format!(
+                            "{} files, {}",
+                            self.last_scan_file_count,
+                            bytesize::ByteSize::b(self.last_scan_total_size)
                         );
-                        let _ = path; // used for context above
+                        ui.label(egui::RichText::new(summary).small());
                     }
                 } else if let Some(ref path) = self.scan_path
                     && !self.scanning
@@ -1138,7 +1166,7 @@ impl eframe::App for App {
                 {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Scanned: {} \u{2014} {} files \u{2014} {}",
+                            "Scanned: {} ({} files, {})",
                             path.display(),
                             self.last_scan_file_count,
                             bytesize::ByteSize::b(self.last_scan_total_size)
@@ -1157,6 +1185,23 @@ impl eframe::App for App {
 
                     // Disk space info
                     if self.tree.is_some() && !self.scanning {
+                        if let Some(duration) = self.last_scan_duration {
+                            let mut summary = format!("Scan: {}", format_elapsed(duration));
+                            if self.last_scan_fallback_count > 0 {
+                                let suffix = if self.last_scan_fallback_count == 1 {
+                                    "fallback"
+                                } else {
+                                    "fallbacks"
+                                };
+                                summary.push_str(&format!(
+                                    " • {} {suffix}",
+                                    self.last_scan_fallback_count
+                                ));
+                            }
+                            ui.label(egui::RichText::new(summary).small().weak());
+                            ui.separator();
+                        }
+
                         if let Some((total, available)) = self.scan_disk_info {
                             let used = total.saturating_sub(available);
                             ui.label(
@@ -1225,15 +1270,8 @@ impl eframe::App for App {
                     // Elapsed time
                     if let Some(start) = self.scan_start_time {
                         ui.add_space(8.0);
-                        let elapsed = start.elapsed();
-                        let secs = elapsed.as_secs();
-                        let elapsed_str = if secs >= 60 {
-                            format!("{}m {:02}s", secs / 60, secs % 60)
-                        } else {
-                            format!("{secs}s")
-                        };
                         ui.label(
-                            egui::RichText::new(format!("Elapsed: {elapsed_str}"))
+                            egui::RichText::new(format!("Elapsed: {}", format_elapsed(start.elapsed())))
                                 .weak()
                                 .size(13.0),
                         );

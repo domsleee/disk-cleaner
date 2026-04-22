@@ -58,6 +58,7 @@ fn bench_startup() {
         let _progress = Arc::new(ScanProgress {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
         });
 
@@ -92,6 +93,7 @@ fn bench_frame_time(scan_path: &Path) {
     let progress = Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
         cancelled: AtomicBool::new(false),
     });
 

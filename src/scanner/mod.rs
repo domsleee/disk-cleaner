@@ -4,6 +4,7 @@ mod macos;
 mod windows;
 
 use std::collections::HashSet;
+#[cfg(target_os = "windows")]
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(any(not(target_os = "macos"), test))]
@@ -162,6 +163,7 @@ pub struct ScanProgress {
     pub cancelled: AtomicBool,
 }
 
+#[cfg(target_os = "windows")]
 const MAX_FALLBACK_DETAILS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

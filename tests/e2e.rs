@@ -33,6 +33,7 @@ fn progress() -> Arc<ScanProgress> {
         fallback_count: std::sync::atomic::AtomicU64::new(0),
         access_denied_fallback_count: std::sync::atomic::AtomicU64::new(0),
         bulk_scan_fallback_count: std::sync::atomic::AtomicU64::new(0),
+        fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: std::sync::atomic::AtomicBool::new(false),
     })
 }

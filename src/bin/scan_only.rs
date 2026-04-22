@@ -17,7 +17,7 @@ fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Op
 
     if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
         return Some(format!(
-            "{} access-denied fallback{}",
+            "compatibility mode used for {} protected folder{}",
             access_denied,
             if access_denied == 1 { "" } else { "s" }
         ));
@@ -25,17 +25,17 @@ fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Op
 
     let mut parts = Vec::new();
     if access_denied > 0 {
-        parts.push(format!("{access_denied} access denied"));
+        parts.push(format!("{access_denied} protected"));
     }
     if other_open > 0 {
-        parts.push(format!("{other_open} other open"));
+        parts.push(format!("{other_open} open issue"));
     }
     if bulk_scan > 0 {
-        parts.push(format!("{bulk_scan} bulk scan"));
+        parts.push(format!("{bulk_scan} scan issue"));
     }
 
     Some(format!(
-        "{} fallback{} ({})",
+        "compatibility mode used for {} folder{} ({})",
         total,
         if total == 1 { "" } else { "s" },
         parts.join(", ")
@@ -62,6 +62,7 @@ fn main() {
         fallback_count: AtomicU64::new(0),
         access_denied_fallback_count: AtomicU64::new(0),
         bulk_scan_fallback_count: AtomicU64::new(0),
+        fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
     });
 

@@ -10,6 +10,7 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -52,7 +53,7 @@ fn format_fallback_summary(
 
     if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
         return Some(format!(
-            "{} access-denied fallback{}",
+            "Compatibility mode used for {} protected folder{}",
             access_denied,
             if access_denied == 1 { "" } else { "s" }
         ));
@@ -60,30 +61,90 @@ fn format_fallback_summary(
 
     let mut parts = Vec::new();
     if access_denied > 0 {
-        parts.push(format!(
-            "{} access denied",
-            access_denied
-        ));
+        parts.push(format!("{access_denied} protected"));
     }
     if other_open > 0 {
-        parts.push(format!(
-            "{} other open",
-            other_open
-        ));
+        parts.push(format!("{other_open} open issue"));
     }
     if bulk_scan > 0 {
-        parts.push(format!(
-            "{} bulk scan",
-            bulk_scan
-        ));
+        parts.push(format!("{bulk_scan} scan issue"));
     }
 
     Some(format!(
-        "{} fallback{} ({})",
+        "Compatibility mode used for {} folder{} ({})",
         total,
         if total == 1 { "" } else { "s" },
         parts.join(", ")
     ))
+}
+
+fn write_fallback_report(
+    scan_path: Option<&std::path::Path>,
+    duration: Option<Duration>,
+    total: u64,
+    access_denied: u64,
+    bulk_scan: u64,
+    details: &[scanner::ScanFallbackDetail],
+) -> std::io::Result<PathBuf> {
+    let report_dir = std::env::temp_dir().join("disk-cleaner");
+    std::fs::create_dir_all(&report_dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let report_path = report_dir.join(format!("windows-compatibility-report-{stamp}.txt"));
+
+    let mut text = String::new();
+    text.push_str("Disk Cleaner Windows compatibility report\n");
+    text.push_str("========================================\n\n");
+    if let Some(path) = scan_path {
+        text.push_str(&format!("Scan path: {}\n", path.display()));
+    }
+    if let Some(duration) = duration {
+        text.push_str(&format!("Scan duration: {}\n", format_elapsed(duration)));
+    }
+    if let Some(summary) = format_fallback_summary(total, access_denied, bulk_scan) {
+        text.push_str(&format!("Summary: {summary}\n"));
+    }
+    text.push_str(&format!("Captured entries: {}\n\n", details.len()));
+
+    if details.is_empty() {
+        text.push_str("No compatibility details were recorded.\n");
+    } else {
+        text.push_str("Technical details:\n\n");
+        for (index, detail) in details.iter().enumerate() {
+            text.push_str(&format!(
+                "{}. [{}] {}\n   {}\n",
+                index + 1,
+                detail.kind.label(),
+                detail.path.display(),
+                detail.error
+            ));
+        }
+    }
+
+    std::fs::write(&report_path, text)?;
+    Ok(report_path)
+}
+
+fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("notepad").arg(path).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+        Ok(())
+    }
 }
 
 /// Result from the background scan thread — includes pre-computed stats
@@ -306,6 +367,7 @@ struct App {
     last_scan_fallback_count: u64,
     last_scan_access_denied_fallback_count: u64,
     last_scan_bulk_scan_fallback_count: u64,
+    last_scan_fallback_details: Vec<scanner::ScanFallbackDetail>,
     show_categories: bool,
     tree_scroll_to_focus: bool,
     /// Cached visible row list for rendering; rebuilt when dirty.
@@ -349,6 +411,7 @@ impl Default for App {
                 fallback_count: 0.into(),
                 access_denied_fallback_count: 0.into(),
                 bulk_scan_fallback_count: 0.into(),
+                fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
             }),
             receiver: None,
@@ -377,6 +440,7 @@ impl Default for App {
             last_scan_fallback_count: 0,
             last_scan_access_denied_fallback_count: 0,
             last_scan_bulk_scan_fallback_count: 0,
+            last_scan_fallback_details: Vec::new(),
             show_categories: false,
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
@@ -405,6 +469,24 @@ impl App {
         self.scan_start_time = None;
     }
 
+    fn open_fallback_report(&mut self) {
+        match write_fallback_report(
+            self.scan_path.as_deref(),
+            self.last_scan_duration,
+            self.last_scan_fallback_count,
+            self.last_scan_access_denied_fallback_count,
+            self.last_scan_bulk_scan_fallback_count,
+            &self.last_scan_fallback_details,
+        )
+        .and_then(|path| open_text_report(&path))
+        {
+            Ok(()) => {}
+            Err(err) => {
+                self.error = Some(format!("Could not open compatibility report: {err}"));
+            }
+        }
+    }
+
     fn start_scan(&mut self, path: PathBuf) {
         // Cancel any in-progress scan so its threads release the rayon pool
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
@@ -426,6 +508,7 @@ impl App {
             fallback_count: 0.into(),
             access_denied_fallback_count: 0.into(),
             bulk_scan_fallback_count: 0.into(),
+            fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
         });
         self.scan_progress = progress.clone();
@@ -438,6 +521,7 @@ impl App {
         self.last_scan_fallback_count = 0;
         self.last_scan_access_denied_fallback_count = 0;
         self.last_scan_bulk_scan_fallback_count = 0;
+        self.last_scan_fallback_details.clear();
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
@@ -608,6 +692,7 @@ impl eframe::App for App {
                 .scan_progress
                 .bulk_scan_fallback_count
                 .load(Ordering::Relaxed);
+            self.last_scan_fallback_details = self.scan_progress.fallback_details_snapshot();
             self.scanning = false;
             self.receiver = None;
             self.category_filter = None;
@@ -657,6 +742,7 @@ impl eframe::App for App {
                 }
                 self.scan_frame_times.clear();
             }
+
         }
 
         // Check if background deletion completed
@@ -1204,6 +1290,8 @@ impl eframe::App for App {
                 });
         }
 
+        let mut open_fallback_report = false;
+
         // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1258,15 +1346,45 @@ impl eframe::App for App {
                     // Disk space info
                     if self.tree.is_some() && !self.scanning {
                         if let Some(duration) = self.last_scan_duration {
-                            let mut summary = format!("Scan: {}", format_elapsed(duration));
-                            if let Some(fallback_summary) = format_fallback_summary(
+                            ui.label(
+                                egui::RichText::new(format!("Scan: {}", format_elapsed(duration)))
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.separator();
+                        }
+
+                        if self.last_scan_fallback_count > 0 {
+                            let button = egui::Button::new(
+                                egui::RichText::new(format!("⚠ {}", self.last_scan_fallback_count))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 200, 80)),
+                            )
+                            .frame(false);
+                            let hover = format_fallback_summary(
                                 self.last_scan_fallback_count,
                                 self.last_scan_access_denied_fallback_count,
                                 self.last_scan_bulk_scan_fallback_count,
-                            ) {
-                                summary.push_str(&format!(" • {fallback_summary}"));
+                            )
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{} fallback{}",
+                                    self.last_scan_fallback_count,
+                                    if self.last_scan_fallback_count == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                )
+                            });
+                            let response = ui
+                                .add(button)
+                                .on_hover_text(format!(
+                                    "{hover}\nClick to open details"
+                                ));
+                            if response.clicked() {
+                                open_fallback_report = true;
                             }
-                            ui.label(egui::RichText::new(summary).small().weak());
                             ui.separator();
                         }
 
@@ -1295,6 +1413,10 @@ impl eframe::App for App {
                 });
             });
         });
+
+        if open_fallback_report {
+            self.open_fallback_report();
+        }
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(any(not(target_os = "macos"), test))]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt;
@@ -158,7 +158,34 @@ pub struct ScanProgress {
     pub fallback_count: AtomicU64,
     pub access_denied_fallback_count: AtomicU64,
     pub bulk_scan_fallback_count: AtomicU64,
+    pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
+}
+
+const MAX_FALLBACK_DETAILS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanFallbackKind {
+    AccessDeniedOpen,
+    OtherOpen,
+    BulkScan,
+}
+
+impl ScanFallbackKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AccessDeniedOpen => "Protected folder",
+            Self::OtherOpen => "Open retry",
+            Self::BulkScan => "Scan retry",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanFallbackDetail {
+    pub kind: ScanFallbackKind,
+    pub path: PathBuf,
+    pub error: Box<str>,
 }
 
 impl ScanProgress {
@@ -171,17 +198,44 @@ impl ScanProgress {
     ) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
         self.bulk_scan_fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.push_fallback_detail(ScanFallbackKind::BulkScan, path, err);
         log_windows_fallback(stage, path, err);
     }
 
     #[cfg(target_os = "windows")]
     pub(crate) fn record_windows_child_open_fallback(&self, path: &Path, err: &io::Error) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
-        if err.kind() == io::ErrorKind::PermissionDenied {
+        let kind = if err.kind() == io::ErrorKind::PermissionDenied {
             self.access_denied_fallback_count
                 .fetch_add(1, Ordering::Relaxed);
-        }
+            ScanFallbackKind::AccessDeniedOpen
+        } else {
+            ScanFallbackKind::OtherOpen
+        };
+        self.push_fallback_detail(kind, path, err);
         log_windows_fallback("child open", path, err);
+    }
+
+    pub fn fallback_details_snapshot(&self) -> Vec<ScanFallbackDetail> {
+        self.fallback_details
+            .lock()
+            .expect("fallback details lock poisoned")
+            .clone()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn push_fallback_detail(&self, kind: ScanFallbackKind, path: &Path, err: &io::Error) {
+        let mut details = self
+            .fallback_details
+            .lock()
+            .expect("fallback details lock poisoned");
+        if details.len() < MAX_FALLBACK_DETAILS {
+            details.push(ScanFallbackDetail {
+                kind,
+                path: path.to_path_buf(),
+                error: err.to_string().into_boxed_str(),
+            });
+        }
     }
 }
 
@@ -497,6 +551,7 @@ mod tests {
             fallback_count: AtomicU64::new(0),
             access_denied_fallback_count: AtomicU64::new(0),
             bulk_scan_fallback_count: AtomicU64::new(0),
+            fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
         })
     }

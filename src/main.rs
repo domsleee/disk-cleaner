@@ -147,12 +147,6 @@ fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-fn display_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
@@ -468,89 +462,6 @@ impl Default for App {
 }
 
 impl App {
-    fn selected_size(&self) -> Option<u64> {
-        let tree = self.tree.as_ref()?;
-        if self.selected_paths.is_empty() {
-            return Some(0);
-        }
-
-        let mut selected_roots: Vec<&PathBuf> = self.selected_paths.iter().collect();
-        selected_roots.sort_by_key(|path| path.components().count());
-
-        let mut deduped = Vec::<&PathBuf>::new();
-        for path in selected_roots {
-            if deduped
-                .iter()
-                .any(|ancestor| path.starts_with(ancestor.as_path()))
-            {
-                continue;
-            }
-            deduped.push(path);
-        }
-
-        Some(
-            deduped
-                .into_iter()
-                .filter_map(|path| treemap::find_node(tree, path))
-                .map(|node| node.size())
-                .sum(),
-        )
-    }
-
-    fn footer_status_text(&self) -> Option<String> {
-        if self.tree.is_none() || self.scanning {
-            return None;
-        }
-
-        let selected_count = self.selected_paths.len();
-        if selected_count == 1
-            && let Some(path) = self.selected_paths.iter().next()
-        {
-            let label = display_name(path);
-            if let Some(tree) = self.tree.as_ref()
-                && let Some(node) = treemap::find_node(tree, path)
-            {
-                return Some(format!(
-                    "{} • {} selected",
-                    label,
-                    bytesize::ByteSize::b(node.size())
-                ));
-            }
-            return Some(format!("{label} selected"));
-        }
-
-        if selected_count > 1 {
-            if let Some(size) = self.selected_size() {
-                return Some(format!(
-                    "{} selected • {}",
-                    selected_count,
-                    bytesize::ByteSize::b(size)
-                ));
-            }
-            return Some(format!("{selected_count} selected"));
-        }
-
-        if let Some(ref focused) = self.focused_path {
-            let label = display_name(focused);
-            if let Some(tree) = self.tree.as_ref()
-                && let Some(node) = treemap::find_node(tree, focused)
-            {
-                return Some(format!("{} • {}", label, bytesize::ByteSize::b(node.size())));
-            }
-            return Some(label);
-        }
-
-        if self.scan_path.is_some() {
-            return Some(format!(
-                "{} files, {}",
-                self.last_scan_file_count,
-                bytesize::ByteSize::b(self.last_scan_total_size)
-            ));
-        }
-
-        None
-    }
-
     fn cancel_scan(&mut self) {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
@@ -1384,9 +1295,16 @@ impl eframe::App for App {
         // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Left: scan summary, focused item, or selection summary.
-                if let Some(status) = self.footer_status_text() {
-                    ui.label(egui::RichText::new(status).small());
+                // Left: static scan summary.
+                if self.tree.is_some() && !self.scanning {
+                    if self.scan_path.is_some() {
+                        let summary = format!(
+                            "{} files, {}",
+                            self.last_scan_file_count,
+                            bytesize::ByteSize::b(self.last_scan_total_size)
+                        );
+                        ui.label(egui::RichText::new(summary).small());
+                    }
                 } else if let Some(ref path) = self.scan_path
                     && !self.scanning
                     && self.last_scan_file_count > 0

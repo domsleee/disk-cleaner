@@ -6,42 +6,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Option<String> {
-    if total == 0 {
-        return None;
-    }
-
-    let other_open = total
-        .saturating_sub(access_denied)
-        .saturating_sub(bulk_scan);
-
-    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
-        return Some(format!(
-            "compatibility mode used for {} protected folder{}",
-            access_denied,
-            if access_denied == 1 { "" } else { "s" }
-        ));
-    }
-
-    let mut parts = Vec::new();
-    if access_denied > 0 {
-        parts.push(format!("{access_denied} protected"));
-    }
-    if other_open > 0 {
-        parts.push(format!("{other_open} open issue"));
-    }
-    if bulk_scan > 0 {
-        parts.push(format!("{bulk_scan} scan issue"));
-    }
-
-    Some(format!(
-        "compatibility mode used for {} folder{} ({})",
-        total,
-        if total == 1 { "" } else { "s" },
-        parts.join(", ")
-    ))
-}
-
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -75,7 +39,7 @@ fn main() {
         .access_denied_fallback_count
         .load(Ordering::Relaxed);
     let bulk_scan = progress.bulk_scan_fallback_count.load(Ordering::Relaxed);
-    if let Some(fallback_summary) = format_fallback_summary(fallbacks, access_denied, bulk_scan) {
+    if let Some(fallback_summary) = scanner::format_fallback_summary(fallbacks, access_denied, bulk_scan) {
         println!(
             "{} files, {} bytes ({}) [{}]",
             files,

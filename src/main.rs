@@ -38,46 +38,6 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
-fn format_fallback_summary(
-    total: u64,
-    access_denied: u64,
-    bulk_scan: u64,
-) -> Option<String> {
-    if total == 0 {
-        return None;
-    }
-
-    let other_open = total
-        .saturating_sub(access_denied)
-        .saturating_sub(bulk_scan);
-
-    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
-        return Some(format!(
-            "Compatibility mode used for {} protected folder{}",
-            access_denied,
-            if access_denied == 1 { "" } else { "s" }
-        ));
-    }
-
-    let mut parts = Vec::new();
-    if access_denied > 0 {
-        parts.push(format!("{access_denied} protected"));
-    }
-    if other_open > 0 {
-        parts.push(format!("{other_open} open issue"));
-    }
-    if bulk_scan > 0 {
-        parts.push(format!("{bulk_scan} scan issue"));
-    }
-
-    Some(format!(
-        "Compatibility mode used for {} folder{} ({})",
-        total,
-        if total == 1 { "" } else { "s" },
-        parts.join(", ")
-    ))
-}
-
 fn write_fallback_report(
     scan_path: Option<&std::path::Path>,
     duration: Option<Duration>,
@@ -103,7 +63,7 @@ fn write_fallback_report(
     if let Some(duration) = duration {
         text.push_str(&format!("Scan duration: {}\n", format_elapsed(duration)));
     }
-    if let Some(summary) = format_fallback_summary(total, access_denied, bulk_scan) {
+    if let Some(summary) = scanner::format_fallback_summary(total, access_denied, bulk_scan) {
         text.push_str(&format!("Summary: {summary}\n"));
     }
     text.push_str(&format!("Captured entries: {}\n\n", details.len()));
@@ -720,7 +680,7 @@ impl eframe::App for App {
                         if self.last_scan_fallback_count > 0 {
                             eprintln!(
                                 "[perf] windows bulk fallbacks: {}",
-                                format_fallback_summary(
+                                scanner::format_fallback_summary(
                                     self.last_scan_fallback_count,
                                     self.last_scan_access_denied_fallback_count,
                                     self.last_scan_bulk_scan_fallback_count
@@ -1346,7 +1306,7 @@ impl eframe::App for App {
                                     .color(egui::Color32::from_rgb(230, 200, 80)),
                             )
                             .frame(false);
-                            let hover = format_fallback_summary(
+                            let hover = scanner::format_fallback_summary(
                                 self.last_scan_fallback_count,
                                 self.last_scan_access_denied_fallback_count,
                                 self.last_scan_bulk_scan_fallback_count,

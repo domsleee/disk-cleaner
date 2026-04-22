@@ -184,6 +184,40 @@ impl ScanFallbackKind {
     }
 }
 
+pub fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+
+    let other_open = total.saturating_sub(access_denied).saturating_sub(bulk_scan);
+
+    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
+        return Some(format!(
+            "Compatibility mode used for {} protected folder{}",
+            access_denied,
+            if access_denied == 1 { "" } else { "s" }
+        ));
+    }
+
+    let mut parts = Vec::new();
+    if access_denied > 0 {
+        parts.push(format!("{access_denied} protected"));
+    }
+    if other_open > 0 {
+        parts.push(format!("{other_open} open issue"));
+    }
+    if bulk_scan > 0 {
+        parts.push(format!("{bulk_scan} scan issue"));
+    }
+
+    Some(format!(
+        "Compatibility mode used for {} folder{} ({})",
+        total,
+        if total == 1 { "" } else { "s" },
+        parts.join(", ")
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanFallbackDetail {
     pub kind: ScanFallbackKind,
@@ -774,14 +808,18 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn set_hidden_attribute(path: &Path) {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, SetFileAttributesW,
+        };
 
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let rc = unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) };
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        assert_ne!(attrs, u32::MAX, "GetFileAttributesW failed");
+        let rc = unsafe { SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN) };
         assert_ne!(rc, 0, "SetFileAttributesW failed");
     }
 

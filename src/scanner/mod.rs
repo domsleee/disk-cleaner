@@ -1,12 +1,16 @@
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use std::collections::HashSet;
+#[cfg(target_os = "windows")]
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(any(not(target_os = "macos"), test))]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt;
@@ -152,7 +156,143 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
+    pub fallback_count: AtomicU64,
+    pub access_denied_fallback_count: AtomicU64,
+    pub bulk_scan_fallback_count: AtomicU64,
+    pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
+}
+
+#[cfg(target_os = "windows")]
+const MAX_FALLBACK_DETAILS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub enum ScanFallbackKind {
+    AccessDeniedOpen,
+    OtherOpen,
+    BulkScan,
+}
+
+impl ScanFallbackKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AccessDeniedOpen => "Protected folder",
+            Self::OtherOpen => "Open retry",
+            Self::BulkScan => "Scan retry",
+        }
+    }
+}
+
+pub fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+
+    let other_open = total.saturating_sub(access_denied).saturating_sub(bulk_scan);
+
+    if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
+        return Some(format!(
+            "Compatibility mode used for {} protected folder{}",
+            access_denied,
+            if access_denied == 1 { "" } else { "s" }
+        ));
+    }
+
+    let mut parts = Vec::new();
+    if access_denied > 0 {
+        parts.push(format!("{access_denied} protected"));
+    }
+    if other_open > 0 {
+        parts.push(format!("{other_open} open issue"));
+    }
+    if bulk_scan > 0 {
+        parts.push(format!("{bulk_scan} scan issue"));
+    }
+
+    Some(format!(
+        "Compatibility mode used for {} folder{} ({})",
+        total,
+        if total == 1 { "" } else { "s" },
+        parts.join(", ")
+    ))
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanFallbackDetail {
+    pub kind: ScanFallbackKind,
+    pub path: PathBuf,
+    pub error: Box<str>,
+}
+
+impl ScanProgress {
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_bulk_scan_fallback(
+        &self,
+        stage: &str,
+        path: &Path,
+        err: &io::Error,
+    ) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.bulk_scan_fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.push_fallback_detail(ScanFallbackKind::BulkScan, path, err);
+        log_windows_fallback(stage, path, err);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_child_open_fallback(&self, path: &Path, err: &io::Error) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        let kind = if err.kind() == io::ErrorKind::PermissionDenied {
+            self.access_denied_fallback_count
+                .fetch_add(1, Ordering::Relaxed);
+            ScanFallbackKind::AccessDeniedOpen
+        } else {
+            ScanFallbackKind::OtherOpen
+        };
+        self.push_fallback_detail(kind, path, err);
+        log_windows_fallback("child open", path, err);
+    }
+
+    pub fn fallback_details_snapshot(&self) -> Vec<ScanFallbackDetail> {
+        self.fallback_details
+            .lock()
+            .expect("fallback details lock poisoned")
+            .clone()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn push_fallback_detail(&self, kind: ScanFallbackKind, path: &Path, err: &io::Error) {
+        let mut details = self
+            .fallback_details
+            .lock()
+            .expect("fallback details lock poisoned");
+        if details.len() < MAX_FALLBACK_DETAILS {
+            details.push(ScanFallbackDetail {
+                kind,
+                path: path.to_path_buf(),
+                error: err.to_string().into_boxed_str(),
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_fallback_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DISK_CLEANER_LOG_WINDOWS_FALLBACKS")
+            .is_ok_and(|value| value != "0")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_fallback(stage: &str, path: &Path, err: &io::Error) {
+    if windows_fallback_logging_enabled() {
+        eprintln!(
+            "[scan][windows] bulk fallback ({stage}) for {}: {err}",
+            path.display()
+        );
+    }
 }
 
 /// Build a set of paths to skip during scanning to avoid double-counting.
@@ -268,7 +408,28 @@ fn scan_directory_inner(
             macos::walk_dir_bulk(root_fd, root, root_name, root_hidden, &progress, &skip)
         }
     };
+    #[cfg(target_os = "windows")]
+    let mut root_node = {
+        let root_name: Box<str> = root
+            .file_name()
+            .map(|n| os_name_to_boxed(n.to_os_string()))
+            .unwrap_or_else(|| root.to_string_lossy().into_owned().into_boxed_str());
+        let root_hidden = std::fs::symlink_metadata(root)
+            .map(|m| is_hidden_from_metadata(&root_name, &m))
+            .unwrap_or_else(|_| root_name.starts_with('.'));
+
+        match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
+            windows::walk_dir_bulk(root_dir, root, root_name.clone(), root_hidden, &progress, &skip)
+        }) {
+            Ok(node) => node,
+            Err(err) => {
+                progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
+                walk_dir(root, &progress, &skip)
+            }
+        }
+    };
     #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
@@ -292,7 +453,16 @@ fn os_name_to_boxed(name: std::ffi::OsString) -> Box<str> {
 #[cfg(target_os = "macos")]
 use macos::is_hidden_from_metadata;
 
+#[cfg(target_os = "windows")]
+fn is_hidden_from_metadata(name: &str, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    name.starts_with('.') || metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
 #[cfg(not(target_os = "macos"))]
+#[cfg(not(target_os = "windows"))]
 fn is_hidden_from_metadata(name: &str, _metadata: &std::fs::Metadata) -> bool {
     name.starts_with('.')
 }
@@ -415,6 +585,10 @@ mod tests {
         Arc::new(ScanProgress {
             file_count: AtomicU64::new(0),
             total_size: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
+            access_denied_fallback_count: AtomicU64::new(0),
+            bulk_scan_fallback_count: AtomicU64::new(0),
+            fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
         })
     }
@@ -629,6 +803,101 @@ mod tests {
             .find(|c| c.name() == "normal_dir")
             .expect("normal dir should appear in scan");
         assert!(!normal_node.is_hidden(), "normal dir should not be hidden");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_hidden_attribute(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, SetFileAttributesW,
+        };
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        assert_ne!(attrs, u32::MAX, "GetFileAttributesW failed");
+        let rc = unsafe { SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_HIDDEN) };
+        assert_ne!(rc, 0, "SetFileAttributesW failed");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_hidden_attribute_detected_as_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden_file = tmp.path().join("visible_name.txt");
+        fs::write(&hidden_file, "secret").unwrap();
+        set_hidden_attribute(&hidden_file);
+
+        fs::write(tmp.path().join("normal.txt"), "hello").unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        let hidden_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "visible_name.txt")
+            .expect("hidden file should appear in scan");
+        assert!(
+            hidden_node.is_hidden(),
+            "FILE_ATTRIBUTE_HIDDEN file should be marked hidden"
+        );
+
+        let normal_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "normal.txt")
+            .expect("normal file should appear in scan");
+        assert!(!normal_node.is_hidden(), "normal file should not be hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_bulk_child_open_failure_falls_back_to_generic_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("nested.txt"), "fallback").unwrap();
+        fs::write(tmp.path().join("root.txt"), "root").unwrap();
+
+        let _guard = windows::fail_open_relative_for_name("sub");
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        let sub_node = root
+            .children()
+            .iter()
+            .find(|c| c.name() == "sub")
+            .expect("sub directory should appear in scan");
+        assert!(sub_node.is_dir(), "sub should remain a directory");
+        assert_eq!(
+            sub_node.children().len(),
+            1,
+            "failed Windows bulk child open should fall back and still scan contents"
+        );
+        assert_eq!(
+            progress.file_count.load(Ordering::Relaxed),
+            2,
+            "fallback scan should still count the nested file"
+        );
+        assert_eq!(
+            progress.fallback_count.load(Ordering::Relaxed),
+            1,
+            "fallback counter should record the Windows child open fallback"
+        );
+        assert_eq!(
+            progress.access_denied_fallback_count.load(Ordering::Relaxed),
+            0,
+            "injected open failure should not be classified as access denied"
+        );
+        assert_eq!(
+            progress.bulk_scan_fallback_count.load(Ordering::Relaxed),
+            0,
+            "child open fallback should not be classified as a bulk scan failure"
+        );
     }
 
     #[test]

@@ -478,19 +478,33 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
 
         let text_cache = ui::build_text_match_cache(&tree, "file_5");
         group.bench_with_input(BenchmarkId::new("filter_hit_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
+            b.iter(|| {
+                ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None)
+            })
         });
 
         group.bench_with_input(
             BenchmarkId::new("filter_miss_uncached", n),
             &tree,
-            |b, t| b.iter(|| ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None, None)),
+            |b, t| {
+                b.iter(|| {
+                    ui::collect_cached_rows(t, "nonexistent_zzz", None, true, None, None, None)
+                })
+            },
         );
 
         let miss_cache = ui::build_text_match_cache(&tree, "nonexistent_zzz");
         group.bench_with_input(BenchmarkId::new("filter_miss_cached", n), &tree, |b, t| {
             b.iter(|| {
-                ui::collect_cached_rows(t, "nonexistent_zzz", None, true, Some(&miss_cache), None, None)
+                ui::collect_cached_rows(
+                    t,
+                    "nonexistent_zzz",
+                    None,
+                    true,
+                    Some(&miss_cache),
+                    None,
+                    None,
+                )
             })
         });
     }
@@ -747,7 +761,9 @@ fn bench_collect_rows_large(c: &mut Criterion) {
         let text_cache = ui::build_text_match_cache(&tree, "file_5");
 
         group.bench_with_input(BenchmarkId::new("filter_cached", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None))
+            b.iter(|| {
+                ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None)
+            })
         });
     }
 

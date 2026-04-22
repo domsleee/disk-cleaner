@@ -92,6 +92,10 @@ fn new_progress() -> Arc<ScanProgress> {
     Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
+        access_denied_fallback_count: AtomicU64::new(0),
+        bulk_scan_fallback_count: AtomicU64::new(0),
+        fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
     })
 }
@@ -197,20 +201,15 @@ fn bench_regression_memory(c: &mut Criterion) {
     eprintln!("=== Regression Report: 50K files / 500 dirs ===");
     eprintln!("Files scanned : {files}");
     eprintln!("Tree nodes    : {nodes}");
+    eprintln!("Total size    : {:.1} MB", total_size as f64 / 1_048_576.0);
     eprintln!(
-        "Total size    : {:.1} MB",
-        total_size as f64 / 1_048_576.0
+        "Scan time     : {elapsed_ms:.1} ms  [{speed_status}] (threshold: {MAX_SCAN_TIME_MS} ms)"
     );
-    eprintln!("Scan time     : {elapsed_ms:.1} ms  [{speed_status}] (threshold: {MAX_SCAN_TIME_MS} ms)");
+    eprintln!("Memory delta  : {:.1} MB", delta as f64 / 1_048_576.0);
+    eprintln!("Peak alloc    : {:.1} MB", peak as f64 / 1_048_576.0);
     eprintln!(
-        "Memory delta  : {:.1} MB",
-        delta as f64 / 1_048_576.0
+        "Bytes/node    : {bytes_per_node:.0}  [{mem_status}] (threshold: {MAX_BYTES_PER_NODE})"
     );
-    eprintln!(
-        "Peak alloc    : {:.1} MB",
-        peak as f64 / 1_048_576.0
-    );
-    eprintln!("Bytes/node    : {bytes_per_node:.0}  [{mem_status}] (threshold: {MAX_BYTES_PER_NODE})");
     eprintln!("=================================================");
     eprintln!();
 

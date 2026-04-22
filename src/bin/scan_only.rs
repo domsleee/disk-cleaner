@@ -23,6 +23,10 @@ fn main() {
     let progress = Arc::new(ScanProgress {
         file_count: AtomicU64::new(0),
         total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
+        access_denied_fallback_count: AtomicU64::new(0),
+        bulk_scan_fallback_count: AtomicU64::new(0),
+        fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
     });
 
@@ -30,11 +34,26 @@ fn main() {
 
     let files = progress.file_count.load(Ordering::Relaxed);
     let size = progress.total_size.load(Ordering::Relaxed);
-    println!(
-        "{} files, {} bytes ({})",
-        files,
-        size,
-        bytesize::ByteSize::b(size)
-    );
+    let fallbacks = progress.fallback_count.load(Ordering::Relaxed);
+    let access_denied = progress
+        .access_denied_fallback_count
+        .load(Ordering::Relaxed);
+    let bulk_scan = progress.bulk_scan_fallback_count.load(Ordering::Relaxed);
+    if let Some(fallback_summary) = scanner::format_fallback_summary(fallbacks, access_denied, bulk_scan) {
+        println!(
+            "{} files, {} bytes ({}) [{}]",
+            files,
+            size,
+            bytesize::ByteSize::b(size),
+            fallback_summary,
+        );
+    } else {
+        println!(
+            "{} files, {} bytes ({})",
+            files,
+            size,
+            bytesize::ByteSize::b(size)
+        );
+    }
     std::hint::black_box(tree);
 }

@@ -10,6 +10,7 @@ mod ui;
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -22,6 +23,88 @@ fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static DEBUG: OnceLock<bool> = OnceLock::new();
     *DEBUG.get_or_init(|| std::env::var("DISK_CLEANER_DEBUG").is_ok_and(|v| v == "1"))
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else if duration < Duration::from_secs(1) {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn write_fallback_report(
+    scan_path: Option<&std::path::Path>,
+    duration: Option<Duration>,
+    total: u64,
+    access_denied: u64,
+    bulk_scan: u64,
+    details: &[scanner::ScanFallbackDetail],
+) -> std::io::Result<PathBuf> {
+    let report_dir = std::env::temp_dir().join("disk-cleaner");
+    std::fs::create_dir_all(&report_dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let report_path = report_dir.join(format!("windows-compatibility-report-{stamp}.txt"));
+
+    let mut text = String::new();
+    text.push_str("Disk Cleaner Windows compatibility report\n");
+    text.push_str("========================================\n\n");
+    if let Some(path) = scan_path {
+        text.push_str(&format!("Scan path: {}\n", path.display()));
+    }
+    if let Some(duration) = duration {
+        text.push_str(&format!("Scan duration: {}\n", format_elapsed(duration)));
+    }
+    if let Some(summary) = scanner::format_fallback_summary(total, access_denied, bulk_scan) {
+        text.push_str(&format!("Summary: {summary}\n"));
+    }
+    text.push_str(&format!("Captured entries: {}\n\n", details.len()));
+
+    if details.is_empty() {
+        text.push_str("No compatibility details were recorded.\n");
+    } else {
+        text.push_str("Technical details:\n\n");
+        for (index, detail) in details.iter().enumerate() {
+            text.push_str(&format!(
+                "{}. [{}] {}\n   {}\n",
+                index + 1,
+                detail.kind.label(),
+                detail.path.display(),
+                detail.error
+            ));
+        }
+    }
+
+    std::fs::write(&report_path, text)?;
+    Ok(report_path)
+}
+
+fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("notepad").arg(path).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+        Ok(())
+    }
 }
 
 /// Result from the background scan thread — includes pre-computed stats
@@ -240,6 +323,11 @@ struct App {
     icon_cache: Option<icons::IconCache>,
     last_scan_file_count: u64,
     last_scan_total_size: u64,
+    last_scan_duration: Option<Duration>,
+    last_scan_fallback_count: u64,
+    last_scan_access_denied_fallback_count: u64,
+    last_scan_bulk_scan_fallback_count: u64,
+    last_scan_fallback_details: Vec<scanner::ScanFallbackDetail>,
     show_categories: bool,
     tree_scroll_to_focus: bool,
     /// Cached visible row list for rendering; rebuilt when dirty.
@@ -280,6 +368,10 @@ impl Default for App {
             scan_progress: Arc::new(ScanProgress {
                 file_count: 0.into(),
                 total_size: 0.into(),
+                fallback_count: 0.into(),
+                access_denied_fallback_count: 0.into(),
+                bulk_scan_fallback_count: 0.into(),
+                fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
             }),
             receiver: None,
@@ -304,6 +396,11 @@ impl Default for App {
             icon_cache: None,
             last_scan_file_count: 0,
             last_scan_total_size: 0,
+            last_scan_duration: None,
+            last_scan_fallback_count: 0,
+            last_scan_access_denied_fallback_count: 0,
+            last_scan_bulk_scan_fallback_count: 0,
+            last_scan_fallback_details: Vec::new(),
             show_categories: false,
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
@@ -329,6 +426,25 @@ impl App {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
+        self.scan_start_time = None;
+    }
+
+    fn open_fallback_report(&mut self) {
+        match write_fallback_report(
+            self.scan_path.as_deref(),
+            self.last_scan_duration,
+            self.last_scan_fallback_count,
+            self.last_scan_access_denied_fallback_count,
+            self.last_scan_bulk_scan_fallback_count,
+            &self.last_scan_fallback_details,
+        )
+        .and_then(|path| open_text_report(&path))
+        {
+            Ok(()) => {}
+            Err(err) => {
+                self.error = Some(format!("Could not open compatibility report: {err}"));
+            }
+        }
     }
 
     fn start_scan(&mut self, path: PathBuf) {
@@ -349,6 +465,10 @@ impl App {
         let progress = Arc::new(ScanProgress {
             file_count: 0.into(),
             total_size: 0.into(),
+            fallback_count: 0.into(),
+            access_denied_fallback_count: 0.into(),
+            bulk_scan_fallback_count: 0.into(),
+            fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
         });
         self.scan_progress = progress.clone();
@@ -357,6 +477,11 @@ impl App {
         self.receiver = Some(rx);
 
         self.scan_start_time = Some(Instant::now());
+        self.last_scan_duration = None;
+        self.last_scan_fallback_count = 0;
+        self.last_scan_access_denied_fallback_count = 0;
+        self.last_scan_bulk_scan_fallback_count = 0;
+        self.last_scan_fallback_details.clear();
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
@@ -517,6 +642,17 @@ impl eframe::App for App {
             }
             self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
             self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
+            self.last_scan_fallback_count =
+                self.scan_progress.fallback_count.load(Ordering::Relaxed);
+            self.last_scan_access_denied_fallback_count = self
+                .scan_progress
+                .access_denied_fallback_count
+                .load(Ordering::Relaxed);
+            self.last_scan_bulk_scan_fallback_count = self
+                .scan_progress
+                .bulk_scan_fallback_count
+                .load(Ordering::Relaxed);
+            self.last_scan_fallback_details = self.scan_progress.fallback_details_snapshot();
             self.scanning = false;
             self.receiver = None;
             self.category_filter = None;
@@ -524,8 +660,9 @@ impl eframe::App for App {
 
             // Report frame-time stats for the scan
             if let Some(scan_start) = self.scan_start_time.take() {
+                let scan_dur = scan_start.elapsed();
+                self.last_scan_duration = Some(scan_dur);
                 if debug_enabled() {
-                    let scan_dur = scan_start.elapsed();
                     let ft = &mut self.scan_frame_times;
                     ft.sort();
                     let n = ft.len();
@@ -540,6 +677,17 @@ impl eframe::App for App {
                             "[perf] scan done in {scan_dur:?} ({} files)",
                             self.last_scan_file_count
                         );
+                        if self.last_scan_fallback_count > 0 {
+                            eprintln!(
+                                "[perf] windows bulk fallbacks: {}",
+                                scanner::format_fallback_summary(
+                                    self.last_scan_fallback_count,
+                                    self.last_scan_access_denied_fallback_count,
+                                    self.last_scan_bulk_scan_fallback_count
+                                )
+                                .unwrap_or_else(|| self.last_scan_fallback_count.to_string())
+                            );
+                        }
                         eprintln!(
                             "[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
                             ft[0],
@@ -554,6 +702,7 @@ impl eframe::App for App {
                 }
                 self.scan_frame_times.clear();
             }
+
         }
 
         // Check if background deletion completed
@@ -1101,36 +1250,20 @@ impl eframe::App for App {
                 });
         }
 
+        let mut open_fallback_report = false;
+
         // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Left: scan info or focused path + selection count
+                // Left: static scan summary.
                 if self.tree.is_some() && !self.scanning {
-                    let selected_count = self.selected_paths.len();
-                    if let Some(ref focused) = self.focused_path {
-                        let display = focused
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| focused.display().to_string());
-                        let mut status = display;
-                        if selected_count > 1 {
-                            status = format!("{status} ({selected_count} selected)");
-                        } else if selected_count == 1 {
-                            status = format!("{status} (1 selected)");
-                        }
-                        ui.label(egui::RichText::new(status).small());
-                    } else if selected_count > 0 {
-                        ui.label(egui::RichText::new(format!("{selected_count} selected")).small());
-                    } else if let Some(ref path) = self.scan_path {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} files \u{2014} {}",
-                                self.last_scan_file_count,
-                                bytesize::ByteSize::b(self.last_scan_total_size)
-                            ))
-                            .small(),
+                    if self.scan_path.is_some() {
+                        let summary = format!(
+                            "{} files, {}",
+                            self.last_scan_file_count,
+                            bytesize::ByteSize::b(self.last_scan_total_size)
                         );
-                        let _ = path; // used for context above
+                        ui.label(egui::RichText::new(summary).small());
                     }
                 } else if let Some(ref path) = self.scan_path
                     && !self.scanning
@@ -1138,7 +1271,7 @@ impl eframe::App for App {
                 {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Scanned: {} \u{2014} {} files \u{2014} {}",
+                            "Scanned: {} ({} files, {})",
                             path.display(),
                             self.last_scan_file_count,
                             bytesize::ByteSize::b(self.last_scan_total_size)
@@ -1157,6 +1290,49 @@ impl eframe::App for App {
 
                     // Disk space info
                     if self.tree.is_some() && !self.scanning {
+                        if let Some(duration) = self.last_scan_duration {
+                            ui.label(
+                                egui::RichText::new(format!("Scan: {}", format_elapsed(duration)))
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.separator();
+                        }
+
+                        if self.last_scan_fallback_count > 0 {
+                            let button = egui::Button::new(
+                                egui::RichText::new(format!("⚠ {}", self.last_scan_fallback_count))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 200, 80)),
+                            )
+                            .frame(false);
+                            let hover = scanner::format_fallback_summary(
+                                self.last_scan_fallback_count,
+                                self.last_scan_access_denied_fallback_count,
+                                self.last_scan_bulk_scan_fallback_count,
+                            )
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{} fallback{}",
+                                    self.last_scan_fallback_count,
+                                    if self.last_scan_fallback_count == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                )
+                            });
+                            let response = ui
+                                .add(button)
+                                .on_hover_text(format!(
+                                    "{hover}\nClick to open details"
+                                ));
+                            if response.clicked() {
+                                open_fallback_report = true;
+                            }
+                            ui.separator();
+                        }
+
                         if let Some((total, available)) = self.scan_disk_info {
                             let used = total.saturating_sub(available);
                             ui.label(
@@ -1182,6 +1358,10 @@ impl eframe::App for App {
                 });
             });
         });
+
+        if open_fallback_report {
+            self.open_fallback_report();
+        }
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1225,15 +1405,8 @@ impl eframe::App for App {
                     // Elapsed time
                     if let Some(start) = self.scan_start_time {
                         ui.add_space(8.0);
-                        let elapsed = start.elapsed();
-                        let secs = elapsed.as_secs();
-                        let elapsed_str = if secs >= 60 {
-                            format!("{}m {:02}s", secs / 60, secs % 60)
-                        } else {
-                            format!("{secs}s")
-                        };
                         ui.label(
-                            egui::RichText::new(format!("Elapsed: {elapsed_str}"))
+                            egui::RichText::new(format!("Elapsed: {}", format_elapsed(start.elapsed())))
                                 .weak()
                                 .size(13.0),
                         );

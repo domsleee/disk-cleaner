@@ -52,7 +52,10 @@ harness = false
 name = "stat_bench"
 harness = false
 
-[profile.dev.package.image]
+[profile.bench]
+inherits = "release-dist"
+
+[profile.dev.package."*"]
 opt-level = 2
 
 [profile.release]

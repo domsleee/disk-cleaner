@@ -68,7 +68,7 @@ jobs:
 
       - name: Generate app icon
         run: |
-          cargo build --bin gen_icon --release
+          cargo build --bin gen_icon --release --features internal-tools
           ./target/release/gen_icon icon_1024.png
 
           # Create iconset with all required sizes

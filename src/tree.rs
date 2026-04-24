@@ -3,12 +3,11 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
-use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
+use std::cmp::Reverse;
 
 /// Bit 63 of the size field stores the hidden flag.
 /// Max representable size: 2^63 − 1 ≈ 9.2 EB (more than enough).
 const HIDDEN_BIT: u64 = 1 << 63;
-const PAR_SORT_THRESHOLD: usize = 128;
 
 #[derive(Clone)]
 pub struct FileLeaf {
@@ -44,6 +43,34 @@ pub struct DirNode {
     pub expanded: bool,
     /// True when the directory is hidden (dotfile or OS-level UF_HIDDEN flag).
     pub hidden: bool,
+    /// True once `children` has been sorted by descending size for display.
+    children_sorted: bool,
+}
+
+impl DirNode {
+    pub fn new(
+        name: Box<str>,
+        size: u64,
+        children: Vec<FileNode>,
+        expanded: bool,
+        hidden: bool,
+    ) -> Self {
+        Self {
+            name,
+            size,
+            children,
+            expanded,
+            hidden,
+            children_sorted: false,
+        }
+    }
+
+    fn sort_children_by_size(&mut self) {
+        if !self.children_sorted {
+            self.children.sort_unstable_by_key(|c| Reverse(c.size()));
+            self.children_sorted = true;
+        }
+    }
 }
 
 pub enum FileNode {
@@ -91,9 +118,19 @@ impl FileNode {
         }
     }
 
+    pub fn children_sorted(&self) -> bool {
+        match self {
+            FileNode::File(_) => true,
+            FileNode::Dir(d) => d.children_sorted,
+        }
+    }
+
     pub fn set_expanded(&mut self, val: bool) {
         if let FileNode::Dir(d) = self {
             d.expanded = val;
+            if val {
+                d.sort_children_by_size();
+            }
         }
     }
 
@@ -101,22 +138,6 @@ impl FileNode {
         match self {
             FileNode::Dir(d) => Some(d),
             FileNode::File(_) => None,
-        }
-    }
-}
-
-/// Sort children of every directory by descending size. Called once after
-/// the full tree is built so the hot `walk_dir` path does zero sorting.
-pub fn sort_children_recursive(node: &mut FileNode) {
-    if let FileNode::Dir(d) = node {
-        d.children
-            .sort_unstable_by_key(|c| std::cmp::Reverse(c.size()));
-        if d.children.len() >= PAR_SORT_THRESHOLD {
-            d.children.par_iter_mut().for_each(sort_children_recursive);
-        } else {
-            for child in &mut d.children {
-                sort_children_recursive(child);
-            }
         }
     }
 }
@@ -146,13 +167,13 @@ pub fn leaf(name: &str, size: u64) -> FileNode {
 #[cfg(test)]
 pub fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
     let size = children.iter().map(|c| c.size()).sum();
-    FileNode::Dir(Box::new(DirNode {
-        name: name.into(),
+    FileNode::Dir(Box::new(DirNode::new(
+        name.into(),
         size,
         children,
-        expanded: false,
-        hidden: name.starts_with('.'),
-    }))
+        false,
+        name.starts_with('.'),
+    )))
 }
 
 #[cfg(test)]
@@ -241,5 +262,39 @@ mod tests {
             root.children()[0].children()[0].expanded(),
             "lvl2 expanded (98% of parent)"
         );
+    }
+
+    #[test]
+    fn expanding_directory_sorts_direct_children_once() {
+        let mut root = dir(
+            "root",
+            vec![leaf("small.txt", 10), leaf("big.txt", 100), leaf("mid.txt", 50)],
+        );
+
+        assert!(!root.children_sorted());
+        root.set_expanded(true);
+
+        assert!(root.children_sorted());
+        assert_eq!(root.children()[0].name(), "big.txt");
+        assert_eq!(root.children()[1].name(), "mid.txt");
+        assert_eq!(root.children()[2].name(), "small.txt");
+    }
+
+    #[test]
+    fn expanding_parent_does_not_sort_collapsed_descendants() {
+        let mut root = dir(
+            "root",
+            vec![dir(
+                "sub",
+                vec![leaf("small.txt", 10), leaf("big.txt", 100)],
+            )],
+        );
+
+        root.set_expanded(true);
+        let sub = &root.children()[0];
+
+        assert!(root.children_sorted());
+        assert!(!sub.children_sorted());
+        assert_eq!(sub.children()[0].name(), "small.txt");
     }
 }

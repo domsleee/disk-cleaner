@@ -3,8 +3,8 @@
 //! These tests exercise the full pipeline: real filesystem operations → scanner
 //! → tree building → UI logic (selection, filtering, removal, categories).
 
-use disk_cleaner::categories::{compute_stats, FileCategory};
-use disk_cleaner::scanner::{scan_directory, ScanProgress};
+use disk_cleaner::categories::{FileCategory, compute_stats};
+use disk_cleaner::scanner::{ScanProgress, scan_directory};
 use disk_cleaner::tree::auto_expand;
 use disk_cleaner::ui;
 use std::collections::HashSet;
@@ -388,9 +388,10 @@ fn hidden_files_excluded_by_default() {
     // With show_hidden, both files are visible but grouped into "[2 files]"
     let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
     // Root + "[2 files]" group (both files visible → grouped since ≥ threshold)
-    assert!(rows
-        .iter()
-        .any(|r| r.is_file_group && r.name.as_ref() == "[2 files]"));
+    assert!(
+        rows.iter()
+            .any(|r| r.is_file_group && r.name.as_ref() == "[2 files]")
+    );
 
     // When file group is expanded, individual files become visible
     let mut expanded = std::collections::HashSet::new();

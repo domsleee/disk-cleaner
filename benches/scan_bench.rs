@@ -7,7 +7,7 @@
 //! cargo bench --bench scan_bench
 //! ```
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
 use std::alloc::{GlobalAlloc, Layout, System};

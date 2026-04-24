@@ -7,7 +7,7 @@
 //! cargo bench --bench tree_bench
 //! ```
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use disk_cleaner::categories;
 use disk_cleaner::tree::{self, DirNode, FileLeaf, FileNode};
 use disk_cleaner::ui;

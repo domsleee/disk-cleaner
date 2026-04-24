@@ -11,16 +11,16 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_NAME_NORMALIZED, FileIdType,
+    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdType,
     FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, OpenFileById, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_FILE_RECORD, FSCTL_GET_NTFS_VOLUME_DATA,
-    MFT_ENUM_DATA_V0, NTFS_FILE_RECORD_INPUT_BUFFER, NTFS_FILE_RECORD_OUTPUT_BUFFER,
-    NTFS_VOLUME_DATA_BUFFER, USN_RECORD_V2, USN_RECORD_V3,
+    FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_FILE_RECORD, FSCTL_GET_NTFS_VOLUME_DATA, MFT_ENUM_DATA_V0,
+    NTFS_FILE_RECORD_INPUT_BUFFER, NTFS_FILE_RECORD_OUTPUT_BUFFER, NTFS_VOLUME_DATA_BUFFER,
+    USN_RECORD_V2, USN_RECORD_V3,
 };
 
 const DRIVE_FIXED: u32 = 3;
@@ -251,8 +251,7 @@ pub fn query_sizes_from_file_records_for_samples(
     let volume_handle = open_volume(&eligibility.volume_device)?;
     let volume_data = ntfs_volume_data(volume_handle.0)?;
     let record_size = volume_data.BytesPerFileRecordSegment;
-    let mut output_buf =
-        vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_size as usize];
+    let mut output_buf = vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_size as usize];
     let mut results = Vec::with_capacity(samples.len());
     for sample in samples {
         let parsed = query_sizes_from_file_record(volume_handle.0, sample, &mut output_buf).ok();
@@ -280,8 +279,7 @@ pub fn query_size_from_file_record_for_sample(
     let volume_handle = open_volume(&eligibility.volume_device)?;
     let volume_data = ntfs_volume_data(volume_handle.0)?;
     let record_size = volume_data.BytesPerFileRecordSegment;
-    let mut output_buf =
-        vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_size as usize];
+    let mut output_buf = vec![0u8; NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE + record_size as usize];
     query_sizes_from_file_record(volume_handle.0, sample, &mut output_buf)
 }
 
@@ -727,16 +725,19 @@ fn parse_data_attribute_sizes(record: &[u8]) -> io::Result<(u64, u64, bool)> {
         ));
     }
 
-    let mut offset =
-        u16::from_le_bytes(record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2].try_into().unwrap())
-            as usize;
+    let mut offset = u16::from_le_bytes(
+        record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     while offset + 8 <= record.len() {
         let attr_type = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
         if attr_type == ATTR_TYPE_END {
             break;
         }
 
-        let attr_len = u32::from_le_bytes(record[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let attr_len =
+            u32::from_le_bytes(record[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if attr_len < 0x18 || offset + attr_len > record.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

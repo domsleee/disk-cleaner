@@ -440,6 +440,15 @@ pub fn render_tree(
     let row_total = row_height + ui.spacing().item_spacing.y;
 
     let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    #[cfg(windows)]
+    {
+        // Desktop Windows users expect wheel/scrollbar scrolling in list views,
+        // not click-and-drag panning anywhere in the content area.
+        scroll_area = scroll_area.scroll_source(egui::containers::scroll_area::ScrollSource {
+            drag: false,
+            ..Default::default()
+        });
+    }
 
     // Scroll to focused row when arrow keys move focus
     if scroll_to_focus && let Some(idx) = focused_idx {

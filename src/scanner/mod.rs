@@ -397,13 +397,13 @@ fn scan_directory_inner(
             .map(|c| unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) })
             .unwrap_or(-1);
         if root_fd < 0 {
-            FileNode::Dir(Box::new(DirNode {
-                name: root_name,
-                size: 0,
-                children: Vec::new(),
-                expanded: false,
-                hidden: root_hidden,
-            }))
+            FileNode::Dir(Box::new(DirNode::new(
+                root_name,
+                0,
+                Vec::new(),
+                false,
+                root_hidden,
+            )))
         } else {
             macos::walk_dir_bulk(root_fd, root, root_name, root_hidden, &progress, &skip)
         }
@@ -431,7 +431,6 @@ fn scan_directory_inner(
     #[cfg(not(target_os = "macos"))]
     #[cfg(not(target_os = "windows"))]
     let mut root_node = walk_dir(root, &progress, &skip);
-    crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only)
     if let FileNode::Dir(d) = &mut root_node {
@@ -489,25 +488,25 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     // Bail out early if scan was cancelled
     if progress.cancelled.load(Ordering::Relaxed) {
-        return FileNode::Dir(Box::new(DirNode {
-            name: dir_name,
-            size: 0,
-            children: Vec::new(),
-            expanded: false,
-            hidden: dir_hidden,
-        }));
+        return FileNode::Dir(Box::new(DirNode::new(
+            dir_name,
+            0,
+            Vec::new(),
+            false,
+            dir_hidden,
+        )));
     }
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
-            return FileNode::Dir(Box::new(DirNode {
-                name: dir_name,
-                size: 0,
-                children: Vec::new(),
-                expanded: false,
-                hidden: dir_hidden,
-            }));
+            return FileNode::Dir(Box::new(DirNode::new(
+                dir_name,
+                0,
+                Vec::new(),
+                false,
+                dir_hidden,
+            )));
         }
     };
 
@@ -567,13 +566,9 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let size = children.iter().map(|c| c.size()).sum();
 
-    FileNode::Dir(Box::new(DirNode {
-        name: dir_name,
-        size,
-        children,
-        expanded: false,
-        hidden: dir_hidden,
-    }))
+    FileNode::Dir(Box::new(DirNode::new(
+        dir_name, size, children, false, dir_hidden,
+    )))
 }
 
 #[cfg(test)]

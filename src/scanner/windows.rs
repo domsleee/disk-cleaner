@@ -401,23 +401,17 @@ pub fn walk_dir_bulk(
     file_children.extend(dir_children);
     let size = file_children.iter().map(|c| c.size()).sum();
 
-    Ok(FileNode::Dir(Box::new(DirNode {
-        name: dir_name,
+    Ok(FileNode::Dir(Box::new(DirNode::new(
+        dir_name,
         size,
-        children: file_children,
-        expanded: false,
-        hidden: dir_hidden,
-    })))
+        file_children,
+        false,
+        dir_hidden,
+    ))))
 }
 
 fn empty_dir(name: Box<str>, hidden: bool) -> FileNode {
-    FileNode::Dir(Box::new(DirNode {
-        name,
-        size: 0,
-        children: Vec::new(),
-        expanded: false,
-        hidden,
-    }))
+    FileNode::Dir(Box::new(DirNode::new(name, 0, Vec::new(), false, hidden)))
 }
 
 fn walk_child_dir(

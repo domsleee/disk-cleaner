@@ -211,6 +211,7 @@ fn main() -> eframe::Result {
 
     let mut i = 0;
     let mut screenshot_scanning_out: Option<PathBuf> = None;
+    let mut screenshot_scanning_multi: Option<(String, Vec<u64>)> = None;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
@@ -232,6 +233,31 @@ fn main() -> eframe::Result {
                     std::process::exit(1);
                 }
                 screenshot_scanning_out = Some(PathBuf::from(&args[i]));
+            }
+            "--screenshot-scanning-multi" => {
+                // --screenshot-scanning-multi <prefix> <t1,t2,...>
+                // Captures frames at the given times-since-scan-start (in
+                // milliseconds), saving as <prefix>_t<ms>.png each.  Exits
+                // after the last capture (or when scan ends, whichever
+                // comes first).
+                i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!(
+                        "Error: --screenshot-scanning-multi requires <prefix> <times-ms-csv>"
+                    );
+                    std::process::exit(1);
+                }
+                let prefix = args[i].clone();
+                i += 1;
+                let times: Vec<u64> = args[i]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .collect();
+                if times.is_empty() {
+                    eprintln!("Error: no valid times in --screenshot-scanning-multi");
+                    std::process::exit(1);
+                }
+                screenshot_scanning_multi = Some((prefix, times));
             }
             other => {
                 if other.starts_with('-') {
@@ -295,6 +321,8 @@ fn main() -> eframe::Result {
                 },
                 screenshot_scanning_out: screenshot_scanning_out.clone(),
                 screenshot_scanning_armed_at: None,
+                screenshot_scanning_multi: screenshot_scanning_multi.clone(),
+                screenshot_scanning_multi_taken: 0,
                 ..Default::default()
             };
             if app.screenshot_prefix.is_some() {
@@ -408,6 +436,10 @@ struct App {
     /// Time the scanning capture was armed (used to delay capture so
     /// the live results panel has time to populate).
     screenshot_scanning_armed_at: Option<Instant>,
+    /// Multi-shot scanning screenshot mode: (prefix, times-in-ms).
+    screenshot_scanning_multi: Option<(String, Vec<u64>)>,
+    /// How many of the multi-shot frames have been captured + saved.
+    screenshot_scanning_multi_taken: usize,
 }
 
 impl Default for App {
@@ -472,6 +504,8 @@ impl Default for App {
             deleter: BackgroundDeleter::default(),
             screenshot_scanning_out: None,
             screenshot_scanning_armed_at: None,
+            screenshot_scanning_multi: None,
+            screenshot_scanning_multi_taken: 0,
         }
     }
 }
@@ -1250,6 +1284,64 @@ impl eframe::App for App {
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
+            }
+        }
+
+        // ── In-scan multi-shot screenshots ──
+        // Capture frames at predefined ms-since-scan-start, save with
+        // suffixed filenames.  Continues until all times have fired or
+        // the scan ends (whichever first), then exits the process.
+        if let Some((prefix, times)) = self.screenshot_scanning_multi.clone() {
+            let scan_start = self.scan_start_time;
+            // Snapshot pending screenshot events first (frame N+1 from
+            // the prior trigger) and save under the matching filename.
+            let pending_image: Option<egui::ColorImage> = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.as_ref().clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = pending_image {
+                let idx = self.screenshot_scanning_multi_taken;
+                if idx > 0 && idx <= times.len() {
+                    let ms = times[idx - 1];
+                    let out = format!("{prefix}_t{ms:05}.png");
+                    let _ = save_screenshot_png(&img, &out);
+                    eprintln!("[multi] saved {out}");
+                }
+                if self.screenshot_scanning_multi_taken >= times.len() || !self.scanning {
+                    eprintln!("[multi] done — captured {} frames", times.len());
+                    std::process::exit(0);
+                }
+            }
+
+            // Trigger the next capture if its scheduled time has come.
+            if let Some(start) = scan_start
+                && self.scanning
+                && self.screenshot_scanning_multi_taken < times.len()
+            {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let next_ms = times[self.screenshot_scanning_multi_taken];
+                if elapsed_ms >= next_ms {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.screenshot_scanning_multi_taken += 1;
+                }
+                // Keep ticking even when nothing happened this frame so
+                // the marquee animates and the elapsed counter advances.
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+
+            // If the scan ended before all times fired, exit anyway so
+            // we don't dangle.
+            if !self.scanning && self.screenshot_scanning_multi_taken > 0 {
+                eprintln!(
+                    "[multi] scan finished early; captured {}/{} frames",
+                    self.screenshot_scanning_multi_taken,
+                    times.len()
+                );
+                std::process::exit(0);
             }
         }
 

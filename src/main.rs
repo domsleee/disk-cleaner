@@ -87,6 +87,55 @@ fn write_fallback_report(
     Ok(report_path)
 }
 
+/// Paint a 45° animated stripe overlay on `rect` to telegraph
+/// "this region is still being computed".  Stripes drift over time
+/// using `t_seconds` so the eye reads it as motion.
+fn paint_shimmer(painter: &egui::Painter, rect: egui::Rect, t_seconds: f32) {
+    let stripe_w = 6.0_f32;
+    let pitch = stripe_w * 2.0;
+    // Translate by t along the diagonal — wraps every `pitch` pixels.
+    let drift = (t_seconds * 22.0) % pitch;
+    let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16);
+    // Cover the rect with /-stripes; clip to rect bounds.
+    let span = rect.width() + rect.height();
+    let n = (span / pitch).ceil() as i32 + 2;
+    // Walk diagonals: each stripe is the polygon between two parallel
+    // lines y = -x + c and y = -x + c + stripe_w.  We approximate with
+    // axis-aligned slabs that we then mask via egui's clip rect.
+    let saved_clip = painter.clip_rect();
+    let painter = painter.with_clip_rect(rect);
+    for i in -n..n {
+        let c = i as f32 * pitch + drift;
+        // Diagonal stripe: a thin parallelogram from (rect.left, top+c)
+        // sliding to (rect.right, top+c-rect.width)
+        let p0 = rect.left_top() + egui::vec2(0.0, c);
+        let p1 = rect.left_top() + egui::vec2(0.0, c + stripe_w);
+        let p2 = rect.left_top() + egui::vec2(rect.width(), c + stripe_w - rect.width());
+        let p3 = rect.left_top() + egui::vec2(rect.width(), c - rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![p0, p1, p2, p3],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    let _ = saved_clip; // keep clip rect alive; restored on drop of `painter`
+}
+
+/// Truncate `s` so it would fit within roughly `max_w` pixels at the
+/// given font size.  Coarse: assumes ~0.55 × font_size px per glyph.
+fn truncate_to_width(s: &str, max_w: f32, font_size: f32) -> String {
+    let est_w_per_glyph = font_size * 0.55;
+    let max_glyphs = (max_w / est_w_per_glyph).max(2.0) as usize;
+    if s.chars().count() <= max_glyphs {
+        s.to_string()
+    } else if max_glyphs <= 1 {
+        "…".to_string()
+    } else {
+        let head: String = s.chars().take(max_glyphs - 1).collect();
+        format!("{head}…")
+    }
+}
+
 /// Open a file/folder in the platform's default file manager.
 fn open_in_finder(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -654,42 +703,24 @@ impl App {
         );
         painter.rect_filled(seg_rect, bar_height / 2.0, ui.visuals().selection.bg_fill);
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
-        // ── Live results list ──
+        // ── Live treemap of completed subtrees ──
+        // Reads from the lock-protected vec once per frame, dedupes
+        // ancestors-vs-descendants (parent wins), groups by the first
+        // path component below scan_root, and renders each group as a
+        // squarified tile.  The tile gets a striped overlay if the dir's
+        // own walk hasn't returned yet (we only know its size from the
+        // sum of its completed children).  Tiles for subdirs are nested
+        // inside their parent tile up to a small budget.
         let raw: Vec<scanner::CompletedSubtree> = self
             .scan_progress
             .completed_subtrees
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        // Sort biggest-first (matches the default post-scan tree sort)
-        // and drop any subtree whose ancestor is already in the list.
-        // Without this filter, MoneyPrinterTurbo (36 GB),
-        // MoneyPrinterTurbo/storage (36 GB), and
-        // MoneyPrinterTurbo/storage/cache_videos (21 GB) all show
-        // separately — same bytes counted three times.  Sort-by-size-
-        // desc puts the largest containing dir first, then we keep
-        // only items whose ancestor is not already shown.
-        let mut sorted = raw;
-        // Sort by size desc; on ties, shorter path first so ancestors
-        // win the dedup pass below (an Application bundle and its
-        // Contents/ subdir often have identical recursive size).
-        sorted.sort_unstable_by(|a, b| {
-            b.size
-                .cmp(&a.size)
-                .then_with(|| a.path.as_os_str().len().cmp(&b.path.as_os_str().len()))
-        });
-        let mut completed: Vec<scanner::CompletedSubtree> = Vec::with_capacity(sorted.len());
-        for item in sorted {
-            if !completed.iter().any(|kept| item.path.starts_with(&kept.path)) {
-                completed.push(item);
-            }
-        }
 
-        if completed.is_empty() {
+        if raw.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -702,223 +733,298 @@ impl App {
         }
 
         let scan_root = self.scan_path.clone();
+        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
         let mut clicked_open: Option<PathBuf> = None;
         let mut clicked_trash: Option<PathBuf> = None;
 
-        // ── Build a 1-level tree: top-level dirs as parents, deeper
-        //    items indented under their top-level parent.
-        //
-        // Grouping by the first path component below scan_root keeps the
-        // structure consistent with the post-scan tree (which always
-        // shows scan_root's children at depth 1) without needing a real
-        // partial-FileNode reconstruction during the scan.
-        #[derive(Default)]
+        // The set of paths whose own walk has finalised — these are
+        // "real" sizes.  Everything else is an inferred / running sum
+        // from children.  Used to pick whether a tile is shimmer-striped.
+        let finalised: std::collections::HashSet<PathBuf> =
+            raw.iter().map(|c| c.path.clone()).collect();
+
+        // Group by first path component below scan_root.
         struct Group {
             top_path: PathBuf,
             top_name: String,
-            // Sum of children's sizes — the parent's size is *at least*
-            // this; the parent's own CompletedSubtree (when it lands)
-            // can replace it.
+            // running_total = max(own_size, sum_of_descendant_sizes).
             running_total: u64,
-            children: Vec<scanner::CompletedSubtree>,
+            // own size if the dir's own CompletedSubtree has arrived.
+            own_size: Option<u64>,
+            // Deduped descendants (largest non-overlapping subtrees).
+            descendants: Vec<scanner::CompletedSubtree>,
         }
         let mut groups: Vec<Group> = Vec::new();
-        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
 
-        for item in &completed {
-            let rel = item.path.strip_prefix(&scan_root_path).unwrap_or(&item.path);
+        // First pass: bucket every completed subtree under its top group.
+        for item in &raw {
+            let rel = match item.path.strip_prefix(&scan_root_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             let mut comps = rel.components();
             let first = match comps.next() {
                 Some(c) => c.as_os_str().to_string_lossy().into_owned(),
-                None => continue, // it's the scan root itself
+                None => continue, // scan_root itself; ignore
             };
             let top_path = scan_root_path.join(&first);
-            let g = match groups.iter_mut().find(|g| g.top_path == top_path) {
-                Some(g) => g,
-                None => {
+            let pos = groups
+                .iter()
+                .position(|g| g.top_path == top_path)
+                .unwrap_or_else(|| {
                     groups.push(Group {
                         top_path: top_path.clone(),
-                        top_name: first,
+                        top_name: first.clone(),
                         running_total: 0,
-                        children: Vec::new(),
+                        own_size: None,
+                        descendants: Vec::new(),
                     });
-                    groups.last_mut().unwrap()
-                }
-            };
-            // If the item *is* the top-level dir, set its running total
-            // to the authoritative size; otherwise add to running total
-            // (children).
-            if item.path == top_path {
-                g.running_total = g.running_total.max(item.size);
-            } else {
-                g.children.push(item.clone());
-                g.running_total = g.running_total.max(
-                    g.running_total
-                        .saturating_add(0)
-                        .max(g.children.iter().map(|c| c.size).sum::<u64>()),
-                );
-            }
-        }
-        // Sort groups biggest-first; sort children within each group too.
-        groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
-        for g in &mut groups {
-            g.children
-                .sort_unstable_by(|a, b| b.size.cmp(&a.size));
-        }
-
-        let total_visible: u64 = groups.iter().map(|g| g.running_total).sum();
-
-        // Flatten into rows so we can virtualize via show_rows.
-        enum Row {
-            Header { path: PathBuf, name: String, size: u64 },
-            Child { path: PathBuf, label: String, size: u64 },
-        }
-        let mut rows: Vec<Row> = Vec::new();
-        for g in &groups {
-            rows.push(Row::Header {
-                path: g.top_path.clone(),
-                name: g.top_name.clone(),
-                size: g.running_total,
-            });
-            for c in &g.children {
-                let rel = c
-                    .path
-                    .strip_prefix(&g.top_path)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| c.path.display().to_string());
-                rows.push(Row::Child {
-                    path: c.path.clone(),
-                    label: rel,
-                    size: c.size,
+                    groups.len() - 1
                 });
+            let g = &mut groups[pos];
+            if item.path == top_path {
+                g.own_size = Some(item.size);
+            } else {
+                g.descendants.push(item.clone());
             }
         }
 
-        let row_height = 22.0_f32;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, row_height, rows.len(), |ui, range| {
-                ui.style_mut().interaction.selectable_labels = false;
-                for i in range {
-                    let row = &rows[i];
-                    let (path, label, size, is_header) = match row {
-                        Row::Header { path, name, size } => (path, name.clone(), *size, true),
-                        Row::Child { path, label, size } => (path, label.clone(), *size, false),
-                    };
+        // Second pass: dedupe descendants per-group (parent-wins) and
+        // compute running totals.
+        for g in &mut groups {
+            g.descendants.sort_unstable_by(|a, b| {
+                b.size.cmp(&a.size).then_with(|| {
+                    a.path.as_os_str().len().cmp(&b.path.as_os_str().len())
+                })
+            });
+            let mut kept: Vec<scanner::CompletedSubtree> = Vec::new();
+            for item in std::mem::take(&mut g.descendants) {
+                if !kept.iter().any(|k| item.path.starts_with(&k.path)) {
+                    kept.push(item);
+                }
+            }
+            let descendants_sum: u64 = kept.iter().map(|c| c.size).sum();
+            g.descendants = kept;
+            g.running_total = g.own_size.unwrap_or(0).max(descendants_sum);
+        }
 
-                    let row_rect = ui
-                        .allocate_response(
-                            egui::vec2(ui.available_width(), row_height),
+        // Sort groups biggest-first — required for squarify.
+        groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
+
+        // ── Layout ──
+        let avail = ui.available_size();
+        let (canvas_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let painter = ui.painter_at(canvas_rect);
+
+        // Background
+        painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+
+        if groups.is_empty() {
+            return;
+        }
+
+        let group_sizes_f64: Vec<f64> = groups
+            .iter()
+            .map(|g| g.running_total.max(1) as f64)
+            .collect();
+        let group_rects = treemap::squarify(
+            &group_sizes_f64,
+            canvas_rect.min.x,
+            canvas_rect.min.y,
+            canvas_rect.width(),
+            canvas_rect.height(),
+        );
+
+        // Top-level tile colour palette — distinct hues so adjacent
+        // groups don't blend.  Indexed by group rank (largest = 0).
+        let palette = [
+            egui::Color32::from_rgb(58, 93, 139),  // blue
+            egui::Color32::from_rgb(42, 109, 77),  // green
+            egui::Color32::from_rgb(122, 74, 48),  // brown
+            egui::Color32::from_rgb(74, 58, 107),  // purple
+            egui::Color32::from_rgb(90, 74, 58),   // tan
+            egui::Color32::from_rgb(48, 90, 100),  // teal
+            egui::Color32::from_rgb(110, 60, 90),  // mauve
+            egui::Color32::from_rgb(86, 86, 56),   // olive
+        ];
+
+        let now = ui.ctx().input(|i| i.time) as f32;
+
+        for (idx, (g, &rect)) in groups.iter().zip(group_rects.iter()).enumerate() {
+            if rect.width() < 1.0 || rect.height() < 1.0 {
+                continue;
+            }
+            let inset = rect.shrink(1.0);
+            let base = palette[idx % palette.len()];
+            let scanning = g.own_size.is_none();
+
+            // Solid fill
+            painter.rect_filled(inset, 4.0, base);
+
+            // If this group is still scanning its own root walk, overlay
+            // a 45° animated stripe pattern to telegraph "in progress".
+            if scanning {
+                paint_shimmer(&painter, inset, now);
+            }
+
+            // Inner nested children, top 12 by size, only if tile is
+            // big enough to be useful.
+            let nest_max = if inset.area() > 60_000.0 {
+                12
+            } else if inset.area() > 18_000.0 {
+                6
+            } else {
+                0
+            };
+            if nest_max > 0 && !g.descendants.is_empty() {
+                let nested_top = &g.descendants[..g.descendants.len().min(nest_max)];
+                let nested_sizes: Vec<f64> =
+                    nested_top.iter().map(|d| d.size.max(1) as f64).collect();
+                // Reserve top strip for the parent label.
+                let label_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
+                let nest_rect = egui::Rect::from_min_max(
+                    egui::pos2(inset.min.x + 4.0, inset.min.y + label_h),
+                    egui::pos2(inset.max.x - 4.0, inset.max.y - 4.0),
+                );
+                if nest_rect.width() > 30.0 && nest_rect.height() > 30.0 {
+                    let nrects = treemap::squarify(
+                        &nested_sizes,
+                        nest_rect.min.x,
+                        nest_rect.min.y,
+                        nest_rect.width(),
+                        nest_rect.height(),
+                    );
+                    for (_i, (d, &nr)) in
+                        nested_top.iter().zip(nrects.iter()).enumerate()
+                    {
+                        if nr.width() < 8.0 || nr.height() < 8.0 {
+                            continue;
+                        }
+                        let inner = nr.shrink(1.0);
+                        // Slightly darker variant for nested tiles.
+                        let dim = base.linear_multiply(0.55);
+                        painter.rect_filled(inner, 3.0, dim);
+                        // Stripe overlay if this nested item itself is
+                        // a synthetic intermediate (rare for descendants
+                        // since they came from a real CompletedSubtree;
+                        // we mark it as scanning if the dir hasn't been
+                        // fully walked yet via finalised set).
+                        if !finalised.contains(&d.path) {
+                            paint_shimmer(&painter, inner, now);
+                        }
+                        // Nested label only if there's room.
+                        if inner.width() > 60.0 && inner.height() > 20.0 {
+                            let leaf = d
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.path.display().to_string());
+                            let truncated =
+                                truncate_to_width(&leaf, inner.width() - 8.0, 11.0);
+                            painter.text(
+                                inner.left_top() + egui::vec2(4.0, 2.0),
+                                egui::Align2::LEFT_TOP,
+                                truncated,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                            );
+                            if inner.height() > 32.0 {
+                                painter.text(
+                                    inner.left_bottom() + egui::vec2(4.0, -16.0),
+                                    egui::Align2::LEFT_TOP,
+                                    bytesize::ByteSize::b(d.size).to_string(),
+                                    egui::FontId::monospace(11.0),
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                                );
+                            }
+                        }
+
+                        // Hit-test for nested tiles.
+                        let resp = ui.interact(
+                            inner,
+                            egui::Id::new(("nest", &d.path)),
                             egui::Sense::click(),
-                        )
-                        .interact(egui::Sense::click());
-
-                    let painter = ui.painter_at(row_rect.rect);
-
-                    // Bar: header bars are sized vs total visible; child
-                    // bars are sized vs their parent's running total so
-                    // the colour reads as proportional within the group.
-                    let frac = if is_header {
-                        if total_visible > 0 {
-                            size as f32 / total_visible as f32
-                        } else {
-                            0.0
-                        }
-                    } else {
-                        let parent_total = groups
-                            .iter()
-                            .find(|g| path.starts_with(&g.top_path))
-                            .map(|g| g.running_total)
-                            .unwrap_or(0);
-                        if parent_total > 0 {
-                            size as f32 / parent_total as f32
-                        } else {
-                            0.0
-                        }
-                    };
-                    let bar_w = row_rect.rect.width() * frac.clamp(0.0, 1.0);
-                    let bar_rect = egui::Rect::from_min_size(
-                        row_rect.rect.min,
-                        egui::vec2(bar_w, row_height),
-                    );
-                    let bar_alpha = if is_header { 0.25 } else { 0.12 };
-                    painter.rect_filled(
-                        bar_rect,
-                        0.0,
-                        ui.visuals().selection.bg_fill.linear_multiply(bar_alpha),
-                    );
-                    if row_rect.hovered() {
-                        painter.rect_filled(
-                            row_rect.rect,
-                            0.0,
-                            ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.4),
                         );
-                    }
-
-                    let indent = if is_header { 0.0 } else { 24.0 };
-                    let inner = row_rect.rect.shrink2(egui::vec2(8.0, 2.0));
-
-                    // Size column (monospace, right-aligned at fixed width).
-                    let size_text = bytesize::ByteSize::b(size).to_string();
-                    painter.text(
-                        inner.left_top() + egui::vec2(0.0, 2.0),
-                        egui::Align2::LEFT_TOP,
-                        size_text,
-                        egui::FontId::monospace(13.0),
-                        if is_header {
-                            ui.visuals().strong_text_color()
-                        } else {
-                            ui.visuals().text_color()
-                        },
-                    );
-
-                    // Disclosure marker for headers (decorative only —
-                    // children are always visible during scan).
-                    if is_header {
-                        painter.text(
-                            inner.left_top() + egui::vec2(80.0, 2.0),
-                            egui::Align2::LEFT_TOP,
-                            "▾",
-                            egui::FontId::proportional(13.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                    }
-
-                    // Label column.
-                    let font = if is_header {
-                        egui::FontId::proportional(13.5)
-                    } else {
-                        egui::FontId::proportional(12.5)
-                    };
-                    let color = if is_header {
-                        ui.visuals().strong_text_color()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    painter.text(
-                        inner.left_top() + egui::vec2(96.0 + indent, 2.0),
-                        egui::Align2::LEFT_TOP,
-                        &label,
-                        font,
-                        color,
-                    );
-
-                    if row_rect.clicked() {
-                        clicked_open = Some(path.clone());
-                    }
-                    let path_for_menu = path.clone();
-                    row_rect.context_menu(|ui| {
-                        if ui.button("Open in Finder").clicked() {
-                            clicked_open = Some(path_for_menu.clone());
-                            ui.close_menu();
+                        if resp.clicked() {
+                            clicked_open = Some(d.path.clone());
                         }
-                        if ui.button("Move to Trash").clicked() {
-                            clicked_trash = Some(path_for_menu.clone());
-                            ui.close_menu();
-                        }
-                    });
+                        let path_for_menu = d.path.clone();
+                        resp.context_menu(|ui| {
+                            if ui.button("Open in Finder").clicked() {
+                                clicked_open = Some(path_for_menu.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("Move to Trash").clicked() {
+                                clicked_trash = Some(path_for_menu.clone());
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Parent header band — solid backdrop so labels stay
+            // readable over nested children's tile colors.  Drawn last
+            // so it sits above nested tiles.
+            let header_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
+            let header_rect = egui::Rect::from_min_size(
+                inset.min,
+                egui::vec2(inset.width(), header_h),
+            );
+            // Slightly darker, opaque-ish band of the base color.
+            let band = base.linear_multiply(0.55);
+            painter.rect_filled(
+                header_rect,
+                egui::CornerRadius {
+                    nw: 4, ne: 4, sw: 0, se: 0,
+                },
+                egui::Color32::from_rgba_unmultiplied(band.r(), band.g(), band.b(), 230),
+            );
+
+            let label_color = egui::Color32::WHITE;
+            painter.text(
+                header_rect.min + egui::vec2(8.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                &g.top_name,
+                egui::FontId::proportional(14.5),
+                label_color,
+            );
+            let size_str = bytesize::ByteSize::b(g.running_total).to_string();
+            let scan_tag = if scanning { "  ·  scanning" } else { "" };
+            // Right-align the size in the header so the leaf name has
+            // room.  Approximate width — egui doesn't expose galley
+            // measurement from this context cheaply.
+            let size_text = format!("{size_str}{scan_tag}");
+            let approx_w = size_text.chars().count() as f32 * 6.5;
+            painter.text(
+                header_rect.right_top() + egui::vec2(-(approx_w + 8.0), 7.0),
+                egui::Align2::LEFT_TOP,
+                size_text,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+            );
+
+            // Whole-tile click handler (when no nested tile caught it).
+            let resp = ui.interact(
+                inset,
+                egui::Id::new(("group", &g.top_path)),
+                egui::Sense::click(),
+            );
+            if resp.clicked() && clicked_open.is_none() {
+                clicked_open = Some(g.top_path.clone());
+            }
+            let path_for_menu = g.top_path.clone();
+            resp.context_menu(|ui| {
+                if ui.button("Open in Finder").clicked() {
+                    clicked_open = Some(path_for_menu.clone());
+                    ui.close_menu();
+                }
+                if ui.button("Move to Trash").clicked() {
+                    clicked_trash = Some(path_for_menu.clone());
+                    ui.close_menu();
                 }
             });
+        }
 
         if let Some(p) = clicked_open {
             let _ = open_in_finder(&p);

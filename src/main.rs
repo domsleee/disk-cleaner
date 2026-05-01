@@ -87,6 +87,25 @@ fn write_fallback_report(
     Ok(report_path)
 }
 
+/// Open a file/folder in the platform's default file manager.
+fn open_in_finder(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(path).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+        Ok(())
+    }
+}
+
 fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -191,6 +210,7 @@ fn main() -> eframe::Result {
     let mut screenshot_prefix: Option<String> = None;
 
     let mut i = 0;
+    let mut screenshot_scanning_out: Option<PathBuf> = None;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
@@ -204,6 +224,14 @@ fn main() -> eframe::Result {
                     std::process::exit(1);
                 }
                 screenshot_prefix = Some(args[i].clone());
+            }
+            "--screenshot-scanning" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --screenshot-scanning requires an output path");
+                    std::process::exit(1);
+                }
+                screenshot_scanning_out = Some(PathBuf::from(&args[i]));
             }
             other => {
                 if other.starts_with('-') {
@@ -265,6 +293,8 @@ fn main() -> eframe::Result {
                 } else {
                     ScreenshotState::Idle
                 },
+                screenshot_scanning_out: screenshot_scanning_out.clone(),
+                screenshot_scanning_armed_at: None,
                 ..Default::default()
             };
             if app.screenshot_prefix.is_some() {
@@ -373,6 +403,11 @@ struct App {
     screenshots_saved: u8,
     /// Background deletion state.
     deleter: BackgroundDeleter,
+    /// One-shot output path for the in-scan screenshot mode.
+    screenshot_scanning_out: Option<PathBuf>,
+    /// Time the scanning capture was armed (used to delay capture so
+    /// the live results panel has time to populate).
+    screenshot_scanning_armed_at: Option<Instant>,
 }
 
 impl Default for App {
@@ -390,6 +425,7 @@ impl Default for App {
                 bulk_scan_fallback_count: 0.into(),
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
+                completed_subtrees: std::sync::Mutex::new(Vec::new()),
             }),
             receiver: None,
             error: None,
@@ -434,6 +470,8 @@ impl Default for App {
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
             deleter: BackgroundDeleter::default(),
+            screenshot_scanning_out: None,
+            screenshot_scanning_armed_at: None,
         }
     }
 }
@@ -487,6 +525,7 @@ impl App {
             bulk_scan_fallback_count: 0.into(),
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
+            completed_subtrees: std::sync::Mutex::new(Vec::new()),
         });
         self.scan_progress = progress.clone();
 
@@ -506,6 +545,199 @@ impl App {
             let stats = categories::compute_stats(&tree);
             let _ = tx.send(ScanResult { tree, stats });
         });
+    }
+
+    /// Live results UI shown during a scan.  Renders a top status strip
+    /// (file count, indeterminate bar, elapsed, cancel) and below it a
+    /// scrolling list of completed subtrees, sorted biggest-first to match
+    /// the post-scan tree view.  Rows are interactive: clicking opens in
+    /// Finder, right-click trashes.
+    fn render_scanning_panel(&mut self, ui: &mut egui::Ui) {
+        // ── Top status strip ──
+        let files = self.scan_progress.file_count.load(Ordering::Relaxed);
+        let size = self.scan_progress.total_size.load(Ordering::Relaxed);
+        let size_str = bytesize::ByteSize::b(size).to_string();
+        let path_str = self
+            .scan_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("Scanning {path_str}"))
+                    .strong()
+                    .size(13.0),
+            );
+            ui.label(
+                egui::RichText::new(format!("· {files} files · {size_str}"))
+                    .weak()
+                    .size(13.0),
+            );
+            if let Some(start) = self.scan_start_time {
+                ui.label(
+                    egui::RichText::new(format!("· {}", format_elapsed(start.elapsed())))
+                        .weak()
+                        .size(13.0),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    self.cancel_scan();
+                }
+            });
+        });
+
+        // Indeterminate animated bar — full width, just a movement cue.
+        let t = ui.ctx().input(|i| i.time);
+        let phase = ((t * 0.7).sin() * 0.5 + 0.5) as f32;
+        let bar = egui::ProgressBar::new(phase).animate(true);
+        ui.add(bar);
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // ── Live results list ──
+        let raw: Vec<scanner::CompletedSubtree> = self
+            .scan_progress
+            .completed_subtrees
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        // Sort biggest-first (matches the default post-scan tree sort)
+        // and drop any subtree whose ancestor is already in the list.
+        // Without this filter, MoneyPrinterTurbo (36 GB),
+        // MoneyPrinterTurbo/storage (36 GB), and
+        // MoneyPrinterTurbo/storage/cache_videos (21 GB) all show
+        // separately — same bytes counted three times.  Sort-by-size-
+        // desc puts the largest containing dir first, then we keep
+        // only items whose ancestor is not already shown.
+        let mut sorted = raw;
+        // Sort by size desc; on ties, shorter path first so ancestors
+        // win the dedup pass below (an Application bundle and its
+        // Contents/ subdir often have identical recursive size).
+        sorted.sort_unstable_by(|a, b| {
+            b.size
+                .cmp(&a.size)
+                .then_with(|| a.path.as_os_str().len().cmp(&b.path.as_os_str().len()))
+        });
+        let mut completed: Vec<scanner::CompletedSubtree> = Vec::with_capacity(sorted.len());
+        for item in sorted {
+            if !completed.iter().any(|kept| item.path.starts_with(&kept.path)) {
+                completed.push(item);
+            }
+        }
+
+        if completed.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Looking for big stuff…")
+                        .weak()
+                        .size(13.0),
+                );
+            });
+            return;
+        }
+
+        let scan_root = self.scan_path.clone();
+        let mut clicked_open: Option<PathBuf> = None;
+        let mut clicked_trash: Option<PathBuf> = None;
+        let row_height = 22.0_f32;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, completed.len(), |ui, range| {
+                ui.style_mut().interaction.selectable_labels = false;
+                let total_visible: u64 = completed.iter().map(|c| c.size).sum();
+                for i in range {
+                    let item = &completed[i];
+                    let display = scan_root
+                        .as_ref()
+                        .and_then(|root| {
+                            item.path.strip_prefix(root).ok().map(|p| {
+                                if p.as_os_str().is_empty() {
+                                    ".".to_string()
+                                } else {
+                                    p.display().to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| item.path.display().to_string());
+
+                    // Background bar proportional to size — same visual
+                    // cue as the post-scan tree.
+                    let row_rect = ui
+                        .allocate_response(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Sense::click(),
+                        )
+                        .interact(egui::Sense::click());
+
+                    let painter = ui.painter_at(row_rect.rect);
+                    let frac = if total_visible > 0 {
+                        item.size as f32 / total_visible as f32
+                    } else {
+                        0.0
+                    };
+                    let bar_w = row_rect.rect.width() * frac.clamp(0.0, 1.0);
+                    let bar_rect = egui::Rect::from_min_size(
+                        row_rect.rect.min,
+                        egui::vec2(bar_w, row_height),
+                    );
+                    let bar_color = ui.visuals().selection.bg_fill.linear_multiply(0.18);
+                    painter.rect_filled(bar_rect, 0.0, bar_color);
+                    if row_rect.hovered() {
+                        painter.rect_filled(
+                            row_rect.rect,
+                            0.0,
+                            ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.4),
+                        );
+                    }
+
+                    // Foreground: size (monospace, fixed col) + path.
+                    let inner = row_rect.rect.shrink2(egui::vec2(8.0, 2.0));
+                    painter.text(
+                        inner.left_top() + egui::vec2(0.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        bytesize::ByteSize::b(item.size).to_string(),
+                        egui::FontId::monospace(13.0),
+                        ui.visuals().strong_text_color(),
+                    );
+                    painter.text(
+                        inner.left_top() + egui::vec2(96.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        &display,
+                        egui::FontId::proportional(13.0),
+                        ui.visuals().text_color(),
+                    );
+
+                    if row_rect.clicked() {
+                        clicked_open = Some(item.path.clone());
+                    }
+                    row_rect.context_menu(|ui| {
+                        if ui.button("Open in Finder").clicked() {
+                            clicked_open = Some(item.path.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("Move to Trash").clicked() {
+                            clicked_trash = Some(item.path.clone());
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+
+        if let Some(p) = clicked_open {
+            let _ = open_in_finder(&p);
+        }
+        if let Some(p) = clicked_trash {
+            self.deleter.start(vec![p], false);
+        }
     }
 
     fn rebuild_rows_if_dirty(&mut self) {
@@ -829,6 +1061,64 @@ impl eframe::App for App {
                     }
                 }
                 self.scan_frame_times.clear();
+            }
+        }
+
+        // ── In-scan screenshot one-shot ──
+        if let Some(out) = self.screenshot_scanning_out.clone() {
+            if self.scanning {
+                if self.screenshot_scanning_armed_at.is_none() {
+                    self.screenshot_scanning_armed_at = Some(Instant::now());
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                } else if let Some(armed) = self.screenshot_scanning_armed_at
+                    && armed.elapsed() >= Duration::from_secs(3)
+                {
+                    // Take the shot now.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.screenshot_scanning_out = None; // one-shot
+                    // Save will happen below when the event arrives.
+                    let out_path = out.clone();
+                    let got = ctx.input(|i| {
+                        i.events
+                            .iter()
+                            .find_map(|e| match e {
+                                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                                _ => None,
+                            })
+                    });
+                    if let Some(image) = got {
+                        let _ = save_screenshot_png(&image, out_path.to_string_lossy().as_ref());
+                        std::process::exit(0);
+                    }
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+        }
+
+        // Handle the screenshot event in a follow-up frame for the
+        // scanning capture mode (the event arrives 1+ frames later).
+        if self.scanning && self.screenshot_scanning_armed_at.is_some() {
+            let mut to_save: Option<egui::ColorImage> = None;
+            ctx.input(|i| {
+                for e in &i.events {
+                    if let egui::Event::Screenshot { image, .. } = e {
+                        to_save = Some(image.as_ref().clone());
+                    }
+                }
+            });
+            if let Some(img) = to_save {
+                // Use original CLI arg as fallback path
+                let out = std::env::args()
+                    .skip_while(|a| a != "--screenshot-scanning")
+                    .nth(1);
+                if let Some(p) = out {
+                    let _ = save_screenshot_png(&img, &p);
+                    std::process::exit(0);
+                }
             }
         }
 
@@ -1495,63 +1785,12 @@ impl eframe::App for App {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Full-page scanning UI
+            // Live results UI during scan: status strip up top, interactive
+            // results list below.  Looks and behaves like the post-scan tree
+            // — just incomplete and growing.
             if self.scanning {
-                ui.vertical_centered(|ui| {
-                    let available = ui.available_height();
-                    ui.add_space(available * 0.3);
-
-                    ui.spinner();
-                    ui.add_space(12.0);
-
-                    let path_str = self
-                        .scan_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    ui.heading("Scanning");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&path_str).weak().size(13.0));
-                    ui.add_space(16.0);
-
-                    let files = self.scan_progress.file_count.load(Ordering::Relaxed);
-                    let size = self.scan_progress.total_size.load(Ordering::Relaxed);
-                    let size_str = bytesize::ByteSize::b(size).to_string();
-                    ui.label(format!("{files} files — {size_str}"));
-
-                    // Progress bar: estimated scan progress based on used disk space
-                    if self.scan_is_volume
-                        && let Some((total, available)) = self.scan_disk_info
-                    {
-                        let used = total.saturating_sub(available);
-                        if used > 0 {
-                            ui.add_space(12.0);
-                            let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                            let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
-                            ui.add(bar);
-                        }
-                    }
-
-                    // Elapsed time
-                    if let Some(start) = self.scan_start_time {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Elapsed: {}",
-                                format_elapsed(start.elapsed())
-                            ))
-                            .weak()
-                            .size(13.0),
-                        );
-                    }
-
-                    ui.add_space(24.0);
-                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0))
-                        .min_size(egui::vec2(120.0, 36.0));
-                    if ui.add(cancel_btn).clicked() {
-                        self.cancel_scan();
-                    }
-                });
+                self.render_scanning_panel(ui);
+                ui.ctx().request_repaint(); // keep indeterminate bar + list live
                 return;
             }
 

@@ -161,6 +161,26 @@ pub struct ScanProgress {
     pub bulk_scan_fallback_count: AtomicU64,
     pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
+    /// Subtrees that have finished scanning, in completion order.
+    /// The walker pushes one entry per directory as it returns.  The UI
+    /// reads this during a scan to render a live "biggest so far" list
+    /// — without waiting for the full tree to be assembled.
+    ///
+    /// Only directories whose recursive size exceeds [`SUBTREE_REPORT_MIN_BYTES`]
+    /// are reported, to keep the lock-protected vector small.
+    pub completed_subtrees: Mutex<Vec<CompletedSubtree>>,
+}
+
+/// Minimum recursive size for a subtree to be reported to the UI during
+/// the scan.  Filters out the tens-of-thousands of trivial leaf dirs in
+/// a typical scan; only keeps things big enough to be interesting in a
+/// "where is my disk space" panel.
+pub const SUBTREE_REPORT_MIN_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+
+#[derive(Clone, Debug)]
+pub struct CompletedSubtree {
+    pub path: PathBuf,
+    pub size: u64,
 }
 
 #[cfg(target_os = "windows")]
@@ -599,6 +619,7 @@ mod tests {
             bulk_scan_fallback_count: AtomicU64::new(0),
             fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
+            completed_subtrees: Mutex::new(Vec::new()),
         })
     }
 

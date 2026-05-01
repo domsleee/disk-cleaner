@@ -28,6 +28,7 @@ fn main() {
         bulk_scan_fallback_count: AtomicU64::new(0),
         fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
+        completed_subtrees: std::sync::Mutex::new(Vec::new()),
     });
 
     let tree = scanner::scan_directory(&path, progress.clone());

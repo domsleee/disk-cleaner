@@ -87,6 +87,53 @@ fn write_fallback_report(
     Ok(report_path)
 }
 
+/// Paint a vertical-gradient-filled rounded rect.  Top is `base` lifted
+/// ~12% toward white, bottom is `base` darkened ~10%.  Adds depth so
+/// tiles read as solid objects rather than flat fills.
+fn paint_gradient_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    base: egui::Color32,
+    radius: f32,
+) {
+    let lift = |c: u8, by: f32| -> u8 {
+        ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8
+    };
+    let dim = |c: u8, by: f32| -> u8 {
+        ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8
+    };
+    let top = egui::Color32::from_rgb(
+        lift(base.r(), 0.18),
+        lift(base.g(), 0.18),
+        lift(base.b(), 0.18),
+    );
+    let bot = egui::Color32::from_rgb(
+        dim(base.r(), 0.12),
+        dim(base.g(), 0.12),
+        dim(base.b(), 0.12),
+    );
+    // Build a Mesh: 4 verts, 2 triangles, vertex colours top→bot.
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bot);
+    mesh.colored_vertex(rect.left_bottom(), bot);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    // For simplicity, paint the mesh first (no rounded corners) and
+    // overlay a rounded-corner mask via stroked outline.
+    painter.add(egui::Shape::mesh(mesh));
+    // A faint rounded outline so the corners appear soft.
+    if radius > 0.0 {
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+}
+
 /// Paint a 45° animated stripe overlay on `rect` to telegraph
 /// "this region is still being computed".  Stripes drift over time
 /// using `t_seconds` so the eye reads it as motion.
@@ -121,19 +168,43 @@ fn paint_shimmer(painter: &egui::Painter, rect: egui::Rect, t_seconds: f32) {
     let _ = saved_clip; // keep clip rect alive; restored on drop of `painter`
 }
 
-/// Truncate `s` so it would fit within roughly `max_w` pixels at the
-/// given font size.  Coarse: assumes ~0.55 × font_size px per glyph.
-fn truncate_to_width(s: &str, max_w: f32, font_size: f32) -> String {
-    let est_w_per_glyph = font_size * 0.55;
-    let max_glyphs = (max_w / est_w_per_glyph).max(2.0) as usize;
-    if s.chars().count() <= max_glyphs {
-        s.to_string()
-    } else if max_glyphs <= 1 {
-        "…".to_string()
-    } else {
-        let head: String = s.chars().take(max_glyphs - 1).collect();
-        format!("{head}…")
+/// Lay out text with egui's font system to get accurate measurements,
+/// then truncate with ellipsis if needed so the *measured* width fits
+/// `max_w`.  Returns the laid-out galley and the actual text used.  If
+/// even one character + ellipsis doesn't fit, returns None.
+fn fit_text(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let color = egui::Color32::WHITE;
+    // Fast path: full text fits.
+    let g = painter.layout_no_wrap(text.to_string(), font_id.clone(), color);
+    if g.size().x <= max_w {
+        return Some(g);
     }
+    // Need to truncate.  Binary-search over char count, appending an
+    // ellipsis.  Always preserve at least 1 char + ellipsis.
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best: Option<std::sync::Arc<egui::Galley>> = None;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars.iter().take(mid).collect::<String>() + "…";
+        let g = painter.layout_no_wrap(candidate, font_id.clone(), color);
+        if g.size().x <= max_w {
+            best = Some(g);
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 /// Open a file/folder in the platform's default file manager.
@@ -489,6 +560,12 @@ struct App {
     screenshot_scanning_multi: Option<(String, Vec<u64>)>,
     /// How many of the multi-shot frames have been captured + saved.
     screenshot_scanning_multi_taken: usize,
+    /// Live scan-treemap layout: per-path target rect (recomputed every
+    /// 250 ms) and current rendered rect (lerped toward target each
+    /// frame).  Empty when not scanning.  See render_scanning_panel.
+    scan_tm_targets: std::collections::HashMap<PathBuf, egui::Rect>,
+    scan_tm_current: std::collections::HashMap<PathBuf, egui::Rect>,
+    scan_tm_last_layout: Option<Instant>,
 }
 
 impl Default for App {
@@ -555,6 +632,9 @@ impl Default for App {
             screenshot_scanning_armed_at: None,
             screenshot_scanning_multi: None,
             screenshot_scanning_multi_taken: 0,
+            scan_tm_targets: std::collections::HashMap::new(),
+            scan_tm_current: std::collections::HashMap::new(),
+            scan_tm_last_layout: None,
         }
     }
 }
@@ -622,6 +702,9 @@ impl App {
         self.last_scan_bulk_scan_fallback_count = 0;
         self.last_scan_fallback_details.clear();
         self.scan_frame_times.clear();
+        self.scan_tm_targets.clear();
+        self.scan_tm_current.clear();
+        self.scan_tm_last_layout = None;
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
@@ -811,29 +894,129 @@ impl App {
         // Sort groups biggest-first — required for squarify.
         groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
 
-        // ── Layout ──
+        // ── Canvas ──
         let avail = ui.available_size();
         let (canvas_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
         let painter = ui.painter_at(canvas_rect);
-
-        // Background
         painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
 
         if groups.is_empty() {
             return;
         }
 
-        let group_sizes_f64: Vec<f64> = groups
-            .iter()
-            .map(|g| g.running_total.max(1) as f64)
-            .collect();
-        let group_rects = treemap::squarify(
-            &group_sizes_f64,
-            canvas_rect.min.x,
-            canvas_rect.min.y,
-            canvas_rect.width(),
-            canvas_rect.height(),
-        );
+        // ── Throttled re-layout (250 ms) so tiles don't jitter every
+        //    frame.  We compute "target" rects on the throttle boundary,
+        //    then lerp the per-path "current" rects toward them with a
+        //    fast cubic ease-out so motion reads as a smooth morph.
+        let now_inst = Instant::now();
+        let canvas_changed = self
+            .scan_tm_targets
+            .values()
+            .next()
+            .map(|r| {
+                // Heuristic: if any cached rect's bounds are far outside
+                // the current canvas, the window resized — re-layout now.
+                !canvas_rect.contains(r.center())
+            })
+            .unwrap_or(true);
+        let due = self
+            .scan_tm_last_layout
+            .map(|t| now_inst.duration_since(t) >= Duration::from_millis(250))
+            .unwrap_or(true);
+        if due || canvas_changed {
+            let group_sizes_f64: Vec<f64> = groups
+                .iter()
+                .map(|g| g.running_total.max(1) as f64)
+                .collect();
+            let group_rects = treemap::squarify(
+                &group_sizes_f64,
+                canvas_rect.min.x,
+                canvas_rect.min.y,
+                canvas_rect.width(),
+                canvas_rect.height(),
+            );
+            self.scan_tm_targets.clear();
+            for (g, &r) in groups.iter().zip(group_rects.iter()) {
+                self.scan_tm_targets.insert(g.top_path.clone(), r);
+            }
+            // Recompute nested targets per-group too.
+            for (idx, (g, &outer)) in
+                groups.iter().zip(group_rects.iter()).enumerate()
+            {
+                let _ = idx;
+                if outer.width() < 1.0 || outer.height() < 1.0 {
+                    continue;
+                }
+                let inset = outer.shrink(1.0);
+                let label_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
+                let nest_max = if inset.area() > 60_000.0 {
+                    12
+                } else if inset.area() > 18_000.0 {
+                    6
+                } else {
+                    0
+                };
+                if nest_max == 0 || g.descendants.is_empty() {
+                    continue;
+                }
+                let nested_top =
+                    &g.descendants[..g.descendants.len().min(nest_max)];
+                let nest_rect = egui::Rect::from_min_max(
+                    egui::pos2(inset.min.x + 4.0, inset.min.y + label_h),
+                    egui::pos2(inset.max.x - 4.0, inset.max.y - 4.0),
+                );
+                if nest_rect.width() < 30.0 || nest_rect.height() < 30.0 {
+                    continue;
+                }
+                let nested_sizes: Vec<f64> =
+                    nested_top.iter().map(|d| d.size.max(1) as f64).collect();
+                let nrects = treemap::squarify(
+                    &nested_sizes,
+                    nest_rect.min.x,
+                    nest_rect.min.y,
+                    nest_rect.width(),
+                    nest_rect.height(),
+                );
+                for (d, &nr) in nested_top.iter().zip(nrects.iter()) {
+                    self.scan_tm_targets.insert(d.path.clone(), nr);
+                }
+            }
+            self.scan_tm_last_layout = Some(now_inst);
+        }
+
+        // Lerp current rects toward targets every frame.
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.05);
+        // 5 = "reach 99 % in ~0.6 s" using the exp(-k·dt) decay.
+        let k = 7.5_f32;
+        let blend = 1.0 - (-k * dt).exp();
+        let target_paths: std::collections::HashSet<_> =
+            self.scan_tm_targets.keys().cloned().collect();
+        // Insert any new path (haven't seen it before) at its target rect
+        // shrunken to a point in the centre, so it grows in.
+        for (path, &target) in &self.scan_tm_targets {
+            if !self.scan_tm_current.contains_key(path) {
+                let centre = target.center();
+                self.scan_tm_current
+                    .insert(path.clone(), egui::Rect::from_center_size(centre, egui::vec2(0.5, 0.5)));
+            }
+        }
+        // Drop paths that no longer exist in targets (rare — usually
+        // dedup just promotes a parent over a child).
+        self.scan_tm_current.retain(|p, _| target_paths.contains(p));
+
+        // Apply lerp.
+        for (path, cur) in self.scan_tm_current.iter_mut() {
+            if let Some(target) = self.scan_tm_targets.get(path) {
+                cur.min.x += (target.min.x - cur.min.x) * blend;
+                cur.min.y += (target.min.y - cur.min.y) * blend;
+                cur.max.x += (target.max.x - cur.max.x) * blend;
+                cur.max.y += (target.max.y - cur.max.y) * blend;
+            }
+        }
+
+        // Keep the UI ticking so animations smooth out even between
+        // events.  60 fps for the eye, atomics are the source of truth.
+        ui.ctx().request_repaint();
 
         // Top-level tile colour palette — distinct hues so adjacent
         // groups don't blend.  Indexed by group rank (largest = 0).
@@ -850,16 +1033,21 @@ impl App {
 
         let now = ui.ctx().input(|i| i.time) as f32;
 
-        for (idx, (g, &rect)) in groups.iter().zip(group_rects.iter()).enumerate() {
-            if rect.width() < 1.0 || rect.height() < 1.0 {
+        for (idx, g) in groups.iter().enumerate() {
+            let rect = match self.scan_tm_current.get(&g.top_path) {
+                Some(r) => *r,
+                None => continue,
+            };
+            if rect.width() < 2.0 || rect.height() < 2.0 {
                 continue;
             }
             let inset = rect.shrink(1.0);
             let base = palette[idx % palette.len()];
             let scanning = g.own_size.is_none();
 
-            // Solid fill
-            painter.rect_filled(inset, 4.0, base);
+            // Vertical gradient: lighter at top, base at bottom.  Painted
+            // as a Mesh with vertex colours.
+            paint_gradient_rect(&painter, inset, base, 4.0);
 
             // If this group is still scanning its own root walk, overlay
             // a 45° animated stripe pattern to telegraph "in progress".
@@ -878,32 +1066,20 @@ impl App {
             };
             if nest_max > 0 && !g.descendants.is_empty() {
                 let nested_top = &g.descendants[..g.descendants.len().min(nest_max)];
-                let nested_sizes: Vec<f64> =
-                    nested_top.iter().map(|d| d.size.max(1) as f64).collect();
-                // Reserve top strip for the parent label.
-                let label_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
-                let nest_rect = egui::Rect::from_min_max(
-                    egui::pos2(inset.min.x + 4.0, inset.min.y + label_h),
-                    egui::pos2(inset.max.x - 4.0, inset.max.y - 4.0),
-                );
-                if nest_rect.width() > 30.0 && nest_rect.height() > 30.0 {
-                    let nrects = treemap::squarify(
-                        &nested_sizes,
-                        nest_rect.min.x,
-                        nest_rect.min.y,
-                        nest_rect.width(),
-                        nest_rect.height(),
-                    );
-                    for (_i, (d, &nr)) in
-                        nested_top.iter().zip(nrects.iter()).enumerate()
+                for d in nested_top {
+                    let nr = match self.scan_tm_current.get(&d.path) {
+                        Some(r) => *r,
+                        None => continue,
+                    };
                     {
                         if nr.width() < 8.0 || nr.height() < 8.0 {
                             continue;
                         }
                         let inner = nr.shrink(1.0);
-                        // Slightly darker variant for nested tiles.
+                        // Slightly darker, gradient-filled variant for
+                        // nested tiles.
                         let dim = base.linear_multiply(0.55);
-                        painter.rect_filled(inner, 3.0, dim);
+                        paint_gradient_rect(&painter, inner, dim, 3.0);
                         // Stripe overlay if this nested item itself is
                         // a synthetic intermediate (rare for descendants
                         // since they came from a real CompletedSubtree;
@@ -913,29 +1089,50 @@ impl App {
                             paint_shimmer(&painter, inner, now);
                         }
                         // Nested label only if there's room.
-                        if inner.width() > 60.0 && inner.height() > 20.0 {
+                        // Only attempt labels on tiles wide enough that
+                        // *something readable* will fit after measuring.
+                        if inner.width() > 50.0 && inner.height() > 18.0 {
                             let leaf = d
                                 .path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| d.path.display().to_string());
-                            let truncated =
-                                truncate_to_width(&leaf, inner.width() - 8.0, 11.0);
-                            painter.text(
-                                inner.left_top() + egui::vec2(4.0, 2.0),
-                                egui::Align2::LEFT_TOP,
-                                truncated,
+                            let avail_w = inner.width() - 8.0;
+                            // Name (top-left).  Skip entirely if even a
+                            // single character + ellipsis won't fit.
+                            if let Some(galley) = fit_text(
+                                &painter,
+                                &leaf,
                                 egui::FontId::proportional(11.0),
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
-                            );
-                            if inner.height() > 32.0 {
-                                painter.text(
-                                    inner.left_bottom() + egui::vec2(4.0, -16.0),
-                                    egui::Align2::LEFT_TOP,
-                                    bytesize::ByteSize::b(d.size).to_string(),
-                                    egui::FontId::monospace(11.0),
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                                avail_w,
+                            ) {
+                                let pos = inner.left_top() + egui::vec2(4.0, 2.0);
+                                painter.galley(
+                                    pos,
+                                    galley,
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220),
                                 );
+                            }
+                            // Size (bottom-left).  Only if the tile is
+                            // tall enough that name and size won't
+                            // visually overlap.
+                            if inner.height() > 36.0 {
+                                let size_str =
+                                    bytesize::ByteSize::b(d.size).to_string();
+                                if let Some(g_sz) = fit_text(
+                                    &painter,
+                                    &size_str,
+                                    egui::FontId::monospace(11.0),
+                                    avail_w,
+                                ) {
+                                    let pos = inner.left_bottom()
+                                        + egui::vec2(4.0, -16.0);
+                                    painter.galley(
+                                        pos,
+                                        g_sz,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                                    );
+                                }
                             }
                         }
 
@@ -981,28 +1178,54 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(band.r(), band.g(), band.b(), 230),
             );
 
-            let label_color = egui::Color32::WHITE;
-            painter.text(
-                header_rect.min + egui::vec2(8.0, 5.0),
-                egui::Align2::LEFT_TOP,
+            // ── Header text: measure both labels first, decide what
+            //    fits, draw without any overlap ──
+            let header_pad = 8.0_f32;
+            let avail = (inset.width() - header_pad * 2.0).max(0.0);
+            let size_str = bytesize::ByteSize::b(g.running_total).to_string();
+            let size_text = if scanning {
+                format!("{size_str}  ·  scanning")
+            } else {
+                size_str
+            };
+            let size_galley = fit_text(
+                &painter,
+                &size_text,
+                egui::FontId::proportional(12.0),
+                avail,
+            );
+            // Reserve right side for size, name gets the rest.
+            let size_w = size_galley
+                .as_ref()
+                .map(|g| g.size().x + 12.0)
+                .unwrap_or(0.0);
+            let name_avail = (avail - size_w).max(0.0);
+            let name_galley = fit_text(
+                &painter,
                 &g.top_name,
                 egui::FontId::proportional(14.5),
-                label_color,
+                name_avail,
             );
-            let size_str = bytesize::ByteSize::b(g.running_total).to_string();
-            let scan_tag = if scanning { "  ·  scanning" } else { "" };
-            // Right-align the size in the header so the leaf name has
-            // room.  Approximate width — egui doesn't expose galley
-            // measurement from this context cheaply.
-            let size_text = format!("{size_str}{scan_tag}");
-            let approx_w = size_text.chars().count() as f32 * 6.5;
-            painter.text(
-                header_rect.right_top() + egui::vec2(-(approx_w + 8.0), 7.0),
-                egui::Align2::LEFT_TOP,
-                size_text,
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
-            );
+            // Vertically centre the larger of the two within header.
+            let header_mid_y = header_rect.center().y;
+            if let Some(ng) = name_galley {
+                let pos = egui::pos2(
+                    header_rect.min.x + header_pad,
+                    header_mid_y - ng.size().y * 0.5,
+                );
+                painter.galley(pos, ng, egui::Color32::WHITE);
+            }
+            if let Some(sg) = size_galley {
+                let pos = egui::pos2(
+                    header_rect.max.x - header_pad - sg.size().x,
+                    header_mid_y - sg.size().y * 0.5,
+                );
+                painter.galley(
+                    pos,
+                    sg,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                );
+            }
 
             // Whole-tile click handler (when no nested tile caught it).
             let resp = ui.interact(
@@ -1010,6 +1233,17 @@ impl App {
                 egui::Id::new(("group", &g.top_path)),
                 egui::Sense::click(),
             );
+            if resp.hovered() {
+                painter.rect_stroke(
+                    inset.shrink(0.5),
+                    4.0,
+                    egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+                    ),
+                    egui::epaint::StrokeKind::Inside,
+                );
+            }
             if resp.clicked() && clicked_open.is_none() {
                 clicked_open = Some(g.top_path.clone());
             }

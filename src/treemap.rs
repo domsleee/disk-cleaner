@@ -826,6 +826,51 @@ fn apply_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * alpha) as u8)
 }
 
+/// Paint a vertical gradient (top lighter, bottom darker) using a
+/// 2-triangle vertex-coloured Mesh.  Same look as the live-scan
+/// treemap so the two views are visually consistent.
+fn paint_gradient_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    base: egui::Color32,
+    radius: f32,
+) {
+    let lift = |c: u8, by: f32| -> u8 {
+        ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8
+    };
+    let dim = |c: u8, by: f32| -> u8 {
+        ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8
+    };
+    let top = egui::Color32::from_rgba_unmultiplied(
+        lift(base.r(), 0.18),
+        lift(base.g(), 0.18),
+        lift(base.b(), 0.18),
+        base.a(),
+    );
+    let bot = egui::Color32::from_rgba_unmultiplied(
+        dim(base.r(), 0.12),
+        dim(base.g(), 0.12),
+        dim(base.b(), 0.12),
+        base.a(),
+    );
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bot);
+    mesh.colored_vertex(rect.left_bottom(), bot);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+    if radius > 0.0 {
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+}
+
 fn paint_cached_leaf(
     painter: &egui::Painter,
     tile: &TreemapTile,
@@ -834,7 +879,7 @@ fn paint_cached_leaf(
     font: &egui::FontId,
 ) {
     let color = apply_alpha(tile.color, alpha);
-    painter.rect_filled(tile.rect, 2.0, color);
+    paint_gradient_rect(painter, tile.rect, color, 2.0);
 
     if is_focused {
         painter.rect_stroke(
@@ -872,7 +917,7 @@ fn paint_other_bucket(
 ) {
     let rect = other.rect;
     let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
-    painter.rect_filled(rect, 2.0, bg);
+    paint_gradient_rect(painter, rect, bg, 2.0);
 
     // Dashed-style border to distinguish from real blocks
     painter.rect_stroke(
@@ -916,8 +961,8 @@ fn paint_cached_directory(
     let bg = apply_alpha(tile.color, alpha);
     let header_bg = apply_alpha(tile.header_color, alpha);
 
-    // Background
-    painter.rect_filled(rect, 2.0, bg);
+    // Gradient background
+    paint_gradient_rect(painter, rect, bg, 2.0);
 
     if is_focused {
         painter.rect_stroke(
@@ -954,7 +999,7 @@ fn paint_cached_directory(
     for nested in &tile.nested {
         let cr = nested.rect;
         let color = apply_alpha(nested.color, alpha);
-        tile_painter.rect_filled(cr, 1.0, color);
+        paint_gradient_rect(&tile_painter, cr, color, 1.0);
 
         if has_focus {
             let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);

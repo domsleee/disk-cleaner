@@ -591,11 +591,34 @@ impl App {
             });
         });
 
-        // Indeterminate animated bar — full width, just a movement cue.
-        let t = ui.ctx().input(|i| i.time);
-        let phase = ((t * 0.7).sin() * 0.5 + 0.5) as f32;
-        let bar = egui::ProgressBar::new(phase).animate(true);
-        ui.add(bar);
+        // Indeterminate progress bar — a fixed-width segment that slides
+        // across left-to-right, the conventional "I'm doing something but
+        // I don't know how much is left" affordance.  egui doesn't ship
+        // an indeterminate ProgressBar, so paint it directly.
+        let t = ui.ctx().input(|i| i.time) as f32;
+        let bar_height = 4.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), bar_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        // Track
+        painter.rect_filled(
+            rect,
+            bar_height / 2.0,
+            ui.visuals().widgets.inactive.bg_fill.linear_multiply(0.6),
+        );
+        // Marquee: 25% wide, slides at ~0.5 cycles/sec, eases via sine-mapped position
+        let track_w = rect.width();
+        let seg_w = (track_w * 0.25).max(40.0);
+        let cycle = 1.6_f32; // seconds for one full sweep
+        let phase = ((t / cycle).fract() * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+        let x_min = rect.min.x + (track_w - seg_w) * phase;
+        let seg_rect = egui::Rect::from_min_size(
+            egui::pos2(x_min, rect.min.y),
+            egui::vec2(seg_w, bar_height),
+        );
+        painter.rect_filled(seg_rect, bar_height / 2.0, ui.visuals().selection.bg_fill);
 
         ui.add_space(8.0);
         ui.separator();
@@ -647,30 +670,108 @@ impl App {
         let scan_root = self.scan_path.clone();
         let mut clicked_open: Option<PathBuf> = None;
         let mut clicked_trash: Option<PathBuf> = None;
-        let row_height = 22.0_f32;
 
+        // ── Build a 1-level tree: top-level dirs as parents, deeper
+        //    items indented under their top-level parent.
+        //
+        // Grouping by the first path component below scan_root keeps the
+        // structure consistent with the post-scan tree (which always
+        // shows scan_root's children at depth 1) without needing a real
+        // partial-FileNode reconstruction during the scan.
+        #[derive(Default)]
+        struct Group {
+            top_path: PathBuf,
+            top_name: String,
+            // Sum of children's sizes — the parent's size is *at least*
+            // this; the parent's own CompletedSubtree (when it lands)
+            // can replace it.
+            running_total: u64,
+            children: Vec<scanner::CompletedSubtree>,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
+
+        for item in &completed {
+            let rel = item.path.strip_prefix(&scan_root_path).unwrap_or(&item.path);
+            let mut comps = rel.components();
+            let first = match comps.next() {
+                Some(c) => c.as_os_str().to_string_lossy().into_owned(),
+                None => continue, // it's the scan root itself
+            };
+            let top_path = scan_root_path.join(&first);
+            let g = match groups.iter_mut().find(|g| g.top_path == top_path) {
+                Some(g) => g,
+                None => {
+                    groups.push(Group {
+                        top_path: top_path.clone(),
+                        top_name: first,
+                        running_total: 0,
+                        children: Vec::new(),
+                    });
+                    groups.last_mut().unwrap()
+                }
+            };
+            // If the item *is* the top-level dir, set its running total
+            // to the authoritative size; otherwise add to running total
+            // (children).
+            if item.path == top_path {
+                g.running_total = g.running_total.max(item.size);
+            } else {
+                g.children.push(item.clone());
+                g.running_total = g.running_total.max(
+                    g.running_total
+                        .saturating_add(0)
+                        .max(g.children.iter().map(|c| c.size).sum::<u64>()),
+                );
+            }
+        }
+        // Sort groups biggest-first; sort children within each group too.
+        groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
+        for g in &mut groups {
+            g.children
+                .sort_unstable_by(|a, b| b.size.cmp(&a.size));
+        }
+
+        let total_visible: u64 = groups.iter().map(|g| g.running_total).sum();
+
+        // Flatten into rows so we can virtualize via show_rows.
+        enum Row {
+            Header { path: PathBuf, name: String, size: u64 },
+            Child { path: PathBuf, label: String, size: u64 },
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for g in &groups {
+            rows.push(Row::Header {
+                path: g.top_path.clone(),
+                name: g.top_name.clone(),
+                size: g.running_total,
+            });
+            for c in &g.children {
+                let rel = c
+                    .path
+                    .strip_prefix(&g.top_path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| c.path.display().to_string());
+                rows.push(Row::Child {
+                    path: c.path.clone(),
+                    label: rel,
+                    size: c.size,
+                });
+            }
+        }
+
+        let row_height = 22.0_f32;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, completed.len(), |ui, range| {
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
                 ui.style_mut().interaction.selectable_labels = false;
-                let total_visible: u64 = completed.iter().map(|c| c.size).sum();
                 for i in range {
-                    let item = &completed[i];
-                    let display = scan_root
-                        .as_ref()
-                        .and_then(|root| {
-                            item.path.strip_prefix(root).ok().map(|p| {
-                                if p.as_os_str().is_empty() {
-                                    ".".to_string()
-                                } else {
-                                    p.display().to_string()
-                                }
-                            })
-                        })
-                        .unwrap_or_else(|| item.path.display().to_string());
+                    let row = &rows[i];
+                    let (path, label, size, is_header) = match row {
+                        Row::Header { path, name, size } => (path, name.clone(), *size, true),
+                        Row::Child { path, label, size } => (path, label.clone(), *size, false),
+                    };
 
-                    // Background bar proportional to size — same visual
-                    // cue as the post-scan tree.
                     let row_rect = ui
                         .allocate_response(
                             egui::vec2(ui.available_width(), row_height),
@@ -679,18 +780,39 @@ impl App {
                         .interact(egui::Sense::click());
 
                     let painter = ui.painter_at(row_rect.rect);
-                    let frac = if total_visible > 0 {
-                        item.size as f32 / total_visible as f32
+
+                    // Bar: header bars are sized vs total visible; child
+                    // bars are sized vs their parent's running total so
+                    // the colour reads as proportional within the group.
+                    let frac = if is_header {
+                        if total_visible > 0 {
+                            size as f32 / total_visible as f32
+                        } else {
+                            0.0
+                        }
                     } else {
-                        0.0
+                        let parent_total = groups
+                            .iter()
+                            .find(|g| path.starts_with(&g.top_path))
+                            .map(|g| g.running_total)
+                            .unwrap_or(0);
+                        if parent_total > 0 {
+                            size as f32 / parent_total as f32
+                        } else {
+                            0.0
+                        }
                     };
                     let bar_w = row_rect.rect.width() * frac.clamp(0.0, 1.0);
                     let bar_rect = egui::Rect::from_min_size(
                         row_rect.rect.min,
                         egui::vec2(bar_w, row_height),
                     );
-                    let bar_color = ui.visuals().selection.bg_fill.linear_multiply(0.18);
-                    painter.rect_filled(bar_rect, 0.0, bar_color);
+                    let bar_alpha = if is_header { 0.25 } else { 0.12 };
+                    painter.rect_filled(
+                        bar_rect,
+                        0.0,
+                        ui.visuals().selection.bg_fill.linear_multiply(bar_alpha),
+                    );
                     if row_rect.hovered() {
                         painter.rect_filled(
                             row_rect.rect,
@@ -699,33 +821,65 @@ impl App {
                         );
                     }
 
-                    // Foreground: size (monospace, fixed col) + path.
+                    let indent = if is_header { 0.0 } else { 24.0 };
                     let inner = row_rect.rect.shrink2(egui::vec2(8.0, 2.0));
+
+                    // Size column (monospace, right-aligned at fixed width).
+                    let size_text = bytesize::ByteSize::b(size).to_string();
                     painter.text(
                         inner.left_top() + egui::vec2(0.0, 2.0),
                         egui::Align2::LEFT_TOP,
-                        bytesize::ByteSize::b(item.size).to_string(),
+                        size_text,
                         egui::FontId::monospace(13.0),
-                        ui.visuals().strong_text_color(),
+                        if is_header {
+                            ui.visuals().strong_text_color()
+                        } else {
+                            ui.visuals().text_color()
+                        },
                     );
+
+                    // Disclosure marker for headers (decorative only —
+                    // children are always visible during scan).
+                    if is_header {
+                        painter.text(
+                            inner.left_top() + egui::vec2(80.0, 2.0),
+                            egui::Align2::LEFT_TOP,
+                            "▾",
+                            egui::FontId::proportional(13.0),
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+
+                    // Label column.
+                    let font = if is_header {
+                        egui::FontId::proportional(13.5)
+                    } else {
+                        egui::FontId::proportional(12.5)
+                    };
+                    let color = if is_header {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
                     painter.text(
-                        inner.left_top() + egui::vec2(96.0, 2.0),
+                        inner.left_top() + egui::vec2(96.0 + indent, 2.0),
                         egui::Align2::LEFT_TOP,
-                        &display,
-                        egui::FontId::proportional(13.0),
-                        ui.visuals().text_color(),
+                        &label,
+                        font,
+                        color,
                     );
 
                     if row_rect.clicked() {
-                        clicked_open = Some(item.path.clone());
+                        clicked_open = Some(path.clone());
                     }
+                    let path_for_menu = path.clone();
                     row_rect.context_menu(|ui| {
                         if ui.button("Open in Finder").clicked() {
-                            clicked_open = Some(item.path.clone());
+                            clicked_open = Some(path_for_menu.clone());
                             ui.close_menu();
                         }
                         if ui.button("Move to Trash").clicked() {
-                            clicked_trash = Some(item.path.clone());
+                            clicked_trash = Some(path_for_menu.clone());
                             ui.close_menu();
                         }
                     });

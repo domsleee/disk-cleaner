@@ -566,6 +566,35 @@ struct App {
     scan_tm_targets: std::collections::HashMap<PathBuf, egui::Rect>,
     scan_tm_current: std::collections::HashMap<PathBuf, egui::Rect>,
     scan_tm_last_layout: Option<Instant>,
+    /// Cached pre-grouped, pre-deduped scan-treemap data.  Rebuilt
+    /// only on the 250 ms throttle boundary so the per-frame render
+    /// path doesn't redo the O(N²) dedupe + grouping.
+    scan_tm_cache: ScanTreemapCache,
+}
+
+/// Pre-computed view of the live treemap data.  Populated on the
+/// 250 ms layout boundary inside render_scanning_panel.  Keeping it
+/// owned on App lets every frame between boundaries skip the dedupe
+/// and grouping work entirely.
+#[derive(Default)]
+struct ScanTreemapCache {
+    /// Top-level groups, biggest-first.  Each carries its top-N
+    /// deduped descendants.
+    groups: Vec<ScanGroup>,
+    /// Paths whose own walk has finalised — flat HashSet for O(1)
+    /// "is this tile still scanning?" lookup at render time.
+    finalised: std::collections::HashSet<PathBuf>,
+    /// Last raw `completed_subtrees.len()` we built from — lets us
+    /// short-circuit when nothing has been added since the last build.
+    built_for_len: usize,
+}
+
+struct ScanGroup {
+    top_path: PathBuf,
+    top_name: String,
+    running_total: u64,
+    own_size: Option<u64>,
+    descendants: Vec<scanner::CompletedSubtree>,
 }
 
 impl Default for App {
@@ -635,6 +664,7 @@ impl Default for App {
             scan_tm_targets: std::collections::HashMap::new(),
             scan_tm_current: std::collections::HashMap::new(),
             scan_tm_last_layout: None,
+            scan_tm_cache: ScanTreemapCache::default(),
         }
     }
 }
@@ -705,6 +735,7 @@ impl App {
         self.scan_tm_targets.clear();
         self.scan_tm_current.clear();
         self.scan_tm_last_layout = None;
+        self.scan_tm_cache = ScanTreemapCache::default();
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
@@ -788,22 +819,43 @@ impl App {
 
         ui.add_space(6.0);
 
-        // ── Live treemap of completed subtrees ──
-        // Reads from the lock-protected vec once per frame, dedupes
-        // ancestors-vs-descendants (parent wins), groups by the first
-        // path component below scan_root, and renders each group as a
-        // squarified tile.  The tile gets a striped overlay if the dir's
-        // own walk hasn't returned yet (we only know its size from the
-        // sum of its completed children).  Tiles for subdirs are nested
-        // inside their parent tile up to a small budget.
-        let raw: Vec<scanner::CompletedSubtree> = self
+        // ── Canvas ──
+        let avail = ui.available_size();
+        let (canvas_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let painter = ui.painter_at(canvas_rect);
+        painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+
+        let scan_root = self.scan_path.clone();
+        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
+        let mut clicked_open: Option<PathBuf> = None;
+        let mut clicked_trash: Option<PathBuf> = None;
+
+        // ── Throttled re-layout + grouping (250 ms) ──
+        // Both the O(N²) dedupe AND the squarify pass live behind this
+        // boundary, so per-frame work is just lerp + paint.
+        let now_inst = Instant::now();
+        let canvas_changed = self
+            .scan_tm_targets
+            .values()
+            .next()
+            .map(|r| !canvas_rect.contains(r.center()))
+            .unwrap_or(true);
+        let due = self
+            .scan_tm_last_layout
+            .map(|t| now_inst.duration_since(t) >= Duration::from_millis(250))
+            .unwrap_or(true);
+
+        // Cheap length probe under the lock — lets us short-circuit if
+        // no events landed since the last rebuild even when the timer
+        // fires.
+        let raw_len = self
             .scan_progress
             .completed_subtrees
             .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+            .map(|g| g.len())
+            .unwrap_or(0);
 
-        if raw.is_empty() {
+        if raw_len == 0 {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -815,121 +867,84 @@ impl App {
             return;
         }
 
-        let scan_root = self.scan_path.clone();
-        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
-        let mut clicked_open: Option<PathBuf> = None;
-        let mut clicked_trash: Option<PathBuf> = None;
+        if (due || canvas_changed) && raw_len != self.scan_tm_cache.built_for_len {
+            // Snapshot the events.  Single clone, brief lock.
+            let raw: Vec<scanner::CompletedSubtree> = self
+                .scan_progress
+                .completed_subtrees
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
 
-        // The set of paths whose own walk has finalised — these are
-        // "real" sizes.  Everything else is an inferred / running sum
-        // from children.  Used to pick whether a tile is shimmer-striped.
-        let finalised: std::collections::HashSet<PathBuf> =
-            raw.iter().map(|c| c.path.clone()).collect();
-
-        // Group by first path component below scan_root.
-        struct Group {
-            top_path: PathBuf,
-            top_name: String,
-            // running_total = max(own_size, sum_of_descendant_sizes).
-            running_total: u64,
-            // own size if the dir's own CompletedSubtree has arrived.
-            own_size: Option<u64>,
-            // Deduped descendants (largest non-overlapping subtrees).
-            descendants: Vec<scanner::CompletedSubtree>,
-        }
-        let mut groups: Vec<Group> = Vec::new();
-
-        // First pass: bucket every completed subtree under its top group.
-        for item in &raw {
-            let rel = match item.path.strip_prefix(&scan_root_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let mut comps = rel.components();
-            let first = match comps.next() {
-                Some(c) => c.as_os_str().to_string_lossy().into_owned(),
-                None => continue, // scan_root itself; ignore
-            };
-            let top_path = scan_root_path.join(&first);
-            let pos = groups
-                .iter()
-                .position(|g| g.top_path == top_path)
-                .unwrap_or_else(|| {
-                    groups.push(Group {
-                        top_path: top_path.clone(),
-                        top_name: first.clone(),
-                        running_total: 0,
-                        own_size: None,
-                        descendants: Vec::new(),
-                    });
-                    groups.len() - 1
+            // Bucket into groups by first path component below scan_root.
+            // HashMap → O(1) group lookup instead of O(G) linear scan.
+            let mut by_top: std::collections::HashMap<PathBuf, ScanGroup> =
+                std::collections::HashMap::new();
+            for item in &raw {
+                let rel = match item.path.strip_prefix(&scan_root_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let first = match rel.components().next() {
+                    Some(c) => c.as_os_str().to_string_lossy().into_owned(),
+                    None => continue,
+                };
+                let top_path = scan_root_path.join(&first);
+                let entry = by_top.entry(top_path.clone()).or_insert_with(|| ScanGroup {
+                    top_path: top_path.clone(),
+                    top_name: first,
+                    running_total: 0,
+                    own_size: None,
+                    descendants: Vec::new(),
                 });
-            let g = &mut groups[pos];
-            if item.path == top_path {
-                g.own_size = Some(item.size);
-            } else {
-                g.descendants.push(item.clone());
-            }
-        }
-
-        // Second pass: dedupe descendants per-group (parent-wins) and
-        // compute running totals.
-        for g in &mut groups {
-            g.descendants.sort_unstable_by(|a, b| {
-                b.size.cmp(&a.size).then_with(|| {
-                    a.path.as_os_str().len().cmp(&b.path.as_os_str().len())
-                })
-            });
-            let mut kept: Vec<scanner::CompletedSubtree> = Vec::new();
-            for item in std::mem::take(&mut g.descendants) {
-                if !kept.iter().any(|k| item.path.starts_with(&k.path)) {
-                    kept.push(item);
+                if item.path == top_path {
+                    entry.own_size = Some(item.size);
+                } else {
+                    entry.descendants.push(item.clone());
                 }
             }
-            let descendants_sum: u64 = kept.iter().map(|c| c.size).sum();
-            g.descendants = kept;
-            g.running_total = g.own_size.unwrap_or(0).max(descendants_sum);
-        }
 
-        // Sort groups biggest-first — required for squarify.
-        groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
+            // Dedupe descendants per-group with O(N log N) sort + an
+            // O(N·D) ancestor check where D is the max-kept depth.
+            // Bound D at 12 (the max rendered nested per tile) so the
+            // inner check stops early.
+            let mut groups: Vec<ScanGroup> = by_top.into_values().collect();
+            for g in &mut groups {
+                g.descendants.sort_unstable_by(|a, b| {
+                    b.size.cmp(&a.size).then_with(|| {
+                        a.path.as_os_str().len().cmp(&b.path.as_os_str().len())
+                    })
+                });
+                let mut kept: Vec<scanner::CompletedSubtree> =
+                    Vec::with_capacity(g.descendants.len().min(12));
+                for item in std::mem::take(&mut g.descendants) {
+                    if !kept.iter().any(|k| item.path.starts_with(&k.path)) {
+                        kept.push(item);
+                        if kept.len() >= 32 {
+                            // Stop dedupe once we have far more than we'd
+                            // ever render (12 nested) — anything past
+                            // here can't be the biggest visible tile.
+                            break;
+                        }
+                    }
+                }
+                let descendants_sum: u64 = kept.iter().map(|c| c.size).sum();
+                g.descendants = kept;
+                g.running_total = g.own_size.unwrap_or(0).max(descendants_sum);
+            }
+            groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
 
-        // ── Canvas ──
-        let avail = ui.available_size();
-        let (canvas_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
-        let painter = ui.painter_at(canvas_rect);
-        painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+            // Build flat finalised set for O(1) shimmer-or-not.
+            let finalised: std::collections::HashSet<PathBuf> =
+                raw.iter().map(|c| c.path.clone()).collect();
 
-        if groups.is_empty() {
-            return;
-        }
-
-        // ── Throttled re-layout (250 ms) so tiles don't jitter every
-        //    frame.  We compute "target" rects on the throttle boundary,
-        //    then lerp the per-path "current" rects toward them with a
-        //    fast cubic ease-out so motion reads as a smooth morph.
-        let now_inst = Instant::now();
-        let canvas_changed = self
-            .scan_tm_targets
-            .values()
-            .next()
-            .map(|r| {
-                // Heuristic: if any cached rect's bounds are far outside
-                // the current canvas, the window resized — re-layout now.
-                !canvas_rect.contains(r.center())
-            })
-            .unwrap_or(true);
-        let due = self
-            .scan_tm_last_layout
-            .map(|t| now_inst.duration_since(t) >= Duration::from_millis(250))
-            .unwrap_or(true);
-        if due || canvas_changed {
-            let group_sizes_f64: Vec<f64> = groups
+            // Squarify top-level + nested into target rects.
+            let group_sizes: Vec<f64> = groups
                 .iter()
                 .map(|g| g.running_total.max(1) as f64)
                 .collect();
             let group_rects = treemap::squarify(
-                &group_sizes_f64,
+                &group_sizes,
                 canvas_rect.min.x,
                 canvas_rect.min.y,
                 canvas_rect.width(),
@@ -938,16 +953,10 @@ impl App {
             self.scan_tm_targets.clear();
             for (g, &r) in groups.iter().zip(group_rects.iter()) {
                 self.scan_tm_targets.insert(g.top_path.clone(), r);
-            }
-            // Recompute nested targets per-group too.
-            for (idx, (g, &outer)) in
-                groups.iter().zip(group_rects.iter()).enumerate()
-            {
-                let _ = idx;
-                if outer.width() < 1.0 || outer.height() < 1.0 {
+                if r.width() < 1.0 || r.height() < 1.0 {
                     continue;
                 }
-                let inset = outer.shrink(1.0);
+                let inset = r.shrink(1.0);
                 let label_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
                 let nest_max = if inset.area() > 60_000.0 {
                     12
@@ -968,10 +977,10 @@ impl App {
                 if nest_rect.width() < 30.0 || nest_rect.height() < 30.0 {
                     continue;
                 }
-                let nested_sizes: Vec<f64> =
+                let nsizes: Vec<f64> =
                     nested_top.iter().map(|d| d.size.max(1) as f64).collect();
                 let nrects = treemap::squarify(
-                    &nested_sizes,
+                    &nsizes,
                     nest_rect.min.x,
                     nest_rect.min.y,
                     nest_rect.width(),
@@ -981,57 +990,82 @@ impl App {
                     self.scan_tm_targets.insert(d.path.clone(), nr);
                 }
             }
+
+            self.scan_tm_cache = ScanTreemapCache {
+                groups,
+                finalised,
+                built_for_len: raw_len,
+            };
             self.scan_tm_last_layout = Some(now_inst);
+        }
+
+        if self.scan_tm_cache.groups.is_empty() {
+            return;
         }
 
         // Lerp current rects toward targets every frame.
         let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.05);
-        // 5 = "reach 99 % in ~0.6 s" using the exp(-k·dt) decay.
         let k = 7.5_f32;
         let blend = 1.0 - (-k * dt).exp();
-        let target_paths: std::collections::HashSet<_> =
-            self.scan_tm_targets.keys().cloned().collect();
-        // Insert any new path (haven't seen it before) at its target rect
-        // shrunken to a point in the centre, so it grows in.
+
+        // Insert any new path at its target's centre with zero size so
+        // it grows in.  Use HashMap::contains_key (O(1)) instead of the
+        // previous "build a HashSet of cloned paths" pattern (O(N) per
+        // frame).
         for (path, &target) in &self.scan_tm_targets {
             if !self.scan_tm_current.contains_key(path) {
                 let centre = target.center();
-                self.scan_tm_current
-                    .insert(path.clone(), egui::Rect::from_center_size(centre, egui::vec2(0.5, 0.5)));
+                self.scan_tm_current.insert(
+                    path.clone(),
+                    egui::Rect::from_center_size(centre, egui::vec2(0.5, 0.5)),
+                );
             }
         }
-        // Drop paths that no longer exist in targets (rare — usually
-        // dedup just promotes a parent over a child).
-        self.scan_tm_current.retain(|p, _| target_paths.contains(p));
+        // Drop paths that disappeared from targets — direct contains_key
+        // on the targets map, no Set rebuild.
+        self.scan_tm_current
+            .retain(|p, _| self.scan_tm_targets.contains_key(p));
 
-        // Apply lerp.
+        // Apply lerp.  Track whether any tile is still "in motion" so we
+        // can stop requesting per-frame repaints once everything is at
+        // rest.
+        let mut still_moving = false;
         for (path, cur) in self.scan_tm_current.iter_mut() {
             if let Some(target) = self.scan_tm_targets.get(path) {
-                cur.min.x += (target.min.x - cur.min.x) * blend;
-                cur.min.y += (target.min.y - cur.min.y) * blend;
-                cur.max.x += (target.max.x - cur.max.x) * blend;
-                cur.max.y += (target.max.y - cur.max.y) * blend;
+                let dx_min = target.min.x - cur.min.x;
+                let dy_min = target.min.y - cur.min.y;
+                let dx_max = target.max.x - cur.max.x;
+                let dy_max = target.max.y - cur.max.y;
+                cur.min.x += dx_min * blend;
+                cur.min.y += dy_min * blend;
+                cur.max.x += dx_max * blend;
+                cur.max.y += dy_max * blend;
+                if dx_min.abs() > 0.5
+                    || dy_min.abs() > 0.5
+                    || dx_max.abs() > 0.5
+                    || dy_max.abs() > 0.5
+                {
+                    still_moving = true;
+                }
             }
         }
 
-        // Keep the UI ticking so animations smooth out even between
-        // events.  60 fps for the eye, atomics are the source of truth.
-        ui.ctx().request_repaint();
+        // Drive the marquee + shimmer regardless (those are always
+        // animating).  But schedule the next repaint so we don't spin
+        // at 60 fps when nothing is moving — 50 ms is plenty for
+        // shimmer/marquee continuity.
+        if still_moving {
+            ui.ctx().request_repaint();
+        } else {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
 
-        // Top-level tile colour palette — distinct hues so adjacent
-        // groups don't blend.  Indexed by group rank (largest = 0).
-        let palette = [
-            egui::Color32::from_rgb(58, 93, 139),  // blue
-            egui::Color32::from_rgb(42, 109, 77),  // green
-            egui::Color32::from_rgb(122, 74, 48),  // brown
-            egui::Color32::from_rgb(74, 58, 107),  // purple
-            egui::Color32::from_rgb(90, 74, 58),   // tan
-            egui::Color32::from_rgb(48, 90, 100),  // teal
-            egui::Color32::from_rgb(110, 60, 90),  // mauve
-            egui::Color32::from_rgb(86, 86, 56),   // olive
-        ];
-
+        // Top-level tile colour: shared palette with the post-scan
+        // treemap (treemap::scan_rank_palette) so the during-scan →
+        // post-scan handoff is seamless.
         let now = ui.ctx().input(|i| i.time) as f32;
+        let groups = &self.scan_tm_cache.groups;
+        let finalised = &self.scan_tm_cache.finalised;
 
         for (idx, g) in groups.iter().enumerate() {
             let rect = match self.scan_tm_current.get(&g.top_path) {
@@ -1042,7 +1076,7 @@ impl App {
                 continue;
             }
             let inset = rect.shrink(1.0);
-            let base = palette[idx % palette.len()];
+            let base = treemap::scan_rank_palette(idx);
             let scanning = g.own_size.is_none();
 
             // Vertical gradient: lighter at top, base at bottom.  Painted

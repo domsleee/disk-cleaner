@@ -349,7 +349,7 @@ pub fn build_treemap_cache(
     let cached_breadcrumbs = zoom_path
         .as_ref()
         .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
 
     // Empty directory — return empty cache
     if view_node.children().is_empty() {
@@ -441,6 +441,12 @@ pub fn build_treemap_cache(
     // Build tiles for real children, tracking global nested budget
     let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
+    // At the root view, top-level tiles get the same vivid per-rank
+    // palette as the live-scan treemap so the during-scan → post-scan
+    // handoff is visually seamless.  In zoomed-in views we keep the
+    // extension/category colours so the user can read content type
+    // at a glance.
+    let is_root_view = view_path == root_path;
     for (i, child) in children.iter().enumerate() {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
@@ -448,7 +454,11 @@ pub fn build_treemap_cache(
         }
         let child_path = view_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        let color = if is_root_view {
+            scan_rank_palette(i)
+        } else {
+            extension_color(child.name(), is_dir)
+        };
         let child_count = if is_dir {
             Some(child.children().len())
         } else {
@@ -631,7 +641,7 @@ pub fn render_treemap(
         inline_crumbs = zoom_path
             .as_ref()
             .map(|p| breadcrumbs(root, p))
-            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+            .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
         &inline_crumbs
     };
     let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
@@ -815,6 +825,22 @@ pub fn render_treemap(
     }
 
     actions
+}
+
+/// Per-rank colour for the root-view top-level tiles.  Mirrors the
+/// palette used by the live-scan treemap.  Largest = index 0.
+pub fn scan_rank_palette(idx: usize) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 8] = [
+        egui::Color32::from_rgb(58, 93, 139),  // blue
+        egui::Color32::from_rgb(42, 109, 77),  // green
+        egui::Color32::from_rgb(122, 74, 48),  // brown
+        egui::Color32::from_rgb(74, 58, 107),  // purple
+        egui::Color32::from_rgb(90, 74, 58),   // tan
+        egui::Color32::from_rgb(48, 90, 100),  // teal
+        egui::Color32::from_rgb(110, 60, 90),  // mauve
+        egui::Color32::from_rgb(86, 86, 56),   // olive
+    ];
+    PALETTE[idx % PALETTE.len()]
 }
 
 // ─── Painting helpers ───────────────────────────────────────────
@@ -1570,8 +1596,56 @@ mod tests {
         let tile = &cache.tiles[0];
         assert_eq!(&*tile.name, "movie.mp4");
         assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
-        assert_eq!(tile.color, extension_color("movie.mp4", false));
+        // At the root view, top-level tiles use the rank palette rather
+        // than extension colour so the post-scan view matches the
+        // during-scan one.
+        assert_eq!(tile.color, scan_rank_palette(0));
         assert!(!tile.is_dir);
         assert_eq!(tile.child_count, None);
+    }
+
+    #[test]
+    fn root_view_uses_rank_palette_in_order() {
+        // Three top-level entries, sorted by size desc — colours
+        // should be palette[0], palette[1], palette[2].
+        let tree = dir(
+            "root",
+            vec![
+                leaf("a.bin", 300),
+                leaf("b.bin", 200),
+                leaf("c.bin", 100),
+            ],
+        );
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let cache = build_treemap_cache(&tree, &None, None, true, rect);
+        // tiles preserve insertion order from the children iter, which
+        // is by the original FileNode order.  The squarify input was
+        // also in that order, so tile[i].color must == palette(i).
+        for (i, tile) in cache.tiles.iter().enumerate() {
+            assert_eq!(
+                tile.color,
+                scan_rank_palette(i),
+                "tile {} ({}) should use rank palette",
+                i,
+                tile.name
+            );
+        }
+    }
+
+    #[test]
+    fn zoomed_view_uses_extension_colour() {
+        // When zoomed into a subdir, tiles should fall back to
+        // extension colours so users can read content type at a glance.
+        let tree = dir(
+            "root",
+            vec![dir("sub", vec![leaf("video.mp4", 300)])],
+        );
+        let rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let zoomed = Some(std::path::PathBuf::from("root/sub"));
+        let cache = build_treemap_cache(&tree, &zoomed, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert_eq!(cache.tiles[0].color, extension_color("video.mp4", false));
     }
 }

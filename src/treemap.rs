@@ -466,12 +466,17 @@ pub fn build_treemap_cache(
         };
 
         // Build nested sub-tiles for directory tiles large enough (respecting global budget)
+        // At root view, propagate the parent tile's rank colour so nested
+        // children are darker variants of it — keeps the visual palette
+        // unified with the during-scan view.  In zoomed sub-views, pass
+        // None so extension colours kick in for content-type cues.
         let nested = if is_dir
             && nested_budget > 0
             && r.width() > 40.0
             && r.height() > DIR_HEADER_H + 16.0
         {
-            let tiles = build_nested_tiles(child, &child_path, r, nested_budget);
+            let parent_color = if is_root_view { Some(color) } else { None };
+            let tiles = build_nested_tiles(child, &child_path, r, nested_budget, parent_color);
             nested_budget = nested_budget.saturating_sub(tiles.len());
             tiles
         } else {
@@ -537,11 +542,19 @@ pub fn build_treemap_cache(
 /// Build nested sub-tiles for the children of a directory tile.
 /// `budget` caps how many nested tiles to create (global limit).
 /// Extracts the nested layout logic from `paint_directory`.
+///
+/// `parent_color` is the parent dir tile's colour.  When provided,
+/// nested children are coloured with a darker variant of it so the
+/// whole subtree reads as one block (matches the during-scan view).
+/// When None, nested children fall back to extension/category
+/// colours — useful in zoomed-in views where the user wants
+/// content-type cues.
 fn build_nested_tiles(
     node: &FileNode,
     node_path: &Path,
     rect: egui::Rect,
     budget: usize,
+    parent_color: Option<egui::Color32>,
 ) -> Vec<NestedTile> {
     let content_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + 1.0, rect.min.y + DIR_HEADER_H),
@@ -579,7 +592,12 @@ fn build_nested_tiles(
         }
         let child_path = node_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        let color = match parent_color {
+            // Slightly-dimmed variant of the parent.  Same logic as
+            // the during-scan view's nested tiles.
+            Some(p) => p.linear_multiply(0.55),
+            None => extension_color(child.name(), is_dir),
+        };
         result.push(NestedTile {
             rect: cr,
             path: child_path,
@@ -1152,15 +1170,20 @@ fn paint_cached_directory(
     }
 
     // ── Header band: solid darkened backdrop + name (left) + size
-    //    (right).  Both measured via fit_text so we never overflow.
+    //    (right).  Use the same darkening as the during-scan view
+    //    (multiply tile colour by 0.55) so the header reads as a
+    //    distinct band, not a faint variant of the body.  Without
+    //    this, `darken(color, 15)` gives rgb that's only 5-10%
+    //    different from the body and the band visually disappears.
     let header_h = if rect.height() > 80.0 { 28.0 } else { 22.0 };
     let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_h));
-    let band_color = apply_alpha(tile.header_color, alpha);
+    let body = apply_alpha(tile.color, alpha);
+    let band_color = body.linear_multiply(0.55);
     let band_color = egui::Color32::from_rgba_unmultiplied(
         band_color.r(),
         band_color.g(),
         band_color.b(),
-        (band_color.a() as f32 * 0.92) as u8,
+        (band_color.a() as f32 * 0.92).clamp(0.0, 255.0) as u8,
     );
     painter.rect_filled(
         header_rect,

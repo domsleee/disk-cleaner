@@ -918,6 +918,41 @@ pub fn fit_path(
     fit_text(painter, parts.last().copied().unwrap_or(path), font_id, max_w)
 }
 
+/// Format `bytes` into a short label suitable for cramped treemap
+/// tiles.  Always one digit + optional one-decimal + unit, e.g.
+/// `"1.5 GB"`, `"562 MB"`, `"4.4 GB"`, `"512 KB"`.  Significantly
+/// shorter than `bytesize::ByteSize::b().to_string()` ("1.5 GiB" with
+/// space + 3-letter unit).  Length is bounded so callers don't need
+/// to ellipsis-truncate it for typical tiles.
+pub fn fmt_size_compact(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b < 1024.0 {
+        return format!("{} B", bytes);
+    }
+    if b < 1024.0 * 1024.0 {
+        let kb = b / 1024.0;
+        return if kb < 10.0 {
+            format!("{:.1} KB", kb)
+        } else {
+            format!("{:.0} KB", kb)
+        };
+    }
+    if b < 1024.0 * 1024.0 * 1024.0 {
+        let mb = b / 1024.0 / 1024.0;
+        return if mb < 10.0 {
+            format!("{:.1} MB", mb)
+        } else {
+            format!("{:.0} MB", mb)
+        };
+    }
+    let gb = b / 1024.0 / 1024.0 / 1024.0;
+    if gb < 10.0 {
+        format!("{:.1} GB", gb)
+    } else {
+        format!("{:.0} GB", gb)
+    }
+}
+
 /// Per-rank colour for the root-view top-level tiles.  Mirrors the
 /// palette used by the live-scan treemap.  Largest = index 0.
 pub fn scan_rank_palette(idx: usize) -> egui::Color32 {
@@ -1027,7 +1062,7 @@ fn paint_cached_leaf(
         painter.galley(inner.left_top(), g, text_color);
     }
     if tile.rect.height() > 36.0 {
-        let size_str = ByteSize::b(tile.size).to_string();
+        let size_str = fmt_size_compact(tile.size);
         if let Some(g) = fit_text(
             painter,
             &size_str,
@@ -1126,6 +1161,20 @@ fn paint_cached_directory(
         let cr = nested.rect;
         let color = apply_alpha(nested.color, alpha);
         paint_gradient_rect(&tile_painter, cr, color, 1.0);
+        // Hairline stroke around the nested rect so the eye can tell
+        // sibling tiles apart even when their gradients are similar
+        // (target inside disk-cleaner, MoneyPrinterTurbo inside
+        // yt-revenue, etc.).  Use a very low-alpha black so it reads
+        // as a soft separator, not a hard outline.
+        tile_painter.rect_stroke(
+            cr,
+            1.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60),
+            ),
+            egui::epaint::StrokeKind::Inside,
+        );
 
         if has_focus {
             let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
@@ -1140,8 +1189,10 @@ fn paint_cached_directory(
         }
 
         // Path-aware label + size — exactly the same layout the
-        // during-scan view paints for its nested tiles.
-        if cr.width() > 50.0 && cr.height() > 18.0 {
+        // during-scan view paints for its nested tiles.  Tiles
+        // smaller than ~70px wide just stay empty rather than
+        // showing "1..." or "12..." gibberish.
+        if cr.width() > 70.0 && cr.height() > 22.0 {
             let inner = cr.shrink(3.0);
             let avail_w = inner.width();
             let display = nested
@@ -1166,11 +1217,12 @@ fn paint_cached_directory(
             ) {
                 tile_painter.galley(inner.left_top(), g, text_color);
             }
-            // Size bottom-left (only when the tile is tall enough that
-            // the labels won't overlap visually — same threshold as
-            // the during-scan code).
-            if cr.height() > 36.0 {
-                let size_str = ByteSize::b(nested.size).to_string();
+            // Size bottom-left.  Suppress when the nested tile is
+            // ≥95 % of the parent's size — header already shows the
+            // same number, so painting it again is visual noise.
+            let near_full = nested.size as f64 >= tile.size as f64 * 0.95;
+            if cr.height() > 36.0 && !near_full {
+                let size_str = fmt_size_compact(nested.size);
                 if let Some(g) = fit_text(
                     &tile_painter,
                     &size_str,
@@ -1187,12 +1239,18 @@ fn paint_cached_directory(
         }
     }
 
+    // ── Header band: only draw when the tile is large enough for
+    //    *something readable* to fit.  Without this gate, narrow
+    //    repo tiles in the bottom-right grid render with truncated
+    //    "1...", "2..." gibberish.  85 px is roughly enough room
+    //    for a 5-char name + a 4-char size like "562 MB".
+    if rect.width() < 85.0 || rect.height() < 24.0 {
+        return;
+    }
     // ── Header band: solid darkened backdrop + name (left) + size
     //    (right).  Use the same darkening as the during-scan view
     //    (multiply tile colour by 0.55) so the header reads as a
-    //    distinct band, not a faint variant of the body.  Without
-    //    this, `darken(color, 15)` gives rgb that's only 5-10%
-    //    different from the body and the band visually disappears.
+    //    distinct band, not a faint variant of the body.
     let header_h = if rect.height() > 80.0 { 28.0 } else { 22.0 };
     let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_h));
     let body = apply_alpha(tile.color, alpha);
@@ -1211,7 +1269,7 @@ fn paint_cached_directory(
 
     let header_pad = 8.0;
     let avail = (rect.width() - header_pad * 2.0).max(0.0);
-    let size_str = ByteSize::b(tile.size).to_string();
+    let size_str = fmt_size_compact(tile.size);
     let size_g = fit_text(
         painter,
         &size_str,

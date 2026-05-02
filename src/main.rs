@@ -1087,10 +1087,19 @@ impl App {
                         if !finalised.contains(&d.path) {
                             paint_shimmer(&painter, inner, now);
                         }
-                        // Nested label only if there's room.
-                        // Only attempt labels on tiles wide enough that
-                        // *something readable* will fit after measuring.
-                        if inner.width() > 50.0 && inner.height() > 18.0 {
+                        // Hairline stroke around nested children so
+                        // sibling tiles read as discrete shapes.
+                        painter.rect_stroke(
+                            nr.shrink(0.5),
+                            3.0,
+                            egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60),
+                            ),
+                            egui::epaint::StrokeKind::Inside,
+                        );
+                        // Nested label only if the tile has real room.
+                        if inner.width() > 70.0 && inner.height() > 22.0 {
                             // Show the path *relative to the group root*.
                             // Nested tiles can be 3-5 levels deep
                             // (e.g. dom/git/yt-revenue/MoneyPrinterTurbo
@@ -1125,12 +1134,14 @@ impl App {
                                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220),
                                 );
                             }
-                            // Size (bottom-left).  Only if the tile is
-                            // tall enough that name and size won't
-                            // visually overlap.
-                            if inner.height() > 36.0 {
-                                let size_str =
-                                    bytesize::ByteSize::b(d.size).to_string();
+                            // Size (bottom-left).  Suppress when this
+                            // nested ≥95 % of the parent's size (the
+                            // header band already shows the same
+                            // number).
+                            let near_full = d.size as f64
+                                >= g.running_total as f64 * 0.95;
+                            if inner.height() > 36.0 && !near_full {
+                                let size_str = treemap::fmt_size_compact(d.size);
                                 if let Some(g_sz) = fit_text(
                                     &painter,
                                     &size_str,
@@ -1172,6 +1183,12 @@ impl App {
                 }
             }
 
+            // Skip the header band on tiny group tiles — at <85 px
+            // wide we'd just produce "1..." / "9..." gibberish in
+            // the band.  The tile still paints with its rank colour
+            // and stays clickable / right-clickable.
+            let draw_header = inset.width() >= 85.0 && inset.height() >= 24.0;
+
             // Parent header band — solid backdrop so labels stay
             // readable over nested children's tile colors.  Drawn last
             // so it sits above nested tiles.
@@ -1180,63 +1197,67 @@ impl App {
                 inset.min,
                 egui::vec2(inset.width(), header_h),
             );
-            // Slightly darker, opaque-ish band of the base color.
-            let band = base.linear_multiply(0.55);
-            painter.rect_filled(
-                header_rect,
-                egui::CornerRadius {
-                    nw: 4, ne: 4, sw: 0, se: 0,
-                },
-                egui::Color32::from_rgba_unmultiplied(band.r(), band.g(), band.b(), 230),
-            );
+            if draw_header {
+                // Slightly darker, opaque-ish band of the base color.
+                let band = base.linear_multiply(0.55);
+                painter.rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 4, ne: 4, sw: 0, se: 0,
+                    },
+                    egui::Color32::from_rgba_unmultiplied(
+                        band.r(), band.g(), band.b(), 230,
+                    ),
+                );
 
-            // ── Header text: measure both labels first, decide what
-            //    fits, draw without any overlap ──
-            let header_pad = 8.0_f32;
-            let avail = (inset.width() - header_pad * 2.0).max(0.0);
-            let size_str = bytesize::ByteSize::b(g.running_total).to_string();
-            let size_text = if scanning {
-                format!("{size_str}  ·  scanning")
-            } else {
-                size_str
-            };
-            let size_galley = fit_text(
-                &painter,
-                &size_text,
-                egui::FontId::proportional(12.0),
-                avail,
-            );
-            // Reserve right side for size, name gets the rest.
-            let size_w = size_galley
-                .as_ref()
-                .map(|g| g.size().x + 12.0)
-                .unwrap_or(0.0);
-            let name_avail = (avail - size_w).max(0.0);
-            let name_galley = fit_text(
-                &painter,
-                &g.top_name,
-                egui::FontId::proportional(14.5),
-                name_avail,
-            );
-            // Vertically centre the larger of the two within header.
-            let header_mid_y = header_rect.center().y;
-            if let Some(ng) = name_galley {
-                let pos = egui::pos2(
-                    header_rect.min.x + header_pad,
-                    header_mid_y - ng.size().y * 0.5,
+                // ── Header text: measure both labels first, decide
+                //    what fits, draw without any overlap ──
+                let header_pad = 8.0_f32;
+                let avail = (inset.width() - header_pad * 2.0).max(0.0);
+                let size_str = treemap::fmt_size_compact(g.running_total);
+                let size_text = if scanning {
+                    format!("{size_str}  ·  scanning")
+                } else {
+                    size_str
+                };
+                let size_galley = fit_text(
+                    &painter,
+                    &size_text,
+                    egui::FontId::proportional(12.0),
+                    avail,
                 );
-                painter.galley(pos, ng, egui::Color32::WHITE);
-            }
-            if let Some(sg) = size_galley {
-                let pos = egui::pos2(
-                    header_rect.max.x - header_pad - sg.size().x,
-                    header_mid_y - sg.size().y * 0.5,
+                // Reserve right side for size, name gets the rest.
+                let size_w = size_galley
+                    .as_ref()
+                    .map(|g| g.size().x + 12.0)
+                    .unwrap_or(0.0);
+                let name_avail = (avail - size_w).max(0.0);
+                let name_galley = fit_text(
+                    &painter,
+                    &g.top_name,
+                    egui::FontId::proportional(14.5),
+                    name_avail,
                 );
-                painter.galley(
-                    pos,
-                    sg,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
-                );
+                // Vertically centre the larger of the two within header.
+                let header_mid_y = header_rect.center().y;
+                if let Some(ng) = name_galley {
+                    let pos = egui::pos2(
+                        header_rect.min.x + header_pad,
+                        header_mid_y - ng.size().y * 0.5,
+                    );
+                    painter.galley(pos, ng, egui::Color32::WHITE);
+                }
+                if let Some(sg) = size_galley {
+                    let pos = egui::pos2(
+                        header_rect.max.x - header_pad - sg.size().x,
+                        header_mid_y - sg.size().y * 0.5,
+                    );
+                    painter.galley(
+                        pos,
+                        sg,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                    );
+                }
             }
 
             // Whole-tile click handler (when no nested tile caught it).

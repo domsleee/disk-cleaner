@@ -347,7 +347,8 @@ pub fn build_treemap_cache(
     };
 
     let view_size = view_node.size();
-    let view_size_label: Box<str> = format!("  ({})", ByteSize::b(view_size)).into();
+    let view_size_label: Box<str> =
+        format!("  ({})", fmt_size_compact(view_size)).into();
 
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
     let cached_breadcrumbs = zoom_path
@@ -523,8 +524,12 @@ pub fn build_treemap_cache(
             count: other_count,
             size: other_size,
             label_short: format!("Other ({})", other_count).into(),
-            label_tall: format!("Other ({} files)\n{}", other_count, ByteSize::b(other_size))
-                .into(),
+            label_tall: format!(
+                "Other ({} files)\n{}",
+                other_count,
+                fmt_size_compact(other_size)
+            )
+            .into(),
         })
     } else {
         None
@@ -674,7 +679,7 @@ pub fn render_treemap(
         } else {
             root.size()
         };
-        inline_size_label = format!("  ({})", ByteSize::b(view_size));
+        inline_size_label = format!("  ({})", fmt_size_compact(view_size));
         &inline_size_label
     };
 
@@ -718,8 +723,13 @@ pub fn render_treemap(
     };
 
     // ── Treemap canvas ──
+    // Reserve breathing room around the canvas so tiles don't run
+    // flush to the panel edge — matches the during-scan view.
     let available = ui.available_size();
-    let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let (outer_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let outer_painter = ui.painter_at(outer_rect);
+    outer_painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+    let full_rect = outer_rect.shrink(8.0);
     let painter = ui.painter_at(full_rect);
 
     // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
@@ -798,6 +808,37 @@ pub fn render_treemap(
         {
             hovered_other = true;
         }
+    }
+
+    // Hover stroke — visible 2-px white inner outline + soft outer
+    // halo on the tile being pointed at.  Matches the during-scan
+    // hover treatment.
+    if let Some(idx) = hovered_tile {
+        let r = cache.tiles[idx].rect;
+        painter.rect_stroke(
+            r.shrink(1.0),
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::epaint::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            r,
+            2.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            ),
+            egui::epaint::StrokeKind::Outside,
+        );
+    }
+    if hovered_other && let Some(ref other) = cache.other {
+        let r = other.rect;
+        painter.rect_stroke(
+            r.shrink(1.0),
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::epaint::StrokeKind::Inside,
+        );
     }
 
     // Hover tooltip
@@ -1113,7 +1154,7 @@ fn paint_other_bucket(
         painter.galley(inner.left_top(), g, text_color);
     }
     if rect.height() > 36.0 {
-        let size_str = ByteSize::b(other.size).to_string();
+        let size_str = fmt_size_compact(other.size);
         if let Some(g) = fit_text(
             painter,
             &size_str,

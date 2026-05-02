@@ -718,7 +718,7 @@ impl App {
         // ── Top status strip ──
         let files = self.scan_progress.file_count.load(Ordering::Relaxed);
         let size = self.scan_progress.total_size.load(Ordering::Relaxed);
-        let size_str = bytesize::ByteSize::b(size).to_string();
+        let size_str = treemap::fmt_size_compact(size);
         let path_str = self
             .scan_path
             .as_ref()
@@ -785,10 +785,15 @@ impl App {
         ui.add_space(6.0);
 
         // ── Canvas ──
+        // Reserve a bit of breathing room around the treemap so tiles
+        // don't run flush to the panel edges.  Looks designed instead
+        // of stuffed.
         let avail = ui.available_size();
-        let (canvas_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let (outer_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let outer_painter = ui.painter_at(outer_rect);
+        outer_painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+        let canvas_rect = outer_rect.shrink(8.0);
         let painter = ui.painter_at(canvas_rect);
-        painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
 
         let scan_root = self.scan_path.clone();
         let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
@@ -1165,6 +1170,14 @@ impl App {
                             egui::Id::new(("nest", &d.path)),
                             egui::Sense::click(),
                         );
+                        if resp.hovered() {
+                            painter.rect_stroke(
+                                inner.shrink(0.5),
+                                3.0,
+                                egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                egui::epaint::StrokeKind::Inside,
+                            );
+                        }
                         if resp.clicked() {
                             clicked_open = Some(d.path.clone());
                         }
@@ -1267,14 +1280,24 @@ impl App {
                 egui::Sense::click(),
             );
             if resp.hovered() {
+                // Bright 2-px inner stroke + a 1-px outer halo so the
+                // hover state is visible regardless of underlying tile
+                // colour.  At 110-alpha (the previous value) the
+                // highlight got swallowed by the gradient.
                 painter.rect_stroke(
-                    inset.shrink(0.5),
+                    inset.shrink(1.0),
+                    4.0,
+                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    egui::epaint::StrokeKind::Inside,
+                );
+                painter.rect_stroke(
+                    inset,
                     4.0,
                     egui::Stroke::new(
-                        1.5,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
                     ),
-                    egui::epaint::StrokeKind::Inside,
+                    egui::epaint::StrokeKind::Outside,
                 );
             }
             if resp.clicked() && clicked_open.is_none() {

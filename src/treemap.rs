@@ -56,6 +56,7 @@ pub fn extension_color(name: &str, is_dir: bool) -> egui::Color32 {
     }
 }
 
+#[cfg(test)]
 fn darken(c: egui::Color32, amount: u8) -> egui::Color32 {
     egui::Color32::from_rgb(
         c.r().saturating_sub(amount),
@@ -287,22 +288,11 @@ pub struct TreemapTile {
     pub color: egui::Color32,
     pub child_count: Option<usize>,
     pub nested: Vec<NestedTile>,
-    /// Pre-formatted short label (name only).
-    pub label_short: Box<str>,
-    /// Pre-formatted tall label (name + size).
-    pub label_tall: Box<str>,
-    /// Pre-computed text color for this tile's background.
-    pub text_color: egui::Color32,
-    /// Pre-computed darkened header color (dirs only, unused for files).
-    pub header_color: egui::Color32,
-    /// Pre-computed text color for header background (dirs only).
-    pub header_text_color: egui::Color32,
 }
 
 pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
-    pub name: Box<str>,
     #[allow(dead_code)]
     pub is_dir: bool,
     pub color: egui::Color32,
@@ -317,10 +307,8 @@ pub struct OtherBucket {
     #[cfg_attr(not(test), allow(dead_code))]
     pub count: usize,
     pub size: u64,
-    /// Pre-formatted short label.
+    /// Pre-formatted short label, e.g. "Other (123 files)".
     pub label_short: Box<str>,
-    /// Pre-formatted tall label.
-    pub label_tall: Box<str>,
 }
 
 /// Build a cached treemap layout from the given tree and parameters.
@@ -487,25 +475,10 @@ pub fn build_treemap_cache(
 
         let name: Box<str> = child.name().into();
         let size = child.size();
-        let size_str = ByteSize::b(size).to_string();
-        let header_color = darken(color, 15);
-        let label_short: Box<str> = name.clone();
-        let label_tall: Box<str> = if is_dir {
-            // For dirs: "name (size)" used in header
-            format!("{} ({})", name, size_str).into()
-        } else {
-            // For files: "name\nsize" used in tall tiles
-            format!("{}\n{}", name, size_str).into()
-        };
 
         tiles.push(TreemapTile {
             rect: r,
             path: child_path,
-            label_short,
-            label_tall,
-            text_color: text_color_for_bg(color),
-            header_color,
-            header_text_color: text_color_for_bg(header_color),
             name,
             size,
             is_dir,
@@ -524,12 +497,6 @@ pub fn build_treemap_cache(
             count: other_count,
             size: other_size,
             label_short: format!("Other ({})", other_count).into(),
-            label_tall: format!(
-                "Other ({} files)\n{}",
-                other_count,
-                fmt_size_compact(other_size)
-            )
-            .into(),
         })
     } else {
         None
@@ -607,7 +574,6 @@ fn build_nested_tiles(
         result.push(NestedTile {
             rect: cr,
             path: child_path,
-            name: child.name().into(),
             is_dir,
             color,
             size: child.size(),
@@ -627,7 +593,6 @@ pub enum TreemapAction {
 
 const GAP: f32 = 1.5;
 const DIR_HEADER_H: f32 = 20.0;
-const MIN_LABEL_W: f32 = 32.0;
 /// Hard cap on visible top-level entries to prevent lag with huge directories.
 const MAX_VISIBLE_ENTRIES: usize = 200;
 /// Minimum rect area (px²) worth painting — below this we skip.
@@ -1083,39 +1048,69 @@ fn paint_cached_leaf(
         );
     }
 
-    // Label: name top-left, size bottom-left.  Measured truncation so
-    // we never paint anything that visually overflows.  Matches the
-    // during-scan tile layout exactly.
-    let pad = 4.0;
-    if tile.rect.width() <= 50.0 || tile.rect.height() <= 18.0 {
+    // Skip labels on tiny leaves — same threshold as dir tiles so the
+    // two views read consistently.
+    if tile.rect.width() < 85.0 || tile.rect.height() < 24.0 {
         return;
     }
-    let avail_w = tile.rect.width() - pad * 2.0;
-    let inner = tile.rect.shrink(pad);
-    let text_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220);
-    let size_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230);
-    if let Some(g) = fit_text(
+
+    // Header band: same darkened-base + name-left + size-right
+    // treatment used by dir tiles.  Files don't have nested children
+    // backdropping the band, but applying it anyway keeps every tile
+    // in the treemap visually consistent — the eye reads a tile as
+    // "header on top + body below" regardless of dir vs file.
+    let header_h = if tile.rect.height() > 80.0 { 28.0 } else { 22.0 };
+    let header_rect =
+        egui::Rect::from_min_size(tile.rect.min, egui::vec2(tile.rect.width(), header_h));
+    let body = apply_alpha(tile.color, alpha);
+    let band = body.linear_multiply(0.55);
+    let band = egui::Color32::from_rgba_unmultiplied(
+        band.r(),
+        band.g(),
+        band.b(),
+        (band.a() as f32 * 0.92).clamp(0.0, 255.0) as u8,
+    );
+    painter.rect_filled(
+        header_rect,
+        egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 },
+        band,
+    );
+
+    let header_pad = 8.0_f32;
+    let avail = (tile.rect.width() - header_pad * 2.0).max(0.0);
+    let size_str = fmt_size_compact(tile.size);
+    let size_g = fit_text(
+        painter,
+        &size_str,
+        egui::FontId::proportional(12.0),
+        avail,
+    );
+    let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
+    let name_avail = (avail - size_w).max(0.0);
+    let name_g = fit_text(
         painter,
         tile.name.as_ref(),
-        egui::FontId::proportional(11.0),
-        avail_w,
-    ) {
-        painter.galley(inner.left_top(), g, text_color);
+        egui::FontId::proportional(13.5),
+        name_avail,
+    );
+    let mid_y = header_rect.center().y;
+    if let Some(ng) = name_g {
+        let pos = egui::pos2(
+            header_rect.min.x + header_pad,
+            mid_y - ng.size().y * 0.5,
+        );
+        painter.galley(pos, ng, egui::Color32::WHITE);
     }
-    if tile.rect.height() > 36.0 {
-        let size_str = fmt_size_compact(tile.size);
-        if let Some(g) = fit_text(
-            painter,
-            &size_str,
-            egui::FontId::monospace(11.0),
-            avail_w,
-        ) {
-            painter.galley(
-                inner.left_bottom() + egui::vec2(0.0, -14.0),
-                g,
-                size_color,
-            );
-        }
+    if let Some(sg) = size_g {
+        let pos = egui::pos2(
+            header_rect.max.x - header_pad - sg.size().x,
+            mid_y - sg.size().y * 0.5,
+        );
+        painter.galley(
+            pos,
+            sg,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+        );
     }
 }
 

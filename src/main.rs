@@ -172,6 +172,40 @@ fn paint_shimmer(painter: &egui::Painter, rect: egui::Rect, t_seconds: f32) {
 // (during-scan + post-scan) use them now.
 use crate::treemap::{fit_path, fit_text};
 
+/// A tab-style toggle button: frameless text label with a 2-px accent
+/// underline drawn while `active`.  Inactive labels render in
+/// `weak_text_color`; active labels in the default text colour and
+/// `strong()`.  Replaces ad-hoc `selectable_label` and the inline
+/// underline-tab code so every toggle in the toolbar reads as the
+/// same kind of widget.
+fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let text = if active {
+        egui::RichText::new(label).strong().size(14.0)
+    } else {
+        egui::RichText::new(label)
+            .size(14.0)
+            .color(ui.visuals().weak_text_color())
+    };
+    let btn = egui::Button::new(text)
+        .frame(false)
+        .min_size(egui::vec2(0.0, 24.0));
+    let response = ui.add(btn);
+    if active {
+        let rect = response.rect;
+        let painter = ui.painter();
+        let accent = egui::Color32::from_rgb(100, 180, 255);
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                egui::vec2(rect.width(), 2.0),
+            ),
+            0.0,
+            accent,
+        );
+    }
+    response
+}
+
 /// Open a file/folder in the platform's default file manager.
 fn open_in_finder(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -2112,35 +2146,7 @@ impl eframe::App for App {
                                 [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
                             {
                                 let is_active = self.view_mode == mode;
-                                let text = if is_active {
-                                    egui::RichText::new(label).strong().size(14.0)
-                                } else {
-                                    egui::RichText::new(label)
-                                        .size(14.0)
-                                        .color(ui.visuals().weak_text_color())
-                                };
-
-                                let btn = egui::Button::new(text)
-                                    .frame(false)
-                                    .min_size(egui::vec2(0.0, 24.0));
-                                let response = ui.add(btn);
-
-                                // Draw underline for active tab
-                                if is_active {
-                                    let rect = response.rect;
-                                    let painter = ui.painter();
-                                    let accent = egui::Color32::from_rgb(100, 180, 255);
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                            egui::vec2(rect.width(), 2.0),
-                                        ),
-                                        0.0,
-                                        accent,
-                                    );
-                                }
-
-                                if response.clicked() {
+                                if tab_button(ui, label, is_active).clicked() {
                                     self.view_mode = mode;
                                 }
                             }
@@ -2168,37 +2174,30 @@ impl eframe::App for App {
                         // }
 
                         // Hidden files toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_hidden, "Show hidden")
-                                .clicked()
-                            {
-                                self.show_hidden = !self.show_hidden;
-                                self.mark_dirty();
-                                // Persist preference
-                                if let Some(ref path) = self.last_scan_path {
-                                    save_config(path, self.show_hidden);
-                                }
-                                // Recompute stats
-                                if let Some(ref tree) = self.tree {
-                                    self.category_stats = Some(categories::compute_stats(tree));
-                                }
+                        if self.tree.is_some()
+                            && tab_button(ui, "Show hidden", self.show_hidden).clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.mark_dirty();
+                            // Persist preference
+                            if let Some(ref path) = self.last_scan_path {
+                                save_config(path, self.show_hidden);
+                            }
+                            // Recompute stats
+                            if let Some(ref tree) = self.tree {
+                                self.category_stats =
+                                    Some(categories::compute_stats(tree));
                             }
                         }
 
                         // File types panel toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_categories, "File Types")
-                                .clicked()
-                            {
-                                self.show_categories = !self.show_categories;
-                                if !self.show_categories {
-                                    self.category_filter = None;
-                                    self.mark_dirty();
-                                }
+                        if self.tree.is_some()
+                            && tab_button(ui, "File Types", self.show_categories).clicked()
+                        {
+                            self.show_categories = !self.show_categories;
+                            if !self.show_categories {
+                                self.category_filter = None;
+                                self.mark_dirty();
                             }
                         }
 

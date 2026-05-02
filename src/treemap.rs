@@ -306,6 +306,10 @@ pub struct NestedTile {
     #[allow(dead_code)]
     pub is_dir: bool,
     pub color: egui::Color32,
+    /// Recursive size of this child — needed so we can render the
+    /// "X GB" label inside the nested tile (matches the during-scan
+    /// view's nested tile layout).
+    pub size: u64,
 }
 
 pub struct OtherBucket {
@@ -604,6 +608,7 @@ fn build_nested_tiles(
             name: child.name().into(),
             is_dir,
             color,
+            size: child.size(),
         });
     }
     result
@@ -1137,12 +1142,11 @@ fn paint_cached_directory(
             }
         }
 
-        // Path-aware label: relative to the parent dir tile.  Skip if
-        // even ellipsis-truncated form won't fit.
-        if cr.width() > 50.0 && cr.height() > 16.0 {
+        // Path-aware label + size — exactly the same layout the
+        // during-scan view paints for its nested tiles.
+        if cr.width() > 50.0 && cr.height() > 18.0 {
             let inner = cr.shrink(3.0);
             let avail_w = inner.width();
-            // Path relative to the parent tile.
             let display = nested
                 .path
                 .strip_prefix(&tile.path)
@@ -1154,17 +1158,34 @@ fn paint_cached_directory(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| nested.path.display().to_string())
                 });
+            let text_color =
+                apply_alpha(text_color_for_bg(nested.color), alpha * 0.95);
+            // Name top-left.
             if let Some(g) = fit_path(
                 &tile_painter,
                 &display,
                 egui::FontId::proportional(11.0),
                 avail_w,
             ) {
-                tile_painter.galley(
-                    inner.left_top(),
-                    g,
-                    apply_alpha(text_color_for_bg(nested.color), alpha * 0.9),
-                );
+                tile_painter.galley(inner.left_top(), g, text_color);
+            }
+            // Size bottom-left (only when the tile is tall enough that
+            // the labels won't overlap visually — same threshold as
+            // the during-scan code).
+            if cr.height() > 36.0 {
+                let size_str = ByteSize::b(nested.size).to_string();
+                if let Some(g) = fit_text(
+                    &tile_painter,
+                    &size_str,
+                    egui::FontId::monospace(11.0),
+                    avail_w,
+                ) {
+                    tile_painter.galley(
+                        inner.left_bottom() + egui::vec2(0.0, -14.0),
+                        g,
+                        text_color,
+                    );
+                }
             }
         }
     }

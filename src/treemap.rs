@@ -827,6 +827,77 @@ pub fn render_treemap(
     actions
 }
 
+/// Lay out `text` only if its measured width fits `max_w` — returns
+/// the laid-out galley or None.  Lets callers avoid drawing labels
+/// that would visually overlap their tile bounds.
+pub fn fit_text_exact(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let g = painter.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE);
+    if g.size().x <= max_w { Some(g) } else { None }
+}
+
+/// Lay out `text` so it fits `max_w`, head-truncating with an ellipsis
+/// if needed via binary search on the measured width.  Returns None if
+/// even one character + ellipsis doesn't fit.
+pub fn fit_text(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if let Some(g) = fit_text_exact(painter, text, font_id.clone(), max_w) {
+        return Some(g);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best: Option<std::sync::Arc<egui::Galley>> = None;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars.iter().take(mid).collect::<String>() + "…";
+        if let Some(g) = fit_text_exact(painter, &candidate, font_id.clone(), max_w) {
+            best = Some(g);
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
+/// Lay out a path so the leaf component stays visible: drops leading
+/// components in favour of "…/" until the result fits `max_w`.  Falls
+/// back to head-truncating the leaf alone when even ".../leaf" is too
+/// wide.
+pub fn fit_path(
+    painter: &egui::Painter,
+    path: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if let Some(g) = fit_text_exact(painter, path, font_id.clone(), max_w) {
+        return Some(g);
+    }
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    for skip in 1..parts.len() {
+        let candidate = format!("…/{}", parts[skip..].join("/"));
+        if let Some(g) = fit_text_exact(painter, &candidate, font_id.clone(), max_w) {
+            return Some(g);
+        }
+    }
+    fit_text(painter, parts.last().copied().unwrap_or(path), font_id, max_w)
+}
+
 /// Per-rank colour for the root-view top-level tiles.  Mirrors the
 /// palette used by the live-scan treemap.  Largest = index 0.
 pub fn scan_rank_palette(idx: usize) -> egui::Color32 {
@@ -902,7 +973,7 @@ fn paint_cached_leaf(
     tile: &TreemapTile,
     is_focused: bool,
     alpha: f32,
-    font: &egui::FontId,
+    _font: &egui::FontId,
 ) {
     let color = apply_alpha(tile.color, alpha);
     paint_gradient_rect(painter, tile.rect, color, 2.0);
@@ -916,22 +987,39 @@ fn paint_cached_leaf(
         );
     }
 
-    // Label if large enough — clip to tile rect, use pre-computed strings
-    if tile.rect.width() > MIN_LABEL_W && tile.rect.height() > 14.0 {
-        let clipped = painter.with_clip_rect(tile.rect);
-        let tc = apply_alpha(tile.text_color, alpha);
-        let text: &str = if tile.rect.height() > 30.0 {
-            &tile.label_tall
-        } else {
-            &tile.label_short
-        };
-        clipped.text(
-            tile.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font.clone(),
-            tc,
-        );
+    // Label: name top-left, size bottom-left.  Measured truncation so
+    // we never paint anything that visually overflows.  Matches the
+    // during-scan tile layout exactly.
+    let pad = 4.0;
+    if tile.rect.width() <= 50.0 || tile.rect.height() <= 18.0 {
+        return;
+    }
+    let avail_w = tile.rect.width() - pad * 2.0;
+    let inner = tile.rect.shrink(pad);
+    let text_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220);
+    let size_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230);
+    if let Some(g) = fit_text(
+        painter,
+        tile.name.as_ref(),
+        egui::FontId::proportional(11.0),
+        avail_w,
+    ) {
+        painter.galley(inner.left_top(), g, text_color);
+    }
+    if tile.rect.height() > 36.0 {
+        let size_str = ByteSize::b(tile.size).to_string();
+        if let Some(g) = fit_text(
+            painter,
+            &size_str,
+            egui::FontId::monospace(11.0),
+            avail_w,
+        ) {
+            painter.galley(
+                inner.left_bottom() + egui::vec2(0.0, -14.0),
+                g,
+                size_color,
+            );
+        }
     }
 }
 
@@ -939,13 +1027,11 @@ fn paint_other_bucket(
     painter: &egui::Painter,
     other: &OtherBucket,
     alpha: f32,
-    font: &egui::FontId,
+    _font: &egui::FontId,
 ) {
     let rect = other.rect;
     let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
     paint_gradient_rect(painter, rect, bg, 2.0);
-
-    // Dashed-style border to distinguish from real blocks
     painter.rect_stroke(
         rect,
         2.0,
@@ -956,21 +1042,35 @@ fn paint_other_bucket(
         egui::StrokeKind::Inside,
     );
 
-    if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
-        let clipped = painter.with_clip_rect(rect);
-        let tc = apply_alpha(egui::Color32::from_rgb(200, 200, 200), alpha);
-        let text: &str = if rect.height() > 30.0 {
-            &other.label_tall
-        } else {
-            &other.label_short
-        };
-        clipped.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font.clone(),
-            tc,
-        );
+    if rect.width() <= 50.0 || rect.height() <= 18.0 {
+        return;
+    }
+    let pad = 4.0;
+    let avail_w = rect.width() - pad * 2.0;
+    let inner = rect.shrink(pad);
+    let text_color = apply_alpha(egui::Color32::from_rgb(220, 220, 220), alpha);
+    if let Some(g) = fit_text(
+        painter,
+        &other.label_short,
+        egui::FontId::proportional(11.0),
+        avail_w,
+    ) {
+        painter.galley(inner.left_top(), g, text_color);
+    }
+    if rect.height() > 36.0 {
+        let size_str = ByteSize::b(other.size).to_string();
+        if let Some(g) = fit_text(
+            painter,
+            &size_str,
+            egui::FontId::monospace(11.0),
+            avail_w,
+        ) {
+            painter.galley(
+                inner.left_bottom() + egui::vec2(0.0, -14.0),
+                g,
+                text_color,
+            );
+        }
     }
 }
 
@@ -980,14 +1080,13 @@ fn paint_cached_directory(
     is_focused: bool,
     focused_path: &Option<PathBuf>,
     alpha: f32,
-    font_header: &egui::FontId,
-    font_nested: &egui::FontId,
+    _font_header: &egui::FontId,
+    _font_nested: &egui::FontId,
 ) {
     let rect = tile.rect;
     let bg = apply_alpha(tile.color, alpha);
-    let header_bg = apply_alpha(tile.header_color, alpha);
 
-    // Gradient background
+    // Gradient background.
     paint_gradient_rect(painter, rect, bg, 2.0);
 
     if is_focused {
@@ -999,27 +1098,8 @@ fn paint_cached_directory(
         );
     }
 
-    // Header
-    let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), DIR_HEADER_H));
-    painter.rect_filled(header_rect, 2.0, header_bg);
-
-    // Header text — clip to header rect, use pre-computed label
-    if rect.width() > MIN_LABEL_W {
-        let clipped = painter.with_clip_rect(header_rect);
-        let tc = apply_alpha(tile.header_text_color, alpha);
-        clipped.text(
-            header_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            tile.label_tall.as_ref(),
-            font_header.clone(),
-            tc,
-        );
-    }
-
-    // Nested children (pre-computed in cache) — single clip group for entire tile
-    if tile.nested.is_empty() {
-        return;
-    }
+    // ── Nested children first, so the header band paints on top and
+    //    stays readable.
     let tile_painter = painter.with_clip_rect(rect);
     let has_focus = focused_path.is_some();
     for nested in &tile.nested {
@@ -1039,17 +1119,90 @@ fn paint_cached_directory(
             }
         }
 
-        // Label only for tiles large enough to be readable.
-        if cr.width() > 60.0 && cr.height() > 16.0 {
-            let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
-            tile_painter.text(
-                cr.center(),
-                egui::Align2::CENTER_CENTER,
-                nested.name.as_ref(),
-                font_nested.clone(),
-                tc,
-            );
+        // Path-aware label: relative to the parent dir tile.  Skip if
+        // even ellipsis-truncated form won't fit.
+        if cr.width() > 50.0 && cr.height() > 16.0 {
+            let inner = cr.shrink(3.0);
+            let avail_w = inner.width();
+            // Path relative to the parent tile.
+            let display = nested
+                .path
+                .strip_prefix(&tile.path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| {
+                    nested
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| nested.path.display().to_string())
+                });
+            if let Some(g) = fit_path(
+                &tile_painter,
+                &display,
+                egui::FontId::proportional(11.0),
+                avail_w,
+            ) {
+                tile_painter.galley(
+                    inner.left_top(),
+                    g,
+                    apply_alpha(text_color_for_bg(nested.color), alpha * 0.9),
+                );
+            }
         }
+    }
+
+    // ── Header band: solid darkened backdrop + name (left) + size
+    //    (right).  Both measured via fit_text so we never overflow.
+    let header_h = if rect.height() > 80.0 { 28.0 } else { 22.0 };
+    let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_h));
+    let band_color = apply_alpha(tile.header_color, alpha);
+    let band_color = egui::Color32::from_rgba_unmultiplied(
+        band_color.r(),
+        band_color.g(),
+        band_color.b(),
+        (band_color.a() as f32 * 0.92) as u8,
+    );
+    painter.rect_filled(
+        header_rect,
+        egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 },
+        band_color,
+    );
+
+    let header_pad = 8.0;
+    let avail = (rect.width() - header_pad * 2.0).max(0.0);
+    let size_str = ByteSize::b(tile.size).to_string();
+    let size_g = fit_text(
+        painter,
+        &size_str,
+        egui::FontId::proportional(12.0),
+        avail,
+    );
+    let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
+    let name_avail = (avail - size_w).max(0.0);
+    let name_g = fit_text(
+        painter,
+        tile.name.as_ref(),
+        egui::FontId::proportional(13.5),
+        name_avail,
+    );
+    let mid_y = header_rect.center().y;
+    if let Some(ng) = name_g {
+        let pos = egui::pos2(
+            header_rect.min.x + header_pad,
+            mid_y - ng.size().y * 0.5,
+        );
+        painter.galley(pos, ng, egui::Color32::WHITE);
+    }
+    if let Some(sg) = size_g {
+        let pos = egui::pos2(
+            header_rect.max.x - header_pad - sg.size().x,
+            mid_y - sg.size().y * 0.5,
+        );
+        painter.galley(
+            pos,
+            sg,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+        );
     }
 }
 

@@ -445,12 +445,15 @@ pub fn build_treemap_cache(
     // Build tiles for real children, tracking global nested budget
     let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
-    // At the root view, top-level tiles get the same vivid per-rank
-    // palette as the live-scan treemap so the during-scan → post-scan
-    // handoff is visually seamless.  In zoomed-in views we keep the
-    // extension/category colours so the user can read content type
-    // at a glance.
-    let is_root_view = view_path == root_path;
+    // Every level uses the rank palette by rank-in-parent-by-size.
+    // Originally I gated this on root_view-only and fell back to
+    // extension_color for zoomed-in views — but extension_color
+    // returns the same dark grey for every directory, which makes a
+    // zoomed-in dir-of-dirs look like a flat slab of identical tiles.
+    // Rank palette cycles through 8 hues so adjacent siblings always
+    // read as distinct, regardless of depth.  Files inside zoomed
+    // views still get a useful colour because they're sized within
+    // the same rank order as their dir siblings.
     for (i, child) in children.iter().enumerate() {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
@@ -458,29 +461,23 @@ pub fn build_treemap_cache(
         }
         let child_path = view_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = if is_root_view {
-            scan_rank_palette(i)
-        } else {
-            extension_color(child.name(), is_dir)
-        };
+        let color = scan_rank_palette(i);
         let child_count = if is_dir {
             Some(child.children().len())
         } else {
             None
         };
 
-        // Build nested sub-tiles for directory tiles large enough (respecting global budget)
-        // At root view, propagate the parent tile's rank colour so nested
-        // children are darker variants of it — keeps the visual palette
-        // unified with the during-scan view.  In zoomed sub-views, pass
-        // None so extension colours kick in for content-type cues.
+        // Always propagate the parent rank colour to nested children.
+        // Inside any directory tile the nested sub-tiles read as
+        // dimmed variants of the parent so the whole subtree looks
+        // like a coherent block rather than a rainbow.
         let nested = if is_dir
             && nested_budget > 0
             && r.width() > 40.0
             && r.height() > DIR_HEADER_H + 16.0
         {
-            let parent_color = if is_root_view { Some(color) } else { None };
-            let tiles = build_nested_tiles(child, &child_path, r, nested_budget, parent_color);
+            let tiles = build_nested_tiles(child, &child_path, r, nested_budget, Some(color));
             nested_budget = nested_budget.saturating_sub(tiles.len());
             tiles
         } else {
@@ -1831,9 +1828,11 @@ mod tests {
     }
 
     #[test]
-    fn zoomed_view_uses_extension_colour() {
-        // When zoomed into a subdir, tiles should fall back to
-        // extension colours so users can read content type at a glance.
+    fn zoomed_view_uses_rank_palette() {
+        // Zoomed-in tiles also get the rank palette — `extension_color`
+        // returns a single dark grey for every directory, so a
+        // zoomed-in dir-of-dirs would otherwise read as identical
+        // tiles.
         let tree = dir(
             "root",
             vec![dir("sub", vec![leaf("video.mp4", 300)])],
@@ -1843,6 +1842,6 @@ mod tests {
         let zoomed = Some(std::path::PathBuf::from("root/sub"));
         let cache = build_treemap_cache(&tree, &zoomed, None, true, rect);
         assert_eq!(cache.tiles.len(), 1);
-        assert_eq!(cache.tiles[0].color, extension_color("video.mp4", false));
+        assert_eq!(cache.tiles[0].color, scan_rank_palette(0));
     }
 }

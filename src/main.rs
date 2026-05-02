@@ -168,6 +168,61 @@ fn paint_shimmer(painter: &egui::Painter, rect: egui::Rect, t_seconds: f32) {
     let _ = saved_clip; // keep clip rect alive; restored on drop of `painter`
 }
 
+/// Lay out a path so that the *leaf* component is always visible when
+/// possible, dropping the leading components in favour of "…/" until
+/// the result measurably fits `max_w`.  Falls back to head-truncating
+/// the leaf itself if even ".../leaf" is too wide.
+///
+/// Examples (max_w shrinking):
+///   dom/git/yt-revenue/MoneyPrinterTurbo
+///   …/git/yt-revenue/MoneyPrinterTurbo
+///   …/yt-revenue/MoneyPrinterTurbo
+///   …/MoneyPrinterTurbo
+///   MoneyPrinterT…
+fn fit_path(
+    painter: &egui::Painter,
+    path: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    // Fast path: full thing fits.
+    if let Some(g) = fit_text_exact(painter, path, font_id.clone(), max_w) {
+        return Some(g);
+    }
+    // Strip leading components one at a time, prepending "…/".
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    for skip in 1..parts.len() {
+        let candidate = format!("…/{}", parts[skip..].join("/"));
+        if let Some(g) =
+            fit_text_exact(painter, &candidate, font_id.clone(), max_w)
+        {
+            return Some(g);
+        }
+    }
+    // Even the leaf alone with "…/" prefix won't fit — fall back to
+    // ordinary head-truncation of the leaf.
+    fit_text(painter, parts.last().copied().unwrap_or(path), font_id, max_w)
+}
+
+/// Try to lay out `text` exactly (no truncation).  Returns the galley
+/// if its measured width is ≤ max_w, otherwise None.
+fn fit_text_exact(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let g = painter.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE);
+    if g.size().x <= max_w {
+        Some(g)
+    } else {
+        None
+    }
+}
+
 /// Lay out text with egui's font system to get accurate measurements,
 /// then truncate with ellipsis if needed so the *measured* width fits
 /// `max_w`.  Returns the laid-out galley and the actual text used.  If
@@ -1126,17 +1181,30 @@ impl App {
                         // Only attempt labels on tiles wide enough that
                         // *something readable* will fit after measuring.
                         if inner.width() > 50.0 && inner.height() > 18.0 {
-                            let leaf = d
+                            // Show the path *relative to the group root*.
+                            // Nested tiles can be 3-5 levels deep
+                            // (e.g. dom/git/yt-revenue/MoneyPrinterTurbo
+                            // under the Users group), so showing only
+                            // file_name() makes them look like direct
+                            // children of the group — misleading.
+                            let display = d
                                 .path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| d.path.display().to_string());
+                                .strip_prefix(&g.top_path)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| {
+                                    d.path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| d.path.display().to_string())
+                                });
                             let avail_w = inner.width() - 8.0;
-                            // Name (top-left).  Skip entirely if even a
-                            // single character + ellipsis won't fit.
-                            if let Some(galley) = fit_text(
+                            // Name (top-left).  Use path-aware
+                            // truncation so the leaf component (the
+                            // bit users actually want) is always
+                            // preserved when possible.
+                            if let Some(galley) = fit_path(
                                 &painter,
-                                &leaf,
+                                &display,
                                 egui::FontId::proportional(11.0),
                                 avail_w,
                             ) {

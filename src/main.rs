@@ -1057,14 +1057,15 @@ impl App {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
-        // Top-level tile colour: shared palette with the post-scan
-        // treemap (treemap::scan_rank_palette) so the during-scan →
-        // post-scan handoff is seamless.
+        // Top-level tile colour: stable name-hash palette
+        // (treemap::path_color) so the same group paints the same
+        // colour during-scan and post-scan, regardless of rank
+        // shifting as more events arrive.
         let now = ui.ctx().input(|i| i.time) as f32;
         let groups = &self.scan_tm_cache.groups;
         let finalised = &self.scan_tm_cache.finalised;
 
-        for (idx, g) in groups.iter().enumerate() {
+        for g in groups.iter() {
             let rect = match self.scan_tm_current.get(&g.top_path) {
                 Some(r) => *r,
                 None => continue,
@@ -1073,10 +1074,6 @@ impl App {
                 continue;
             }
             let inset = rect.shrink(1.0);
-            // Stable name-based colour so the same group paints the
-            // same colour during-scan and post-scan, regardless of
-            // its rank shifting as more events arrive.
-            let _ = idx;
             let base = treemap::path_color(&g.top_name);
             let scanning = g.own_size.is_none();
 

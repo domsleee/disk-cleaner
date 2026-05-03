@@ -558,7 +558,7 @@ fn build_nested_tiles(
 
     let mut result = Vec::with_capacity(nested.len());
     for (j, child) in nested.iter().enumerate() {
-        let cr = child_rects[j].shrink(0.5);
+        let cr = child_rects[j].shrink(1.0);
         if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
             continue;
         }
@@ -590,7 +590,7 @@ pub enum TreemapAction {
 
 // ─── Rendering ──────────────────────────────────────────────────
 
-const GAP: f32 = 1.5;
+const GAP: f32 = 1.0;
 const DIR_HEADER_H: f32 = 20.0;
 /// Hard cap on visible top-level entries to prevent lag with huge directories.
 const MAX_VISIBLE_ENTRIES: usize = 200;
@@ -1038,12 +1038,12 @@ fn paint_cached_leaf(
     _font: &egui::FontId,
 ) {
     let color = apply_alpha(tile.color, alpha);
-    paint_gradient_rect(painter, tile.rect, color, 2.0);
+    paint_gradient_rect(painter, tile.rect, color, 4.0);
 
     if is_focused {
         painter.rect_stroke(
             tile.rect,
-            2.0,
+            4.0,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
@@ -1124,10 +1124,10 @@ fn paint_other_bucket(
 ) {
     let rect = other.rect;
     let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
-    paint_gradient_rect(painter, rect, bg, 2.0);
+    paint_gradient_rect(painter, rect, bg, 4.0);
     painter.rect_stroke(
         rect,
-        2.0,
+        4.0,
         egui::Stroke::new(
             1.0,
             apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha),
@@ -1171,12 +1171,12 @@ fn paint_cached_directory(
     let bg = apply_alpha(tile.color, alpha);
 
     // Gradient background.
-    paint_gradient_rect(painter, rect, bg, 2.0);
+    paint_gradient_rect(painter, rect, bg, 4.0);
 
     if is_focused {
         painter.rect_stroke(
             rect,
-            2.0,
+            4.0,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
@@ -1189,7 +1189,7 @@ fn paint_cached_directory(
     for nested in &tile.nested {
         let cr = nested.rect;
         let color = apply_alpha(nested.color, alpha);
-        paint_gradient_rect(&tile_painter, cr, color, 1.0);
+        paint_gradient_rect(&tile_painter, cr, color, 3.0);
         // Hairline stroke around the nested rect so the eye can tell
         // sibling tiles apart even when their gradients are similar
         // (target inside disk-cleaner, MoneyPrinterTurbo inside
@@ -1197,7 +1197,7 @@ fn paint_cached_directory(
         // as a soft separator, not a hard outline.
         tile_painter.rect_stroke(
             cr,
-            1.0,
+            3.0,
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60)),
             egui::epaint::StrokeKind::Inside,
         );

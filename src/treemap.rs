@@ -449,7 +449,9 @@ pub fn build_treemap_cache(
         }
         let child_path = view_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = scan_rank_palette(i);
+        // Stable name-based colour so the same item paints the same
+        // colour during-scan and post-scan.
+        let color = path_color(child.name());
         let child_count = if is_dir {
             Some(child.children().len())
         } else {
@@ -963,21 +965,32 @@ pub fn fmt_size_compact(bytes: u64) -> String {
     }
 }
 
-/// Per-rank colour for the root-view top-level tiles.  Mirrors the
-/// palette used by the live-scan treemap.  Largest = index 0.
-pub fn scan_rank_palette(idx: usize) -> egui::Color32 {
-    const PALETTE: [egui::Color32; 8] = [
-        egui::Color32::from_rgb(58, 93, 139), // blue
-        egui::Color32::from_rgb(42, 109, 77), // green
-        egui::Color32::from_rgb(122, 74, 48), // brown
-        egui::Color32::from_rgb(74, 58, 107), // purple
-        egui::Color32::from_rgb(90, 74, 58),  // tan
-        egui::Color32::from_rgb(48, 90, 100), // teal
-        egui::Color32::from_rgb(110, 60, 90), // mauve
-        egui::Color32::from_rgb(86, 86, 56),  // olive
-    ];
-    PALETTE[idx % PALETTE.len()]
+/// Stable colour for a tile keyed by its leaf name.  FNV-1a hash mod
+/// palette length — same name always gets the same colour, across
+/// the during-scan / post-scan handoff and across re-runs.
+///
+/// Tile *size* still encodes "how big is this thing"; tile *colour*
+/// now encodes "which thing is this", which is what users actually
+/// track in a disk cleaner ("the green one is disk-cleaner").
+pub fn path_color(name: &str) -> egui::Color32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    PALETTE[(h as usize) % PALETTE.len()]
 }
+
+const PALETTE: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(58, 93, 139), // blue
+    egui::Color32::from_rgb(42, 109, 77), // green
+    egui::Color32::from_rgb(122, 74, 48), // brown
+    egui::Color32::from_rgb(74, 58, 107), // purple
+    egui::Color32::from_rgb(90, 74, 58),  // tan
+    egui::Color32::from_rgb(48, 90, 100), // teal
+    egui::Color32::from_rgb(110, 60, 90), // mauve
+    egui::Color32::from_rgb(86, 86, 56),  // olive
+];
 
 // ─── Painting helpers ───────────────────────────────────────────
 
@@ -1870,49 +1883,54 @@ mod tests {
         let tile = &cache.tiles[0];
         assert_eq!(&*tile.name, "movie.mp4");
         assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
-        // At the root view, top-level tiles use the rank palette rather
-        // than extension colour so the post-scan view matches the
-        // during-scan one.
-        assert_eq!(tile.color, scan_rank_palette(0));
+        // Tile colour is now hashed from the leaf name, not the rank.
+        assert_eq!(tile.color, path_color("movie.mp4"));
         assert!(!tile.is_dir);
         assert_eq!(tile.child_count, None);
     }
 
     #[test]
-    fn root_view_uses_rank_palette_in_order() {
-        // Three top-level entries, sorted by size desc — colours
-        // should be palette[0], palette[1], palette[2].
-        let tree = dir(
-            "root",
-            vec![leaf("a.bin", 300), leaf("b.bin", 200), leaf("c.bin", 100)],
-        );
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let cache = build_treemap_cache(&tree, &None, None, true, rect);
-        // tiles preserve insertion order from the children iter, which
-        // is by the original FileNode order.  The squarify input was
-        // also in that order, so tile[i].color must == palette(i).
-        for (i, tile) in cache.tiles.iter().enumerate() {
-            assert_eq!(
-                tile.color,
-                scan_rank_palette(i),
-                "tile {} ({}) should use rank palette",
-                i,
-                tile.name
-            );
+    fn path_color_is_stable_across_calls() {
+        // Same name always maps to the same palette entry, regardless
+        // of how many other names come before it.  This is the whole
+        // point — during-scan and post-scan views render the same
+        // dir in the same colour.
+        let a = path_color("disk-cleaner");
+        let b = path_color("disk-cleaner");
+        assert_eq!(a, b);
+        // And different names *probably* differ (palette has 8 hues
+        // so collisions are possible; just check we're not always
+        // returning the same thing).
+        let mut seen = std::collections::HashSet::new();
+        for name in [
+            "yt-revenue",
+            "disk-cleaner",
+            "finance",
+            "paperclip",
+            "wezterm",
+            "wordle",
+            "bananagrams",
+            "ollama",
+        ] {
+            seen.insert(path_color(name));
         }
+        // 8 inputs → expect at least 3 distinct colours via FNV.
+        assert!(
+            seen.len() >= 3,
+            "palette spread too narrow: only {} distinct colours",
+            seen.len()
+        );
     }
 
     #[test]
-    fn zoomed_view_uses_rank_palette() {
-        // Zoomed-in tiles also get the rank palette — `extension_color`
-        // returns a single dark grey for every directory, so a
-        // zoomed-in dir-of-dirs would otherwise read as identical
-        // tiles.
+    fn zoomed_view_uses_path_color() {
+        // Zoomed-in tiles also use the name-hash palette so the same
+        // dir keeps the same colour at any zoom depth.
         let tree = dir("root", vec![dir("sub", vec![leaf("video.mp4", 300)])]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
         let zoomed = Some(std::path::PathBuf::from("root/sub"));
         let cache = build_treemap_cache(&tree, &zoomed, None, true, rect);
         assert_eq!(cache.tiles.len(), 1);
-        assert_eq!(cache.tiles[0].color, scan_rank_palette(0));
+        assert_eq!(cache.tiles[0].color, path_color("video.mp4"));
     }
 }

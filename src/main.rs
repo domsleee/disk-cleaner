@@ -1073,7 +1073,11 @@ impl App {
                 continue;
             }
             let inset = rect.shrink(1.0);
-            let base = treemap::scan_rank_palette(idx);
+            // Stable name-based colour so the same group paints the
+            // same colour during-scan and post-scan, regardless of
+            // its rank shifting as more events arrive.
+            let _ = idx;
+            let base = treemap::path_color(&g.top_name);
             let scanning = g.own_size.is_none();
 
             // Vertical gradient: lighter at top, base at bottom.  Painted

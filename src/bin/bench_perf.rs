@@ -63,7 +63,7 @@ fn bench_startup() {
             bulk_scan_fallback_count: AtomicU64::new(0),
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
-        completed_subtrees: std::sync::Mutex::new(Vec::new()),
+            completed_subtrees: std::sync::Mutex::new(Vec::new()),
         });
 
         let elapsed = start.elapsed();

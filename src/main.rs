@@ -96,12 +96,9 @@ fn paint_gradient_rect(
     base: egui::Color32,
     radius: f32,
 ) {
-    let lift = |c: u8, by: f32| -> u8 {
-        ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8
-    };
-    let dim = |c: u8, by: f32| -> u8 {
-        ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8
-    };
+    let lift =
+        |c: u8, by: f32| -> u8 { ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8 };
+    let dim = |c: u8, by: f32| -> u8 { ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8 };
     let top = egui::Color32::from_rgb(
         lift(base.r(), 0.18),
         lift(base.g(), 0.18),
@@ -810,10 +807,8 @@ impl App {
         let cycle = 1.6_f32; // seconds for one full sweep
         let phase = ((t / cycle).fract() * std::f32::consts::TAU).sin() * 0.5 + 0.5;
         let x_min = rect.min.x + (track_w - seg_w) * phase;
-        let seg_rect = egui::Rect::from_min_size(
-            egui::pos2(x_min, rect.min.y),
-            egui::vec2(seg_w, bar_height),
-        );
+        let seg_rect =
+            egui::Rect::from_min_size(egui::pos2(x_min, rect.min.y), egui::vec2(seg_w, bar_height));
         painter.rect_filled(seg_rect, bar_height / 2.0, ui.visuals().selection.bg_fill);
 
         ui.add_space(6.0);
@@ -915,9 +910,9 @@ impl App {
             let mut groups: Vec<ScanGroup> = by_top.into_values().collect();
             for g in &mut groups {
                 g.descendants.sort_unstable_by(|a, b| {
-                    b.size.cmp(&a.size).then_with(|| {
-                        a.path.as_os_str().len().cmp(&b.path.as_os_str().len())
-                    })
+                    b.size
+                        .cmp(&a.size)
+                        .then_with(|| a.path.as_os_str().len().cmp(&b.path.as_os_str().len()))
                 });
                 let mut kept: Vec<scanner::CompletedSubtree> =
                     Vec::with_capacity(g.descendants.len().min(12));
@@ -936,7 +931,7 @@ impl App {
                 g.descendants = kept;
                 g.running_total = g.own_size.unwrap_or(0).max(descendants_sum);
             }
-            groups.sort_unstable_by(|a, b| b.running_total.cmp(&a.running_total));
+            groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.running_total));
 
             // Build flat finalised set for O(1) shimmer-or-not.
             let finalised: std::collections::HashSet<PathBuf> =
@@ -972,8 +967,7 @@ impl App {
                 if nest_max == 0 || g.descendants.is_empty() {
                     continue;
                 }
-                let nested_top =
-                    &g.descendants[..g.descendants.len().min(nest_max)];
+                let nested_top = &g.descendants[..g.descendants.len().min(nest_max)];
                 let nest_rect = egui::Rect::from_min_max(
                     egui::pos2(inset.min.x + 4.0, inset.min.y + label_h),
                     egui::pos2(inset.max.x - 4.0, inset.max.y - 4.0),
@@ -981,8 +975,7 @@ impl App {
                 if nest_rect.width() < 30.0 || nest_rect.height() < 30.0 {
                     continue;
                 }
-                let nsizes: Vec<f64> =
-                    nested_top.iter().map(|d| d.size.max(1) as f64).collect();
+                let nsizes: Vec<f64> = nested_top.iter().map(|d| d.size.max(1) as f64).collect();
                 let nrects = treemap::squarify(
                     &nsizes,
                     nest_rect.min.x,
@@ -1177,8 +1170,7 @@ impl App {
                             // nested ≥95 % of the parent's size (the
                             // header band already shows the same
                             // number).
-                            let near_full = d.size as f64
-                                >= g.running_total as f64 * 0.95;
+                            let near_full = d.size as f64 >= g.running_total as f64 * 0.95;
                             if inner.height() > 36.0 && !near_full {
                                 let size_str = treemap::fmt_size_compact(d.size);
                                 if let Some(g_sz) = fit_text(
@@ -1187,8 +1179,7 @@ impl App {
                                     egui::FontId::monospace(11.0),
                                     avail_w,
                                 ) {
-                                    let pos = inner.left_bottom()
-                                        + egui::vec2(4.0, -16.0);
+                                    let pos = inner.left_bottom() + egui::vec2(4.0, -16.0);
                                     painter.galley(
                                         pos,
                                         g_sz,
@@ -1219,11 +1210,11 @@ impl App {
                         resp.context_menu(|ui| {
                             if ui.button("Open in Finder").clicked() {
                                 clicked_open = Some(path_for_menu.clone());
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.button("Move to Trash").clicked() {
                                 clicked_trash = Some(path_for_menu.clone());
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -1240,21 +1231,20 @@ impl App {
             // readable over nested children's tile colors.  Drawn last
             // so it sits above nested tiles.
             let header_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
-            let header_rect = egui::Rect::from_min_size(
-                inset.min,
-                egui::vec2(inset.width(), header_h),
-            );
+            let header_rect =
+                egui::Rect::from_min_size(inset.min, egui::vec2(inset.width(), header_h));
             if draw_header {
                 // Slightly darker, opaque-ish band of the base color.
                 let band = base.linear_multiply(0.55);
                 painter.rect_filled(
                     header_rect,
                     egui::CornerRadius {
-                        nw: 4, ne: 4, sw: 0, se: 0,
+                        nw: 4,
+                        ne: 4,
+                        sw: 0,
+                        se: 0,
                     },
-                    egui::Color32::from_rgba_unmultiplied(
-                        band.r(), band.g(), band.b(), 230,
-                    ),
+                    egui::Color32::from_rgba_unmultiplied(band.r(), band.g(), band.b(), 230),
                 );
 
                 // ── Header text: measure both labels first, decide
@@ -1341,11 +1331,11 @@ impl App {
             resp.context_menu(|ui| {
                 if ui.button("Open in Finder").clicked() {
                     clicked_open = Some(path_for_menu.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Move to Trash").clicked() {
                     clicked_trash = Some(path_for_menu.clone());
-                    ui.close_menu();
+                    ui.close();
                 }
             });
         }
@@ -1683,8 +1673,10 @@ impl eframe::App for App {
         }
 
         // ── In-scan screenshot one-shot ──
-        if let Some(out) = self.screenshot_scanning_out.clone() {
-            if self.scanning {
+        if let Some(out) = self.screenshot_scanning_out.clone()
+            && self.scanning
+        {
+            {
                 if self.screenshot_scanning_armed_at.is_none() {
                     self.screenshot_scanning_armed_at = Some(Instant::now());
                     ctx.request_repaint_after(Duration::from_millis(100));
@@ -1699,12 +1691,10 @@ impl eframe::App for App {
                     // Save will happen below when the event arrives.
                     let out_path = out.clone();
                     let got = ctx.input(|i| {
-                        i.events
-                            .iter()
-                            .find_map(|e| match e {
-                                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                                _ => None,
-                            })
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                            _ => None,
+                        })
                     });
                     if let Some(image) = got {
                         let _ = save_screenshot_png(&image, out_path.to_string_lossy().as_ref());
@@ -2185,8 +2175,7 @@ impl eframe::App for App {
                             }
                             // Recompute stats
                             if let Some(ref tree) = self.tree {
-                                self.category_stats =
-                                    Some(categories::compute_stats(tree));
+                                self.category_stats = Some(categories::compute_stats(tree));
                             }
                         }
 

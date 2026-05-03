@@ -349,13 +349,13 @@ pub fn walk_dir_bulk(
     // Stream "subtree complete" event to the UI for live display of
     // the biggest items found so far.  Only big-enough subtrees go in,
     // to keep the lock-protected vector small.
-    if size >= super::SUBTREE_REPORT_MIN_BYTES {
-        if let Ok(mut completed) = progress.completed_subtrees.lock() {
-            completed.push(super::CompletedSubtree {
-                path: dir.to_path_buf(),
-                size,
-            });
-        }
+    if size >= super::SUBTREE_REPORT_MIN_BYTES
+        && let Ok(mut completed) = progress.completed_subtrees.lock()
+    {
+        completed.push(super::CompletedSubtree {
+            path: dir.to_path_buf(),
+            size,
+        });
     }
 
     FileNode::Dir(Box::new(DirNode {

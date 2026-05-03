@@ -335,8 +335,7 @@ pub fn build_treemap_cache(
     };
 
     let view_size = view_node.size();
-    let view_size_label: Box<str> =
-        format!("  ({})", fmt_size_compact(view_size)).into();
+    let view_size_label: Box<str> = format!("  ({})", fmt_size_compact(view_size)).into();
 
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
     let cached_breadcrumbs = zoom_path
@@ -921,7 +920,12 @@ pub fn fit_path(
             return Some(g);
         }
     }
-    fit_text(painter, parts.last().copied().unwrap_or(path), font_id, max_w)
+    fit_text(
+        painter,
+        parts.last().copied().unwrap_or(path),
+        font_id,
+        max_w,
+    )
 }
 
 /// Format `bytes` into a short label suitable for cramped treemap
@@ -963,14 +967,14 @@ pub fn fmt_size_compact(bytes: u64) -> String {
 /// palette used by the live-scan treemap.  Largest = index 0.
 pub fn scan_rank_palette(idx: usize) -> egui::Color32 {
     const PALETTE: [egui::Color32; 8] = [
-        egui::Color32::from_rgb(58, 93, 139),  // blue
-        egui::Color32::from_rgb(42, 109, 77),  // green
-        egui::Color32::from_rgb(122, 74, 48),  // brown
-        egui::Color32::from_rgb(74, 58, 107),  // purple
-        egui::Color32::from_rgb(90, 74, 58),   // tan
-        egui::Color32::from_rgb(48, 90, 100),  // teal
-        egui::Color32::from_rgb(110, 60, 90),  // mauve
-        egui::Color32::from_rgb(86, 86, 56),   // olive
+        egui::Color32::from_rgb(58, 93, 139), // blue
+        egui::Color32::from_rgb(42, 109, 77), // green
+        egui::Color32::from_rgb(122, 74, 48), // brown
+        egui::Color32::from_rgb(74, 58, 107), // purple
+        egui::Color32::from_rgb(90, 74, 58),  // tan
+        egui::Color32::from_rgb(48, 90, 100), // teal
+        egui::Color32::from_rgb(110, 60, 90), // mauve
+        egui::Color32::from_rgb(86, 86, 56),  // olive
     ];
     PALETTE[idx % PALETTE.len()]
 }
@@ -993,12 +997,9 @@ fn paint_gradient_rect(
     base: egui::Color32,
     radius: f32,
 ) {
-    let lift = |c: u8, by: f32| -> u8 {
-        ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8
-    };
-    let dim = |c: u8, by: f32| -> u8 {
-        ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8
-    };
+    let lift =
+        |c: u8, by: f32| -> u8 { ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8 };
+    let dim = |c: u8, by: f32| -> u8 { ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8 };
     let top = egui::Color32::from_rgba_unmultiplied(
         lift(base.r(), 0.18),
         lift(base.g(), 0.18),
@@ -1059,7 +1060,11 @@ fn paint_cached_leaf(
     // backdropping the band, but applying it anyway keeps every tile
     // in the treemap visually consistent — the eye reads a tile as
     // "header on top + body below" regardless of dir vs file.
-    let header_h = if tile.rect.height() > 80.0 { 28.0 } else { 22.0 };
+    let header_h = if tile.rect.height() > 80.0 {
+        28.0
+    } else {
+        22.0
+    };
     let header_rect =
         egui::Rect::from_min_size(tile.rect.min, egui::vec2(tile.rect.width(), header_h));
     let body = apply_alpha(tile.color, alpha);
@@ -1072,19 +1077,19 @@ fn paint_cached_leaf(
     );
     painter.rect_filled(
         header_rect,
-        egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 },
+        egui::CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
         band,
     );
 
     let header_pad = 8.0_f32;
     let avail = (tile.rect.width() - header_pad * 2.0).max(0.0);
     let size_str = fmt_size_compact(tile.size);
-    let size_g = fit_text(
-        painter,
-        &size_str,
-        egui::FontId::proportional(12.0),
-        avail,
-    );
+    let size_g = fit_text(painter, &size_str, egui::FontId::proportional(12.0), avail);
     let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
     let name_avail = (avail - size_w).max(0.0);
     let name_g = fit_text(
@@ -1095,10 +1100,7 @@ fn paint_cached_leaf(
     );
     let mid_y = header_rect.center().y;
     if let Some(ng) = name_g {
-        let pos = egui::pos2(
-            header_rect.min.x + header_pad,
-            mid_y - ng.size().y * 0.5,
-        );
+        let pos = egui::pos2(header_rect.min.x + header_pad, mid_y - ng.size().y * 0.5);
         painter.galley(pos, ng, egui::Color32::WHITE);
     }
     if let Some(sg) = size_g {
@@ -1150,17 +1152,8 @@ fn paint_other_bucket(
     }
     if rect.height() > 36.0 {
         let size_str = fmt_size_compact(other.size);
-        if let Some(g) = fit_text(
-            painter,
-            &size_str,
-            egui::FontId::monospace(11.0),
-            avail_w,
-        ) {
-            painter.galley(
-                inner.left_bottom() + egui::vec2(0.0, -14.0),
-                g,
-                text_color,
-            );
+        if let Some(g) = fit_text(painter, &size_str, egui::FontId::monospace(11.0), avail_w) {
+            painter.galley(inner.left_bottom() + egui::vec2(0.0, -14.0), g, text_color);
         }
     }
 }
@@ -1205,10 +1198,7 @@ fn paint_cached_directory(
         tile_painter.rect_stroke(
             cr,
             1.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60),
-            ),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60)),
             egui::epaint::StrokeKind::Inside,
         );
 
@@ -1242,8 +1232,7 @@ fn paint_cached_directory(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| nested.path.display().to_string())
                 });
-            let text_color =
-                apply_alpha(text_color_for_bg(nested.color), alpha * 0.95);
+            let text_color = apply_alpha(text_color_for_bg(nested.color), alpha * 0.95);
             // Name top-left.
             if let Some(g) = fit_path(
                 &tile_painter,
@@ -1299,19 +1288,19 @@ fn paint_cached_directory(
     );
     painter.rect_filled(
         header_rect,
-        egui::CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 },
+        egui::CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
         band_color,
     );
 
     let header_pad = 8.0;
     let avail = (rect.width() - header_pad * 2.0).max(0.0);
     let size_str = fmt_size_compact(tile.size);
-    let size_g = fit_text(
-        painter,
-        &size_str,
-        egui::FontId::proportional(12.0),
-        avail,
-    );
+    let size_g = fit_text(painter, &size_str, egui::FontId::proportional(12.0), avail);
     let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
     let name_avail = (avail - size_w).max(0.0);
     let name_g = fit_text(
@@ -1322,10 +1311,7 @@ fn paint_cached_directory(
     );
     let mid_y = header_rect.center().y;
     if let Some(ng) = name_g {
-        let pos = egui::pos2(
-            header_rect.min.x + header_pad,
-            mid_y - ng.size().y * 0.5,
-        );
+        let pos = egui::pos2(header_rect.min.x + header_pad, mid_y - ng.size().y * 0.5);
         painter.galley(pos, ng, egui::Color32::WHITE);
     }
     if let Some(sg) = size_g {
@@ -1898,14 +1884,9 @@ mod tests {
         // should be palette[0], palette[1], palette[2].
         let tree = dir(
             "root",
-            vec![
-                leaf("a.bin", 300),
-                leaf("b.bin", 200),
-                leaf("c.bin", 100),
-            ],
+            vec![leaf("a.bin", 300), leaf("b.bin", 200), leaf("c.bin", 100)],
         );
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
         let cache = build_treemap_cache(&tree, &None, None, true, rect);
         // tiles preserve insertion order from the children iter, which
         // is by the original FileNode order.  The squarify input was
@@ -1927,12 +1908,8 @@ mod tests {
         // returns a single dark grey for every directory, so a
         // zoomed-in dir-of-dirs would otherwise read as identical
         // tiles.
-        let tree = dir(
-            "root",
-            vec![dir("sub", vec![leaf("video.mp4", 300)])],
-        );
-        let rect =
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let tree = dir("root", vec![dir("sub", vec![leaf("video.mp4", 300)])]);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
         let zoomed = Some(std::path::PathBuf::from("root/sub"));
         let cache = build_treemap_cache(&tree, &zoomed, None, true, rect);
         assert_eq!(cache.tiles.len(), 1);

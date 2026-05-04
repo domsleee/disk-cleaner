@@ -305,6 +305,34 @@ fn bench_real_click_rebuild(c: &mut Criterion) {
             b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect))
         });
     }
+
+    // Drill into the biggest subtree several levels deep — simulates
+    // a power-user clicking through a chain of directories.
+    let mut deep = target.clone();
+    let mut depth = 0;
+    let mut node = &tree;
+    while let Some(child) = node
+        .children()
+        .iter()
+        .max_by_key(|c| if c.is_dir() { c.size() } else { 0 })
+    {
+        if !child.is_dir() {
+            break;
+        }
+        deep.push(child.name());
+        node = child;
+        depth += 1;
+        if depth > 12 {
+            break;
+        }
+        let p = Some(deep.clone());
+        group.bench_with_input(
+            BenchmarkId::new(format!("zoom_depth{depth}"), n),
+            &tree,
+            |b, t| b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect)),
+        );
+    }
+
     group.finish();
 }
 

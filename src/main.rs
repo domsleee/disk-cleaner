@@ -328,11 +328,25 @@ fn main() -> eframe::Result {
     let mut i = 0;
     let mut screenshot_scanning_out: Option<PathBuf> = None;
     let mut screenshot_scanning_multi: Option<(String, Vec<u64>)> = None;
+    let mut bench_zoom: Option<String> = None;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
+            }
+            "--bench-zoom" => {
+                // After the initial scan completes, switch to treemap
+                // mode and zoom into the named top-level child.
+                // Records the elapsed time of the next ~10 update()
+                // frames after the click, then exits.  Used to measure
+                // "click into a folder" lag from the command line.
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --bench-zoom requires a child name");
+                    std::process::exit(1);
+                }
+                bench_zoom = Some(args[i].clone());
             }
             "--screenshot" => {
                 i += 1;
@@ -439,6 +453,10 @@ fn main() -> eframe::Result {
                 screenshot_scanning_armed_at: None,
                 screenshot_scanning_multi: screenshot_scanning_multi.clone(),
                 screenshot_scanning_multi_taken: 0,
+                bench_zoom_target: bench_zoom.clone(),
+                bench_zoom_armed: false,
+                bench_zoom_clicked_at: None,
+                bench_zoom_frames_left: 0,
                 ..Default::default()
             };
             if app.screenshot_prefix.is_some() {
@@ -556,6 +574,12 @@ struct App {
     screenshot_scanning_multi: Option<(String, Vec<u64>)>,
     /// How many of the multi-shot frames have been captured + saved.
     screenshot_scanning_multi_taken: usize,
+    /// Click-lag bench mode: after scan, switch to treemap and zoom
+    /// into this top-level child name.  Measures next-frame timings.
+    bench_zoom_target: Option<String>,
+    bench_zoom_armed: bool,
+    bench_zoom_clicked_at: Option<Instant>,
+    bench_zoom_frames_left: u8,
     /// Live scan-treemap layout: per-path target rect (recomputed every
     /// 250 ms) and current rendered rect (lerped toward target each
     /// frame).  Empty when not scanning.  See render_scanning_panel.
@@ -657,6 +681,10 @@ impl Default for App {
             screenshot_scanning_armed_at: None,
             screenshot_scanning_multi: None,
             screenshot_scanning_multi_taken: 0,
+            bench_zoom_target: None,
+            bench_zoom_armed: false,
+            bench_zoom_clicked_at: None,
+            bench_zoom_frames_left: 0,
             scan_tm_targets: std::collections::HashMap::new(),
             scan_tm_current: std::collections::HashMap::new(),
             scan_tm_last_layout: None,
@@ -1795,6 +1823,90 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // ── Click-lag bench: simulate a click ──
+        // If target is "DEEP" or "deep" walk biggest-child chain to depth N.
+        // Otherwise zoom to a single named top-level child.
+        if let Some(target_name) = self.bench_zoom_target.clone()
+            && let Some(tree) = self.tree.as_ref()
+            && !self.bench_zoom_armed
+            && !self.scanning
+        {
+            let tree_mode = target_name.starts_with("tree:");
+            let resolved_name = target_name.strip_prefix("tree:").unwrap_or(&target_name);
+            let target = if resolved_name.eq_ignore_ascii_case("deep") {
+                let mut p = std::path::PathBuf::from(tree.name());
+                let mut node = tree;
+                for _ in 0..6 {
+                    let Some(child) = node
+                        .children()
+                        .iter()
+                        .max_by_key(|c| if c.is_dir() { c.size() } else { 0 })
+                    else {
+                        break;
+                    };
+                    if !child.is_dir() {
+                        break;
+                    }
+                    p.push(child.name());
+                    node = child;
+                }
+                Some(p)
+            } else {
+                tree.children()
+                    .iter()
+                    .find(|c| c.name() == resolved_name)
+                    .map(|c| std::path::PathBuf::from(tree.name()).join(c.name()))
+            };
+            if let Some(p) = target {
+                let click_t = Instant::now();
+                if tree_mode {
+                    // Simulate clicking the disclosure arrow on a tree
+                    // row — toggles expand and marks rows dirty.
+                    self.view_mode = ViewMode::Tree;
+                    if let Some(t) = self.tree.as_mut() {
+                        ui::toggle_expand(t, &p);
+                    }
+                    self.rows_dirty = true;
+                    eprintln!("[bench-zoom] tree-toggle on {}", p.display());
+                } else {
+                    self.view_mode = ViewMode::Treemap;
+                    self.treemap_zoom = Some(p.clone());
+                    self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
+                    self.treemap_dirty = true;
+                    eprintln!("[bench-zoom] zoom into {}", p.display());
+                }
+                self.bench_zoom_clicked_at = Some(click_t);
+                self.bench_zoom_frames_left = 12;
+                self.bench_zoom_armed = true;
+            } else {
+                eprintln!(
+                    "[bench-zoom] no top-level child named '{}'; available:",
+                    target_name
+                );
+                for c in tree.children().iter().take(20) {
+                    eprintln!("  - {}", c.name());
+                }
+                std::process::exit(2);
+            }
+        }
+        if self.bench_zoom_armed && self.bench_zoom_frames_left > 0 {
+            let n = 12 - self.bench_zoom_frames_left;
+            let total = self
+                .bench_zoom_clicked_at
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let frame_dt = frame_start.elapsed();
+            eprintln!(
+                "[bench-zoom] frame {} dt={:?} total={:?}",
+                n, frame_dt, total
+            );
+            self.bench_zoom_frames_left -= 1;
+            ctx.request_repaint(); // force next frame so we measure
+            if self.bench_zoom_frames_left == 0 {
+                std::process::exit(0);
+            }
+        }
+
         // ── Screenshot state machine ──
         if self.screenshot_prefix.is_some() {
             // Handle incoming screenshot events
@@ -2813,6 +2925,24 @@ impl eframe::App for App {
         // Record frame time while scanning (only when debug output is enabled)
         if self.scanning && debug_enabled() {
             self.scan_frame_times.push(frame_start.elapsed());
+        }
+
+        // Per-frame profile: print frames slower than 8 ms (i.e. would
+        // miss 120 fps).  Gated on DISK_CLEANER_PROFILE so it doesn't
+        // spam in normal use.  Very useful for diagnosing click-lag.
+        if std::env::var_os("DISK_CLEANER_PROFILE").is_some() {
+            let dt = frame_start.elapsed();
+            if dt > std::time::Duration::from_millis(8) {
+                let mode = if self.scanning {
+                    "scan"
+                } else {
+                    match self.view_mode {
+                        ViewMode::Tree => "tree",
+                        ViewMode::Treemap => "treemap",
+                    }
+                };
+                eprintln!("[frame] {} {:?}", mode, dt);
+            }
         }
     }
 }

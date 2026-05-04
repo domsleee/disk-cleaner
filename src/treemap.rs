@@ -200,70 +200,64 @@ fn squarify_impl(
 // ─── Tree navigation helpers ────────────────────────────────────
 
 /// Find a node by path in the file tree.
+///
+/// Walks `target`'s path components from the root, doing a sibling
+/// scan at each level — O(depth × avg_siblings) instead of O(N) full
+/// tree walk.  For a 700 k-node tree the old version took ~20 ms when
+/// the target wasn't the first child of root (find_node would
+/// recursively descend every child until it found a match); this one
+/// finishes in microseconds regardless of where the target is.
 pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    let mut buf = PathBuf::from(node.name());
-    find_node_inner(node, target, &mut buf)
-}
-
-fn find_node_inner<'a>(
-    node: &'a FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-) -> Option<&'a FileNode> {
-    if buf.as_path() == target {
+    let root_path = Path::new(node.name());
+    if target == root_path {
         return Some(node);
     }
-    for child in node.children() {
-        buf.push(child.name());
-        if let Some(found) = find_node_inner(child, target, buf) {
-            buf.pop();
-            return Some(found);
-        }
-        buf.pop();
+    let rel = target.strip_prefix(root_path).ok()?;
+    let mut current = node;
+    for component in rel.components() {
+        let comp_str = component.as_os_str();
+        let child = current
+            .children()
+            .iter()
+            .find(|c| std::ffi::OsStr::new(c.name()) == comp_str)?;
+        current = child;
     }
-    None
+    Some(current)
 }
 
 /// Build breadcrumb trail from root to `target`.
+///
+/// Same O(depth × siblings) sibling-scan as `find_node` — was an
+/// O(N) full-tree walk before (`breadcrumbs_walk` recursed into every
+/// branch until it found the target).  For deep zoom paths in big
+/// trees this was the second source of click lag.
 pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
     let root_path = PathBuf::from(root.name());
     let mut trail = vec![(root.name().to_string(), root_path.clone())];
     if root_path.as_path() == target {
         return trail;
     }
-    let mut buf = root_path;
-    if breadcrumbs_walk(root, target, &mut buf, &mut trail) {
-        trail
-    } else {
-        vec![(root.name().to_string(), PathBuf::from(root.name()))]
+    let rel = match target.strip_prefix(&root_path) {
+        Ok(r) => r,
+        Err(_) => return vec![(root.name().to_string(), root_path)],
+    };
+    let mut current = root;
+    let mut acc = root_path;
+    for component in rel.components() {
+        let comp_str = component.as_os_str();
+        let Some(child) = current
+            .children()
+            .iter()
+            .find(|c| std::ffi::OsStr::new(c.name()) == comp_str)
+        else {
+            // Path went off the tree — fall back to root-only trail.
+            return vec![(root.name().to_string(), PathBuf::from(root.name()))];
+        };
+        acc.push(child.name());
+        trail.push((child.name().to_string(), acc.clone()));
+        current = child;
     }
-}
-
-fn breadcrumbs_walk(
-    node: &FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-    trail: &mut Vec<(String, PathBuf)>,
-) -> bool {
-    for child in node.children() {
-        buf.push(child.name());
-        let child_path = buf.clone();
-        if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
-            buf.pop();
-            return true;
-        }
-        if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
-                buf.pop();
-                return true;
-            }
-            trail.pop();
-        }
-        buf.pop();
-    }
-    false
+    trail
 }
 
 // ─── Cached treemap layout ─────────────────────────────────────
@@ -325,6 +319,8 @@ pub fn build_treemap_cache(
     let root_path = PathBuf::from(root.name());
 
     // Resolve the node we're viewing and its full path
+    let prof = std::env::var("DISK_CLEANER_PROFILE").is_ok();
+    let t_find = std::time::Instant::now();
     let (view_node, view_path) = if let Some(zp) = zoom_path {
         match find_node(root, zp) {
             Some(n) => (n, zp.clone()),
@@ -333,15 +329,22 @@ pub fn build_treemap_cache(
     } else {
         (root, root_path.clone())
     };
+    if prof {
+        eprintln!("[treemap]   find_node:    {:?}", t_find.elapsed());
+    }
 
     let view_size = view_node.size();
     let view_size_label: Box<str> = format!("  ({})", fmt_size_compact(view_size)).into();
 
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
+    let t_bc = std::time::Instant::now();
     let cached_breadcrumbs = zoom_path
         .as_ref()
         .map(|p| breadcrumbs(root, p))
         .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
+    if prof {
+        eprintln!("[treemap]   breadcrumbs:  {:?}", t_bc.elapsed());
+    }
 
     // Empty directory — return empty cache
     if view_node.children().is_empty() {
@@ -422,6 +425,7 @@ pub fn build_treemap_cache(
     if has_other {
         sizes.push(other_size as f64);
     }
+    let t_sq = std::time::Instant::now();
     let rects = squarify(
         &sizes,
         full_rect.min.x,
@@ -429,8 +433,16 @@ pub fn build_treemap_cache(
         full_rect.width(),
         full_rect.height(),
     );
+    if prof {
+        eprintln!(
+            "[treemap]   squarify-top: {:?} ({} sizes)",
+            t_sq.elapsed(),
+            sizes.len()
+        );
+    }
 
     // Build tiles for real children, tracking global nested budget
+    let t_tiles = std::time::Instant::now();
     let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
     // Every level uses the rank palette by rank-in-parent-by-size.
@@ -487,6 +499,15 @@ pub fn build_treemap_cache(
             child_count,
             nested,
         });
+    }
+    if prof {
+        let total_nested: usize = tiles.iter().map(|t| t.nested.len()).sum();
+        eprintln!(
+            "[treemap]   tiles+nest:   {:?} ({} tiles, {} total nested)",
+            t_tiles.elapsed(),
+            tiles.len(),
+            total_nested
+        );
     }
 
     // Build Other bucket if needed
@@ -706,6 +727,7 @@ pub fn render_treemap(
                 || (c.layout_size.1 - full_rect.height()).abs() > 1.0
         });
     if needs_rebuild {
+        let t0 = std::time::Instant::now();
         *cache = Some(build_treemap_cache(
             root,
             zoom_path,
@@ -713,6 +735,25 @@ pub fn render_treemap(
             show_hidden,
             full_rect,
         ));
+        let dt = t0.elapsed();
+        if std::env::var("DISK_CLEANER_PROFILE").is_ok() {
+            let zoom_str = zoom_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<root>".to_string());
+            let n_tiles = cache.as_ref().unwrap().tiles.len();
+            let n_nested: usize = cache
+                .as_ref()
+                .unwrap()
+                .tiles
+                .iter()
+                .map(|t| t.nested.len())
+                .sum();
+            eprintln!(
+                "[treemap] rebuild: {:?} for zoom={} ({} tiles, {} nested)",
+                dt, zoom_str, n_tiles, n_nested
+            );
+        }
         *cache_dirty = false;
     }
     let cache = cache.as_ref().unwrap();

@@ -538,13 +538,19 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let targets = paths.iter().flat_map(|p| self.deletion_targets(p)).collect();
+        let targets = paths
+            .iter()
+            .flat_map(|p| self.deletion_targets(p))
+            .collect();
         self.deleter.start(targets, true);
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let targets = paths.iter().flat_map(|p| self.deletion_targets(p)).collect();
+        let targets = paths
+            .iter()
+            .flat_map(|p| self.deletion_targets(p))
+            .collect();
         self.deleter.start(targets, false);
     }
 
@@ -554,14 +560,7 @@ impl App {
     /// does not exist on disk. Those expand to the loose files in `<dir>`. Every
     /// other path maps to itself.
     fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
-        if is_file_group_row(path) {
-            match (path.parent(), self.tree.as_ref()) {
-                (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, self.show_hidden),
-                _ => Vec::new(),
-            }
-        } else {
-            vec![path.to_path_buf()]
-        }
+        resolve_deletion_targets(self.tree.as_ref(), path, self.show_hidden)
     }
 
     /// Poll for background deletion completion and apply results to the tree.
@@ -599,7 +598,34 @@ impl App {
 /// be named `__file_group__` is excluded — otherwise deleting it would expand
 /// to its loose siblings and wipe them instead of the selected item.
 fn is_file_group_row(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n == "__file_group__") && path.symlink_metadata().is_err()
+    // Only a genuine "does not exist" (NotFound) means synthetic. A stat that
+    // fails for another reason — e.g. EACCES on an unreadable parent — is a
+    // real entry we simply can't read, and must NOT be expanded to siblings.
+    path.file_name().is_some_and(|n| n == "__file_group__")
+        && matches!(
+            path.symlink_metadata(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
+/// Expand a tree-row path into the real filesystem paths a delete should touch.
+///
+/// A synthetic file-group row expands to the loose files in its parent dir;
+/// every other path (including a real entry that happens to be named
+/// `__file_group__`) maps to itself, so deleting it never touches siblings.
+fn resolve_deletion_targets(
+    tree: Option<&FileNode>,
+    path: &Path,
+    show_hidden: bool,
+) -> Vec<PathBuf> {
+    if is_file_group_row(path) {
+        match (path.parent(), tree) {
+            (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, show_hidden),
+            _ => Vec::new(),
+        }
+    } else {
+        vec![path.to_path_buf()]
+    }
 }
 
 fn save_screenshot_png(
@@ -1853,7 +1879,23 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{DirNode, leaf};
     use tempfile::TempDir;
+
+    /// Build a directory node named `name` (an absolute path in resolution
+    /// tests) holding `children`.
+    fn dir_named(name: &str, children: Vec<FileNode>) -> FileNode {
+        let size = children.iter().map(|c| c.size()).sum();
+        FileNode::Dir(Box::new(DirNode {
+            name: name.into(),
+            size,
+            children,
+            expanded: true,
+            hidden: false,
+        }))
+    }
+
+    // --- is_file_group_row: identity of a row path ---
 
     #[test]
     fn synthetic_group_path_is_a_group_row() {
@@ -1877,5 +1919,96 @@ mod tests {
     #[test]
     fn ordinary_path_is_not_a_group_row() {
         assert!(!is_file_group_row(Path::new("/no/such/file.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_file_under_unreadable_dir_is_not_a_group_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let f = locked.join("__file_group__");
+        std::fs::write(&f, b"x").unwrap();
+        // Strip all perms so symlink_metadata(f) fails with EACCES, not NotFound.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = is_file_group_row(&f);
+
+        // Restore perms so TempDir cleanup succeeds.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A real file must never be read as synthetic just because we can't
+        // stat it. (No-op when tests run as root and the chmod is ignored.)
+        assert!(
+            !result,
+            "EACCES on a real __file_group__ file must not be read as a synthetic group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_named_group_is_not_a_group_row() {
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("__file_group__");
+        std::os::unix::fs::symlink(tmp.path().join("missing-target"), &link).unwrap();
+        // lstat sees the link itself (Ok), so it is a real entry to delete,
+        // not a synthetic group. (path.exists() would wrongly return false here.)
+        assert!(!is_file_group_row(&link));
+    }
+
+    // --- resolve_deletion_targets: path → real files to delete ---
+
+    #[test]
+    fn resolve_synthetic_group_expands_to_loose_files() {
+        // The group path is NOT created on disk → synthetic → expands to the
+        // directory's loose files in tree order.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        let group = tmp.path().join("__file_group__");
+
+        let got = resolve_deletion_targets(Some(&tree), &group, true);
+
+        assert_eq!(
+            got,
+            vec![tmp.path().join("a.txt"), tmp.path().join("b.txt")]
+        );
+    }
+
+    #[test]
+    fn resolve_real_file_named_group_deletes_only_itself() {
+        // A real file literally named __file_group__ next to loose siblings.
+        // Deleting it must remove ONLY that file, never expand to siblings.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("__file_group__"), b"x").unwrap();
+        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("__file_group__", 1)]);
+        let target = tmp.path().join("__file_group__");
+
+        let got = resolve_deletion_targets(Some(&tree), &target, true);
+
+        assert_eq!(got, vec![target]);
+    }
+
+    #[test]
+    fn resolve_ordinary_file_maps_to_itself() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        let target = tmp.path().join("a.txt");
+
+        assert_eq!(
+            resolve_deletion_targets(Some(&tree), &target, true),
+            vec![target]
+        );
+    }
+
+    #[test]
+    fn resolve_group_without_tree_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let group = tmp.path().join("__file_group__");
+        // No tree loaded → nothing to expand → no-op delete.
+        assert!(resolve_deletion_targets(None, &group, true).is_empty());
     }
 }

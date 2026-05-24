@@ -1075,7 +1075,10 @@ mod tests {
         // Included when show_hidden is on.
         assert_eq!(
             file_group_files(&tree, Path::new("root"), true),
-            vec![PathBuf::from("root/a.txt"), PathBuf::from("root/hidden.dat")]
+            vec![
+                PathBuf::from("root/a.txt"),
+                PathBuf::from("root/hidden.dat")
+            ]
         );
     }
 
@@ -1083,6 +1086,44 @@ mod tests {
     fn file_group_files_empty_for_missing_dir() {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
         assert!(file_group_files(&tree, Path::new("root/nope"), true).is_empty());
+    }
+
+    #[test]
+    fn file_group_files_resolves_a_nested_dir() {
+        // A group living in a subdirectory resolves against that dir, not root.
+        let tree = dir(
+            "root",
+            vec![dir("sub", vec![leaf("x.txt", 1), leaf("y.txt", 2)])],
+        );
+        assert_eq!(
+            file_group_files(&tree, Path::new("root/sub"), true),
+            vec![
+                PathBuf::from("root/sub/x.txt"),
+                PathBuf::from("root/sub/y.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn file_group_files_empty_when_dir_has_no_loose_files() {
+        // Only subdirectories, no loose files → nothing to delete.
+        let tree = dir("root", vec![dir("sub", vec![leaf("x.txt", 1)])]);
+        assert!(file_group_files(&tree, Path::new("root"), true).is_empty());
+    }
+
+    #[test]
+    fn file_group_files_includes_a_real_file_named_group_marker() {
+        // If a loose file is literally named __file_group__, it is part of the
+        // group like any other loose file (path-level disambiguation happens in
+        // resolve_deletion_targets, not here).
+        let tree = dir("root", vec![leaf("a.txt", 10), leaf("__file_group__", 1)]);
+        assert_eq!(
+            file_group_files(&tree, Path::new("root"), true),
+            vec![
+                PathBuf::from("root/a.txt"),
+                PathBuf::from("root/__file_group__")
+            ]
+        );
     }
 
     #[test]

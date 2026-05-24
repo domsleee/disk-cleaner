@@ -323,7 +323,7 @@ fn collect_cached_rows_inner(
         let files: Vec<_> = node
             .children()
             .iter()
-            .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
+            .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
             .collect();
         let should_group_files =
             files.len() >= FILE_GROUP_THRESHOLD && filter.is_empty() && category_filter.is_none();
@@ -865,7 +865,7 @@ pub fn file_group_files(root: &FileNode, dir: &Path, show_hidden: bool) -> Vec<P
     };
     node.children()
         .iter()
-        .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
+        .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
         .map(|c| dir.join(c.name()))
         .collect()
 }
@@ -1051,6 +1051,31 @@ mod tests {
         assert_eq!(
             all,
             vec![PathBuf::from("root/a.txt"), PathBuf::from("root/.secret")]
+        );
+    }
+
+    #[test]
+    fn file_group_files_excludes_os_hidden_non_dotfiles() {
+        use crate::tree::{DirNode, FileLeaf};
+        // A file with no leading dot but the OS hidden flag set.
+        let hidden = FileNode::File(FileLeaf::new("hidden.dat".into(), 5, true));
+        let tree = FileNode::Dir(Box::new(DirNode {
+            name: "root".into(),
+            size: 15,
+            children: vec![leaf("a.txt", 10), hidden],
+            expanded: false,
+            hidden: false,
+        }));
+
+        // Hidden flag respected even though the name has no leading dot.
+        assert_eq!(
+            file_group_files(&tree, Path::new("root"), false),
+            vec![PathBuf::from("root/a.txt")]
+        );
+        // Included when show_hidden is on.
+        assert_eq!(
+            file_group_files(&tree, Path::new("root"), true),
+            vec![PathBuf::from("root/a.txt"), PathBuf::from("root/hidden.dat")]
         );
     }
 

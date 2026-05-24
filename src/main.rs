@@ -294,6 +294,17 @@ enum ScreenshotState {
     Done,
 }
 
+/// A permanent delete awaiting confirmation. Resolved when the user asked (while
+/// the row was rendered), so a later "Yes" is unaffected by tree changes.
+struct PendingDelete {
+    /// Row path the user acted on, dropped from the selection after deleting.
+    path: PathBuf,
+    /// Pre-rendered confirmation prompt.
+    prompt: String,
+    /// Real files to delete.
+    targets: Vec<PathBuf>,
+}
+
 struct App {
     tree: Option<FileNode>,
     scanning: bool,
@@ -301,7 +312,7 @@ struct App {
     scan_progress: Arc<ScanProgress>,
     receiver: Option<mpsc::Receiver<ScanResult>>,
     error: Option<String>,
-    confirm_delete: Option<PathBuf>,
+    confirm_delete: Option<PendingDelete>,
     confirm_batch_delete: bool,
     search_query: String,
     /// The search query currently applied to the cached rows (debounced).
@@ -538,29 +549,82 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let targets = paths
-            .iter()
-            .flat_map(|p| self.deletion_targets(p))
-            .collect();
+        let targets = self.resolve_batch_targets(paths);
         self.deleter.start(targets, true);
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        let targets = paths
-            .iter()
-            .flat_map(|p| self.deletion_targets(p))
-            .collect();
+        let targets = self.resolve_batch_targets(paths);
         self.deleter.start(targets, false);
     }
 
-    /// Expand a tree-row path into the real filesystem paths it represents.
+    /// Expand one tree-row path into the real filesystem paths it represents.
     ///
-    /// File-group rows carry the synthetic path `<dir>/__file_group__`, which
-    /// does not exist on disk. Those expand to the loose files in `<dir>`. Every
-    /// other path maps to itself.
+    /// A synthetic file-group row expands to the loose files in `<dir>`; every
+    /// other path maps to itself. See [`resolve_deletion_targets`].
     fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
-        resolve_deletion_targets(self.tree.as_ref(), path, self.show_hidden)
+        resolve_deletion_targets(
+            &self.cached_rows,
+            self.tree.as_ref(),
+            path,
+            self.show_hidden,
+        )
+    }
+
+    /// Expand a batch of selected row paths into a de-duplicated target list.
+    ///
+    /// Collects the synthetic group-row paths once so each lookup is O(1),
+    /// keeping batch resolution O(rows + selected) rather than O(rows*selected).
+    fn resolve_batch_targets(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let group_paths: HashSet<&Path> = self
+            .cached_rows
+            .iter()
+            .filter(|r| r.is_file_group)
+            .map(|r| r.path.as_path())
+            .collect();
+        let mut targets: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for p in paths {
+            if group_paths.contains(p.as_path()) {
+                if let (Some(dir), Some(tree)) = (p.parent(), self.tree.as_ref()) {
+                    for f in ui::file_group_files(tree, dir, self.show_hidden) {
+                        if seen.insert(f.clone()) {
+                            targets.push(f);
+                        }
+                    }
+                }
+            } else if seen.insert(p.clone()) {
+                targets.push(p);
+            }
+        }
+        targets
+    }
+
+    /// Build a confirmed-delete plan for `path`, resolved now (while the row is
+    /// still rendered) so a later "Yes" click is unaffected by intervening
+    /// scroll, collapse, or rescan.
+    fn pending_delete_for(&self, path: &Path) -> PendingDelete {
+        let targets = self.deletion_targets(path);
+        let is_group = self
+            .cached_rows
+            .iter()
+            .any(|r| r.is_file_group && r.path == path);
+        let prompt = if is_group {
+            let dir = path.parent().unwrap_or(path);
+            format!(
+                "Permanently delete {} files in\n{}",
+                targets.len(),
+                dir.display()
+            )
+        } else {
+            format!("Permanently delete?\n{}", path.display())
+        };
+        PendingDelete {
+            path: path.to_path_buf(),
+            prompt,
+            targets,
+        }
     }
 
     /// Poll for background deletion completion and apply results to the tree.
@@ -592,33 +656,22 @@ impl App {
     }
 }
 
-/// True when `path` is a synthetic file-group row (`<dir>/__file_group__`).
-///
-/// Such rows never exist on disk, so a real file or directory that happens to
-/// be named `__file_group__` is excluded — otherwise deleting it would expand
-/// to its loose siblings and wipe them instead of the selected item.
-fn is_file_group_row(path: &Path) -> bool {
-    // Only a genuine "does not exist" (NotFound) means synthetic. A stat that
-    // fails for another reason — e.g. EACCES on an unreadable parent — is a
-    // real entry we simply can't read, and must NOT be expanded to siblings.
-    path.file_name().is_some_and(|n| n == "__file_group__")
-        && matches!(
-            path.symlink_metadata(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        )
-}
-
 /// Expand a tree-row path into the real filesystem paths a delete should touch.
 ///
-/// A synthetic file-group row expands to the loose files in its parent dir;
-/// every other path (including a real entry that happens to be named
-/// `__file_group__`) maps to itself, so deleting it never touches siblings.
+/// Identity comes from the rendered rows, never the filesystem: `path` is a
+/// synthetic file group only if a currently-rendered row carries it with
+/// `is_file_group`. The grouping invariant guarantees that synthetic path is
+/// unique, so a real entry named `__file_group__` is never mistaken for a group.
+/// A group expands to the loose files in its parent dir; anything else
+/// (including a stale path no longer rendered) maps to itself.
 fn resolve_deletion_targets(
+    rows: &[ui::CachedRow],
     tree: Option<&FileNode>,
     path: &Path,
     show_hidden: bool,
 ) -> Vec<PathBuf> {
-    if is_file_group_row(path) {
+    let is_group = rows.iter().any(|r| r.is_file_group && r.path == path);
+    if is_group {
         match (path.parent(), tree) {
             (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, show_hidden),
             _ => Vec::new(),
@@ -983,7 +1036,7 @@ impl eframe::App for App {
                         self.mark_dirty();
                     }
                 } else if shift_del {
-                    self.confirm_delete = Some(focused.clone());
+                    self.confirm_delete = Some(self.pending_delete_for(focused));
                 } else if del {
                     let targets = self.deletion_targets(focused);
                     self.selected_paths.remove(focused);
@@ -1034,31 +1087,24 @@ impl eframe::App for App {
         }
 
         // Single-item delete confirmation dialog
-        let mut do_delete: Option<PathBuf> = None;
+        let mut do_delete = false;
         let mut close_dialog = false;
 
-        if let Some(ref path) = self.confirm_delete {
+        if let Some(ref pending) = self.confirm_delete {
             let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            let prompt = if is_file_group_row(path) {
-                let count = self.deletion_targets(path).len();
-                let dir = path.parent().unwrap_or(path);
-                format!("Permanently delete {count} files in\n{}", dir.display())
-            } else {
-                format!("Permanently delete?\n{}", path.display())
-            };
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(&prompt);
+                    ui.label(&pending.prompt);
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
                             egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(220, 50, 50));
                         if ui.add(delete_btn).clicked() || enter_pressed {
-                            do_delete = Some(path.clone());
+                            do_delete = true;
                             close_dialog = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -1068,14 +1114,15 @@ impl eframe::App for App {
                 });
         }
 
-        if close_dialog {
+        if do_delete {
+            // Use the plan captured when the user asked — not a fresh lookup —
+            // so intervening tree changes can't alter what gets deleted.
+            if let Some(pending) = self.confirm_delete.take() {
+                self.selected_paths.remove(&pending.path);
+                self.deleter.start(pending.targets, false);
+            }
+        } else if close_dialog {
             self.confirm_delete = None;
-        }
-
-        if let Some(path) = do_delete {
-            let targets = self.deletion_targets(&path);
-            self.selected_paths.remove(&path);
-            self.deleter.start(targets, false);
         }
 
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
@@ -1696,7 +1743,7 @@ impl eframe::App for App {
                                 self.batch_trash_selected();
                             }
                             ui::TreeAction::ConfirmDelete(path) => {
-                                self.confirm_delete = Some(path.clone());
+                                self.confirm_delete = Some(self.pending_delete_for(path));
                             }
                             ui::TreeAction::ConfirmDeleteSelected => {
                                 self.confirm_batch_delete = true;
@@ -1879,136 +1926,92 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{DirNode, leaf};
-    use tempfile::TempDir;
+    use crate::tree::{dir, leaf};
 
-    /// Build a directory node named `name` (an absolute path in resolution
-    /// tests) holding `children`.
-    fn dir_named(name: &str, children: Vec<FileNode>) -> FileNode {
-        let size = children.iter().map(|c| c.size()).sum();
-        FileNode::Dir(Box::new(DirNode {
-            name: name.into(),
-            size,
-            children,
-            expanded: true,
-            hidden: false,
-        }))
+    /// Rendered rows for a tree with the root expanded — the same source of
+    /// truth deletion uses to decide whether a path is a synthetic group.
+    fn rows_for(tree: &FileNode) -> Vec<ui::CachedRow> {
+        ui::collect_cached_rows(tree, "", None, true, None, None, None)
     }
-
-    // --- is_file_group_row: identity of a row path ---
-
-    #[test]
-    fn synthetic_group_path_is_a_group_row() {
-        let tmp = TempDir::new().unwrap();
-        // Nothing exists at <dir>/__file_group__ → it is a synthetic group row.
-        let p = tmp.path().join("__file_group__");
-        assert!(is_file_group_row(&p));
-    }
-
-    #[test]
-    fn real_file_named_file_group_is_not_a_group_row() {
-        let tmp = TempDir::new().unwrap();
-        let p = tmp.path().join("__file_group__");
-        std::fs::write(&p, b"real").unwrap();
-        // A real file that happens to be named __file_group__ must NOT be
-        // treated as a synthetic group — otherwise its loose siblings get
-        // deleted instead of the file itself.
-        assert!(!is_file_group_row(&p));
-    }
-
-    #[test]
-    fn ordinary_path_is_not_a_group_row() {
-        assert!(!is_file_group_row(Path::new("/no/such/file.txt")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn real_file_under_unreadable_dir_is_not_a_group_row() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let locked = tmp.path().join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        let f = locked.join("__file_group__");
-        std::fs::write(&f, b"x").unwrap();
-        // Strip all perms so symlink_metadata(f) fails with EACCES, not NotFound.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let result = is_file_group_row(&f);
-
-        // Restore perms so TempDir cleanup succeeds.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // A real file must never be read as synthetic just because we can't
-        // stat it. (No-op when tests run as root and the chmod is ignored.)
-        assert!(
-            !result,
-            "EACCES on a real __file_group__ file must not be read as a synthetic group"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn broken_symlink_named_group_is_not_a_group_row() {
-        let tmp = TempDir::new().unwrap();
-        let link = tmp.path().join("__file_group__");
-        std::os::unix::fs::symlink(tmp.path().join("missing-target"), &link).unwrap();
-        // lstat sees the link itself (Ok), so it is a real entry to delete,
-        // not a synthetic group. (path.exists() would wrongly return false here.)
-        assert!(!is_file_group_row(&link));
-    }
-
-    // --- resolve_deletion_targets: path → real files to delete ---
 
     #[test]
     fn resolve_synthetic_group_expands_to_loose_files() {
-        // The group path is NOT created on disk → synthetic → expands to the
-        // directory's loose files in tree order.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_str().unwrap();
-        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
-        let group = tmp.path().join("__file_group__");
+        // Two loose files → a synthetic group row at root/__file_group__.
+        let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        tree.set_expanded(true);
+        let rows = rows_for(&tree);
+        assert!(
+            rows.iter()
+                .any(|r| r.is_file_group && r.path.as_path() == Path::new("root/__file_group__"))
+        );
 
-        let got = resolve_deletion_targets(Some(&tree), &group, true);
+        let got =
+            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true);
 
         assert_eq!(
             got,
-            vec![tmp.path().join("a.txt"), tmp.path().join("b.txt")]
+            vec![PathBuf::from("root/a.txt"), PathBuf::from("root/b.txt")]
         );
     }
 
     #[test]
     fn resolve_real_file_named_group_deletes_only_itself() {
-        // A real file literally named __file_group__ next to loose siblings.
-        // Deleting it must remove ONLY that file, never expand to siblings.
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_str().unwrap();
-        std::fs::write(tmp.path().join("__file_group__"), b"x").unwrap();
-        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("__file_group__", 1)]);
-        let target = tmp.path().join("__file_group__");
+        // The grouping invariant suppresses a synthetic group when a loose file
+        // is named __file_group__, so the row at root/__file_group__ is the real
+        // file (is_file_group = false). Deleting it must remove ONLY that file.
+        let mut tree = dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                leaf("__file_group__", 1),
+            ],
+        );
+        tree.set_expanded(true);
+        let rows = rows_for(&tree);
+        assert!(!rows.iter().any(|r| r.is_file_group));
 
-        let got = resolve_deletion_targets(Some(&tree), &target, true);
+        let got =
+            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true);
 
-        assert_eq!(got, vec![target]);
+        assert_eq!(got, vec![PathBuf::from("root/__file_group__")]);
     }
 
     #[test]
     fn resolve_ordinary_file_maps_to_itself() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_str().unwrap();
-        let tree = dir_named(root, vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
-        let target = tmp.path().join("a.txt");
+        let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        tree.set_expanded(true);
+        let rows = rows_for(&tree);
 
         assert_eq!(
-            resolve_deletion_targets(Some(&tree), &target, true),
-            vec![target]
+            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/a.txt"), true),
+            vec![PathBuf::from("root/a.txt")]
+        );
+    }
+
+    #[test]
+    fn resolve_stale_path_not_in_rows_maps_to_itself() {
+        // A path no longer among the rendered rows is treated as a literal path
+        // — no filesystem probe, no sibling expansion. Worst case the deleter
+        // simply no-ops on a stale synthetic path.
+        let tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        let rows: Vec<ui::CachedRow> = Vec::new();
+
+        assert_eq!(
+            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true),
+            vec![PathBuf::from("root/__file_group__")]
         );
     }
 
     #[test]
     fn resolve_group_without_tree_is_empty() {
-        let tmp = TempDir::new().unwrap();
-        let group = tmp.path().join("__file_group__");
-        // No tree loaded → nothing to expand → no-op delete.
-        assert!(resolve_deletion_targets(None, &group, true).is_empty());
+        let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        tree.set_expanded(true);
+        let rows = rows_for(&tree);
+        // The group row is present, but no tree is available to expand against.
+        assert!(
+            resolve_deletion_targets(&rows, None, Path::new("root/__file_group__"), true)
+                .is_empty()
+        );
     }
 }

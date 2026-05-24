@@ -158,6 +158,11 @@ pub enum TreeAction {
 /// Minimum number of loose files in a folder to trigger grouping.
 const FILE_GROUP_THRESHOLD: usize = 2;
 
+/// Final path component of a synthetic file-group row: `<dir>/__file_group__`.
+/// Grouping is suppressed when a real loose file already uses this name, so a
+/// path ending in this marker uniquely identifies a synthetic group row.
+pub const FILE_GROUP_MARKER: &str = "__file_group__";
+
 /// Cached row data for the visible tree. Rebuilt only when the tree state changes.
 /// Owns all data so it can outlive a single frame.
 pub struct CachedRow {
@@ -227,7 +232,7 @@ fn emit_file_group(
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) {
     result.push(CachedRow {
-        path: current_path.join("__file_group__"),
+        path: current_path.join(FILE_GROUP_MARKER),
         name: format!("[{file_count} files]").into(),
         size: file_size,
         is_dir: false,
@@ -325,8 +330,14 @@ fn collect_cached_rows_inner(
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
             .collect();
-        let should_group_files =
-            files.len() >= FILE_GROUP_THRESHOLD && filter.is_empty() && category_filter.is_none();
+        // Never group when a loose file is literally named `__file_group__`:
+        // the synthetic group row borrows that exact path, and emitting both
+        // would make `<dir>/__file_group__` ambiguous. Falling back to rendering
+        // the files individually keeps every row path unique.
+        let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
+            && filter.is_empty()
+            && category_filter.is_none()
+            && !files.iter().any(|f| f.name() == FILE_GROUP_MARKER);
 
         if should_group_files {
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
@@ -1086,6 +1097,34 @@ mod tests {
     fn file_group_files_empty_for_missing_dir() {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
         assert!(file_group_files(&tree, Path::new("root/nope"), true).is_empty());
+    }
+
+    #[test]
+    fn no_synthetic_group_when_real_file_group_marker_present() {
+        // A dir with 3 loose files, one literally named __file_group__.
+        // Grouping must be suppressed so the synthetic path stays unique;
+        // all three files render as individual rows.
+        let mut tree = dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                leaf("__file_group__", 5),
+            ],
+        );
+        tree.set_expanded(true);
+
+        let rows = collect_cached_rows(&tree, "", None, true, None, None, None);
+
+        // No row is a synthetic group.
+        assert!(!rows.iter().any(|r| r.is_file_group));
+        // The real __file_group__ file appears exactly once, as a normal file.
+        let marker_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.path.as_path() == Path::new("root/__file_group__"))
+            .collect();
+        assert_eq!(marker_rows.len(), 1);
+        assert!(!marker_rows[0].is_file_group);
     }
 
     #[test]

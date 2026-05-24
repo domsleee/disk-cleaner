@@ -47,13 +47,13 @@
 //! - Total: 50,000 files, 500 dirs, ~50 MB on disk
 //! - Total tree nodes: 50,501 (50,000 files + 500 dirs + 1 root)
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ── Tracking allocator ───────────────────────────────────────────────

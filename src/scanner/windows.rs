@@ -394,7 +394,9 @@ pub fn walk_dir_bulk(
     } else {
         sub_dirs
             .into_par_iter()
-            .map(|(name, hidden)| walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip))
+            .map(|(name, hidden)| {
+                walk_child_dir(&dir_handle, dir_path, name, hidden, progress, _skip)
+            })
             .collect()
     };
 
@@ -430,13 +432,19 @@ fn walk_child_dir(
 ) -> FileNode {
     let child_path = dir_path.join(name.as_ref());
     match dir_handle.open_relative(&name) {
-        Ok(child_handle) => match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
-            Ok(node) => node,
-            Err(err) => {
-                progress.record_windows_bulk_scan_fallback("child bulk scan", &child_path, &err);
-                super::walk_dir(&child_path, progress, skip)
+        Ok(child_handle) => {
+            match walk_dir_bulk(child_handle, &child_path, name, hidden, progress, skip) {
+                Ok(node) => node,
+                Err(err) => {
+                    progress.record_windows_bulk_scan_fallback(
+                        "child bulk scan",
+                        &child_path,
+                        &err,
+                    );
+                    super::walk_dir(&child_path, progress, skip)
+                }
             }
-        },
+        }
         Err(err) => {
             progress.record_windows_child_open_fallback(&child_path, &err);
             super::walk_dir(&child_path, progress, skip)

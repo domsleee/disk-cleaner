@@ -3,8 +3,8 @@
 
 use disk_cleaner::scanner::{self, ScanProgress};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn main() {
     let path = std::env::args()
@@ -39,7 +39,9 @@ fn main() {
         .access_denied_fallback_count
         .load(Ordering::Relaxed);
     let bulk_scan = progress.bulk_scan_fallback_count.load(Ordering::Relaxed);
-    if let Some(fallback_summary) = scanner::format_fallback_summary(fallbacks, access_denied, bulk_scan) {
+    if let Some(fallback_summary) =
+        scanner::format_fallback_summary(fallbacks, access_denied, bulk_scan)
+    {
         println!(
             "{} files, {} bytes ({}) [{}]",
             files,

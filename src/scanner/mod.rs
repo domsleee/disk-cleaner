@@ -189,7 +189,9 @@ pub fn format_fallback_summary(total: u64, access_denied: u64, bulk_scan: u64) -
         return None;
     }
 
-    let other_open = total.saturating_sub(access_denied).saturating_sub(bulk_scan);
+    let other_open = total
+        .saturating_sub(access_denied)
+        .saturating_sub(bulk_scan);
 
     if access_denied > 0 && other_open == 0 && bulk_scan == 0 {
         return Some(format!(
@@ -234,7 +236,8 @@ impl ScanProgress {
         err: &io::Error,
     ) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
-        self.bulk_scan_fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.bulk_scan_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
         self.push_fallback_detail(ScanFallbackKind::BulkScan, path, err);
         log_windows_fallback(stage, path, err);
     }
@@ -280,8 +283,7 @@ impl ScanProgress {
 fn windows_fallback_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("DISK_CLEANER_LOG_WINDOWS_FALLBACKS")
-            .is_ok_and(|value| value != "0")
+        std::env::var("DISK_CLEANER_LOG_WINDOWS_FALLBACKS").is_ok_and(|value| value != "0")
     })
 }
 
@@ -419,7 +421,14 @@ fn scan_directory_inner(
             .unwrap_or_else(|_| root_name.starts_with('.'));
 
         match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
-            windows::walk_dir_bulk(root_dir, root, root_name.clone(), root_hidden, &progress, &skip)
+            windows::walk_dir_bulk(
+                root_dir,
+                root,
+                root_name.clone(),
+                root_hidden,
+                &progress,
+                &skip,
+            )
         }) {
             Ok(node) => node,
             Err(err) => {
@@ -889,7 +898,9 @@ mod tests {
             "fallback counter should record the Windows child open fallback"
         );
         assert_eq!(
-            progress.access_denied_fallback_count.load(Ordering::Relaxed),
+            progress
+                .access_denied_fallback_count
+                .load(Ordering::Relaxed),
             0,
             "injected open failure should not be classified as access denied"
         );

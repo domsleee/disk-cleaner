@@ -9,7 +9,7 @@ mod ui;
 
 use eframe::egui;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -538,12 +538,30 @@ impl App {
 
     fn batch_trash_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        self.deleter.start(paths, true);
+        let targets = paths.iter().flat_map(|p| self.deletion_targets(p)).collect();
+        self.deleter.start(targets, true);
     }
 
     fn batch_delete_selected(&mut self) {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
-        self.deleter.start(paths, false);
+        let targets = paths.iter().flat_map(|p| self.deletion_targets(p)).collect();
+        self.deleter.start(targets, false);
+    }
+
+    /// Expand a tree-row path into the real filesystem paths it represents.
+    ///
+    /// File-group rows carry the synthetic path `<dir>/__file_group__`, which
+    /// does not exist on disk. Those expand to the loose files in `<dir>`. Every
+    /// other path maps to itself.
+    fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
+        if path.file_name().is_some_and(|n| n == "__file_group__") {
+            match (path.parent(), self.tree.as_ref()) {
+                (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, self.show_hidden),
+                _ => Vec::new(),
+            }
+        } else {
+            vec![path.to_path_buf()]
+        }
     }
 
     /// Poll for background deletion completion and apply results to the tree.
@@ -933,8 +951,9 @@ impl eframe::App for App {
                 } else if shift_del {
                     self.confirm_delete = Some(focused.clone());
                 } else if del {
+                    let targets = self.deletion_targets(focused);
                     self.selected_paths.remove(focused);
-                    self.deleter.start(vec![focused.clone()], true);
+                    self.deleter.start(targets, true);
                     self.focused_path = None;
                 }
             }
@@ -986,12 +1005,19 @@ impl eframe::App for App {
 
         if let Some(ref path) = self.confirm_delete {
             let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            let prompt = if path.file_name().is_some_and(|n| n == "__file_group__") {
+                let count = self.deletion_targets(path).len();
+                let dir = path.parent().unwrap_or(path);
+                format!("Permanently delete {count} files in\n{}", dir.display())
+            } else {
+                format!("Permanently delete?\n{}", path.display())
+            };
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("Permanently delete?\n{}", path.display()));
+                    ui.label(&prompt);
                     ui.horizontal(|ui| {
                         let delete_btn = egui::Button::new(
                             egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
@@ -1013,8 +1039,9 @@ impl eframe::App for App {
         }
 
         if let Some(path) = do_delete {
+            let targets = self.deletion_targets(&path);
             self.selected_paths.remove(&path);
-            self.deleter.start(vec![path], false);
+            self.deleter.start(targets, false);
         }
 
         // Top panel with toolbar (hidden on home page where it only has "Open Directory")
@@ -1626,8 +1653,9 @@ impl eframe::App for App {
                                 self.focused_path = Some(path.clone());
                             }
                             ui::TreeAction::Trash(path) => {
+                                let targets = self.deletion_targets(path);
                                 self.selected_paths.remove(path);
-                                self.deleter.start(vec![path.clone()], true);
+                                self.deleter.start(targets, true);
                             }
                             ui::TreeAction::TrashSelected => {
                                 self.batch_trash_selected();

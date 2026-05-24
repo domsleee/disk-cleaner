@@ -333,11 +333,17 @@ fn collect_cached_rows_inner(
         // Never group when a loose file is literally named `__file_group__`:
         // the synthetic group row borrows that exact path, and emitting both
         // would make `<dir>/__file_group__` ambiguous. Falling back to rendering
-        // the files individually keeps every row path unique.
+        // the files individually keeps every row path unique. Check ALL loose
+        // children (not just the visible `files`) so a hidden marker can't slip
+        // through and collide once "Show hidden" is toggled on.
+        let has_file_group_marker = node
+            .children()
+            .iter()
+            .any(|c| !c.is_dir() && c.name() == FILE_GROUP_MARKER);
         let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
             && filter.is_empty()
             && category_filter.is_none()
-            && !files.iter().any(|f| f.name() == FILE_GROUP_MARKER);
+            && !has_file_group_marker;
 
         if should_group_files {
             let file_size: u64 = files.iter().map(|f| f.size()).sum();
@@ -1125,6 +1131,26 @@ mod tests {
             .collect();
         assert_eq!(marker_rows.len(), 1);
         assert!(!marker_rows[0].is_file_group);
+    }
+
+    #[test]
+    fn no_synthetic_group_when_hidden_file_group_marker_present() {
+        use crate::tree::{DirNode, FileLeaf};
+        // A file named __file_group__ that is OS-hidden (no dot, hidden flag).
+        let hidden_marker = FileNode::File(FileLeaf::new(FILE_GROUP_MARKER.into(), 1, true));
+        let tree = FileNode::Dir(Box::new(DirNode {
+            name: "root".into(),
+            size: 31,
+            children: vec![leaf("a.txt", 10), leaf("b.txt", 20), hidden_marker],
+            expanded: true,
+            hidden: false,
+        }));
+
+        // Even with show_hidden = false (marker not rendered), grouping must be
+        // suppressed: otherwise the synthetic path would collide with the real
+        // marker once "Show hidden" is toggled on.
+        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        assert!(!rows.iter().any(|r| r.is_file_group));
     }
 
     #[test]

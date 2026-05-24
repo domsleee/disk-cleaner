@@ -702,7 +702,6 @@ impl eframe::App for App {
                 }
                 self.scan_frame_times.clear();
             }
-
         }
 
         // Check if background deletion completed
@@ -1324,9 +1323,7 @@ impl eframe::App for App {
                             });
                             let response = ui
                                 .add(button)
-                                .on_hover_text(format!(
-                                    "{hover}\nClick to open details"
-                                ));
+                                .on_hover_text(format!("{hover}\nClick to open details"));
                             if response.clicked() {
                                 open_fallback_report = true;
                             }
@@ -1406,9 +1403,12 @@ impl eframe::App for App {
                     if let Some(start) = self.scan_start_time {
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(format!("Elapsed: {}", format_elapsed(start.elapsed())))
-                                .weak()
-                                .size(13.0),
+                            egui::RichText::new(format!(
+                                "Elapsed: {}",
+                                format_elapsed(start.elapsed())
+                            ))
+                            .weak()
+                            .size(13.0),
                         );
                     }
 

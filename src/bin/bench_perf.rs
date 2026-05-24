@@ -13,7 +13,7 @@ use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 fn main() {

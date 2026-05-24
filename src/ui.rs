@@ -330,16 +330,17 @@ fn collect_cached_rows_inner(
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
             .collect();
-        // Never group when a loose file is literally named `__file_group__`:
-        // the synthetic group row borrows that exact path, and emitting both
-        // would make `<dir>/__file_group__` ambiguous. Falling back to rendering
-        // the files individually keeps every row path unique. Check ALL loose
-        // children (not just the visible `files`) so a hidden marker can't slip
-        // through and collide once "Show hidden" is toggled on.
+        // Never group when ANY child is literally named `__file_group__`: the
+        // synthetic group row borrows that exact path, and emitting both would
+        // make `<dir>/__file_group__` ambiguous. Falling back to rendering the
+        // files individually keeps every row path unique. Check every child —
+        // file or directory, hidden or visible — so nothing can slip through and
+        // collide (a hidden child once "Show hidden" is toggled on; a directory
+        // regardless of visibility).
         let has_file_group_marker = node
             .children()
             .iter()
-            .any(|c| !c.is_dir() && c.name() == FILE_GROUP_MARKER);
+            .any(|c| c.name() == FILE_GROUP_MARKER);
         let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
             && filter.is_empty()
             && category_filter.is_none()
@@ -1149,6 +1150,45 @@ mod tests {
         // Even with show_hidden = false (marker not rendered), grouping must be
         // suppressed: otherwise the synthetic path would collide with the real
         // marker once "Show hidden" is toggled on.
+        let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
+        assert!(!rows.iter().any(|r| r.is_file_group));
+    }
+
+    #[test]
+    fn no_synthetic_group_when_dir_named_file_group_marker() {
+        // A real subdirectory named __file_group__ shares the synthetic path,
+        // so grouping must be suppressed for it too (not just files).
+        let mut tree = dir(
+            "root",
+            vec![
+                leaf("a.txt", 10),
+                leaf("b.txt", 20),
+                dir(FILE_GROUP_MARKER, vec![leaf("inner.txt", 3)]),
+            ],
+        );
+        tree.set_expanded(true);
+
+        let rows = collect_cached_rows(&tree, "", None, true, None, None, None);
+        assert!(!rows.iter().any(|r| r.is_file_group));
+    }
+
+    #[test]
+    fn no_synthetic_group_when_hidden_dir_named_file_group_marker() {
+        use crate::tree::DirNode;
+        // Hidden subdirectory named __file_group__, show_hidden = false.
+        let hidden_dir = FileNode::Dir(Box::new(DirNode {
+            name: FILE_GROUP_MARKER.into(),
+            size: 3,
+            children: vec![leaf("inner.txt", 3)],
+            expanded: false,
+            hidden: true,
+        }));
+        let mut tree = dir("root", vec![leaf("a.txt", 10), leaf("b.txt", 20)]);
+        if let FileNode::Dir(d) = &mut tree {
+            d.children.push(hidden_dir);
+        }
+        tree.set_expanded(true);
+
         let rows = collect_cached_rows(&tree, "", None, false, None, None, None);
         assert!(!rows.iter().any(|r| r.is_file_group));
     }

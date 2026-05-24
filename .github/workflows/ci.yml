@@ -39,6 +39,20 @@ env:
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
   # Quick sanity check — compiles everything, runs on one machine
   check:
     runs-on: ubuntu-latest

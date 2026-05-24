@@ -554,7 +554,7 @@ impl App {
     /// does not exist on disk. Those expand to the loose files in `<dir>`. Every
     /// other path maps to itself.
     fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
-        if path.file_name().is_some_and(|n| n == "__file_group__") {
+        if is_file_group_row(path) {
             match (path.parent(), self.tree.as_ref()) {
                 (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, self.show_hidden),
                 _ => Vec::new(),
@@ -591,6 +591,15 @@ impl App {
             self.scan_disk_info = scanner::disk_space(path);
         }
     }
+}
+
+/// True when `path` is a synthetic file-group row (`<dir>/__file_group__`).
+///
+/// Such rows never exist on disk, so a real file or directory that happens to
+/// be named `__file_group__` is excluded — otherwise deleting it would expand
+/// to its loose siblings and wipe them instead of the selected item.
+fn is_file_group_row(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == "__file_group__") && path.symlink_metadata().is_err()
 }
 
 fn save_screenshot_png(
@@ -1005,7 +1014,7 @@ impl eframe::App for App {
 
         if let Some(ref path) = self.confirm_delete {
             let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            let prompt = if path.file_name().is_some_and(|n| n == "__file_group__") {
+            let prompt = if is_file_group_row(path) {
                 let count = self.deletion_targets(path).len();
                 let dir = path.parent().unwrap_or(path);
                 format!("Permanently delete {count} files in\n{}", dir.display())
@@ -1838,5 +1847,35 @@ impl eframe::App for App {
         if self.scanning && debug_enabled() {
             self.scan_frame_times.push(frame_start.elapsed());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn synthetic_group_path_is_a_group_row() {
+        let tmp = TempDir::new().unwrap();
+        // Nothing exists at <dir>/__file_group__ → it is a synthetic group row.
+        let p = tmp.path().join("__file_group__");
+        assert!(is_file_group_row(&p));
+    }
+
+    #[test]
+    fn real_file_named_file_group_is_not_a_group_row() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("__file_group__");
+        std::fs::write(&p, b"real").unwrap();
+        // A real file that happens to be named __file_group__ must NOT be
+        // treated as a synthetic group — otherwise its loose siblings get
+        // deleted instead of the file itself.
+        assert!(!is_file_group_row(&p));
+    }
+
+    #[test]
+    fn ordinary_path_is_not_a_group_row() {
+        assert!(!is_file_group_row(Path::new("/no/such/file.txt")));
     }
 }

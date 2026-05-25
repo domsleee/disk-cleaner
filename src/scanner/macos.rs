@@ -111,13 +111,13 @@ pub fn walk_dir_bulk(
     let _dirfd_guard = DropFd(dirfd);
 
     let empty_dir = |name: Box<str>| {
-        FileNode::Dir(Box::new(DirNode {
+        FileNode::Dir(Box::new(DirNode::new(
             name,
-            size: 0,
-            children: Vec::new(),
-            expanded: false,
-            hidden: dir_hidden,
-        }))
+            0,
+            Vec::new(),
+            false,
+            dir_hidden,
+        )))
     };
 
     if progress.cancelled.load(Ordering::Relaxed) {
@@ -330,13 +330,13 @@ pub fn walk_dir_bulk(
                 })
                 .unwrap_or(-1);
             if child_fd < 0 {
-                return Some(FileNode::Dir(Box::new(DirNode {
+                return Some(FileNode::Dir(Box::new(DirNode::new(
                     name,
-                    size: 0,
-                    children: Vec::new(),
-                    expanded: false,
+                    0,
+                    Vec::new(),
+                    false,
                     hidden,
-                })));
+                ))));
             }
             Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
         })
@@ -346,11 +346,11 @@ pub fn walk_dir_bulk(
     file_children.shrink_to_fit();
     let size = file_children.iter().map(|c| c.size()).sum();
 
-    FileNode::Dir(Box::new(DirNode {
-        name: dir_name,
+    FileNode::Dir(Box::new(DirNode::new(
+        dir_name,
         size,
-        children: file_children,
-        expanded: false,
-        hidden: dir_hidden,
-    }))
+        file_children,
+        false,
+        dir_hidden,
+    )))
 }

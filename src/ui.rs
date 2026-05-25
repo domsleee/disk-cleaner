@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -317,14 +318,20 @@ fn collect_cached_rows_inner(
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
     if show_children {
+        let children_sorted = node.children_sorted();
+
         // Separate children into dirs and files for grouping.
         // Only consider visible files (respecting show_hidden).
-        let dirs: Vec<_> = node.children().iter().filter(|c| c.is_dir()).collect();
-        let files: Vec<_> = node
+        let mut dirs: Vec<_> = node.children().iter().filter(|c| c.is_dir()).collect();
+        let mut files: Vec<_> = node
             .children()
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.name().starts_with('.')))
             .collect();
+        if !children_sorted {
+            dirs.sort_unstable_by_key(|c| Reverse(c.size()));
+            files.sort_unstable_by_key(|c| Reverse(c.size()));
+        }
         let should_group_files =
             files.len() >= FILE_GROUP_THRESHOLD && filter.is_empty() && category_filter.is_none();
 
@@ -335,8 +342,7 @@ fn collect_cached_rows_inner(
             let file_count = files.len();
             let mut file_group_emitted = false;
 
-            // Interleave dirs and file group sorted by size (children are
-            // already size-sorted from the scanner).
+            // Interleave dirs and file group sorted by size.
             for child in &dirs {
                 // Emit file group before the first dir that is smaller
                 if !file_group_emitted && child.size() < file_size {
@@ -393,12 +399,36 @@ fn collect_cached_rows_inner(
                     expanded_file_groups,
                 );
             }
-        } else {
+        } else if children_sorted {
             // No grouping — emit all children in original order
             for child in node.children() {
                 if !show_hidden && child.name().starts_with('.') {
                     continue;
                 }
+                current_path.push(child.name());
+                collect_cached_rows_inner(
+                    child,
+                    depth + 1,
+                    node.size(),
+                    current_path,
+                    filter,
+                    category_filter,
+                    show_hidden,
+                    text_cache,
+                    cat_cache,
+                    expanded_file_groups,
+                    result,
+                );
+                current_path.pop();
+            }
+        } else {
+            let mut children: Vec<_> = node
+                .children()
+                .iter()
+                .filter(|child| show_hidden || !child.name().starts_with('.'))
+                .collect();
+            children.sort_unstable_by_key(|c| Reverse(c.size()));
+            for child in children {
                 current_path.push(child.name());
                 collect_cached_rows_inner(
                     child,
@@ -760,8 +790,7 @@ pub fn toggle_expand(node: &mut FileNode, target: &Path) -> bool {
 
 fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> bool {
     if buf.as_path() == target {
-        let new_val = !node.expanded();
-        node.set_expanded(new_val);
+        node.set_expanded(!node.expanded());
         return true;
     }
     if let FileNode::Dir(d) = node
@@ -1008,6 +1037,25 @@ mod tests {
             assert_eq!(a.parent_size, b.parent_size);
             assert_eq!(a.children_count, b.children_count);
         }
+    }
+
+    #[test]
+    fn collect_cached_rows_sorts_unsorted_expanded_nodes_without_mutating_tree() {
+        let mut tree = dir(
+            "root",
+            vec![
+                dir("small", vec![leaf("small.txt", 10)]),
+                dir("big", vec![leaf("big.txt", 100)]),
+            ],
+        );
+        tree.as_dir_mut().unwrap().expanded = true;
+
+        let rows = collect_cached_rows(&tree, "", None, true, None, None, None);
+
+        assert!(!tree.children_sorted());
+        assert_eq!(tree.children()[0].name(), "small");
+        assert_eq!(&*rows[1].name, "big");
+        assert_eq!(&*rows[2].name, "small");
     }
 
     #[test]

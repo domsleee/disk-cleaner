@@ -159,8 +159,6 @@ pub enum TreeAction {
 const FILE_GROUP_THRESHOLD: usize = 2;
 
 /// Final path component of a synthetic file-group row: `<dir>/__file_group__`.
-/// Grouping is suppressed when a real loose file already uses this name, so a
-/// path ending in this marker uniquely identifies a synthetic group row.
 pub const FILE_GROUP_MARKER: &str = "__file_group__";
 
 /// Cached row data for the visible tree. Rebuilt only when the tree state changes.
@@ -330,13 +328,8 @@ fn collect_cached_rows_inner(
             .iter()
             .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
             .collect();
-        // Never group when ANY child is literally named `__file_group__`: the
-        // synthetic group row borrows that exact path, and emitting both would
-        // make `<dir>/__file_group__` ambiguous. Falling back to rendering the
-        // files individually keeps every row path unique. Check every child —
-        // file or directory, hidden or visible — so nothing can slip through and
-        // collide (a hidden child once "Show hidden" is toggled on; a directory
-        // regardless of visibility).
+        // Never group when any child (visible, hidden, or a dir) is named
+        // `__file_group__`, so the synthetic group path stays unambiguous.
         let has_file_group_marker = node
             .children()
             .iter()
@@ -414,7 +407,7 @@ fn collect_cached_rows_inner(
         } else {
             // No grouping — emit all children in original order
             for child in node.children() {
-                if !show_hidden && child.name().starts_with('.') {
+                if !show_hidden && child.is_hidden() {
                     continue;
                 }
                 current_path.push(child.name());
@@ -870,12 +863,9 @@ fn find_parent_path_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> 
     None
 }
 
-/// Resolve a file-group row to the loose-file paths it represents.
-///
-/// `dir` is the parent directory of the synthetic `__file_group__` row.
-/// Returns the absolute paths of `dir`'s non-directory children, applying the
-/// same visibility rule used when the group is rendered (hidden files are
-/// included only when `show_hidden` is set). Empty if `dir` is not found.
+/// Resolve a file-group row to the loose-file paths it represents: `dir`'s
+/// non-directory children, with hidden files included only when `show_hidden`.
+/// Empty if `dir` is not found.
 pub fn file_group_files(root: &FileNode, dir: &Path, show_hidden: bool) -> Vec<PathBuf> {
     let mut buf = PathBuf::from(root.name());
     let Some(node) = find_node(root, dir, &mut buf) else {
@@ -1036,9 +1026,7 @@ mod tests {
 
     #[test]
     fn file_group_files_returns_loose_files() {
-        // root has two loose files and one subdir. The file group at
-        // root/__file_group__ should resolve to the two loose file paths,
-        // never the synthetic path or the subdir.
+        // Group resolves to the loose files only, never the subdir.
         let tree = dir(
             "root",
             vec![
@@ -1075,7 +1063,7 @@ mod tests {
     #[test]
     fn file_group_files_excludes_os_hidden_non_dotfiles() {
         use crate::tree::{DirNode, FileLeaf};
-        // A file with no leading dot but the OS hidden flag set.
+        // No leading dot, but the OS hidden flag is set.
         let hidden = FileNode::File(FileLeaf::new("hidden.dat".into(), 5, true));
         let tree = FileNode::Dir(Box::new(DirNode {
             name: "root".into(),
@@ -1085,12 +1073,10 @@ mod tests {
             hidden: false,
         }));
 
-        // Hidden flag respected even though the name has no leading dot.
         assert_eq!(
             file_group_files(&tree, Path::new("root"), false),
             vec![PathBuf::from("root/a.txt")]
         );
-        // Included when show_hidden is on.
         assert_eq!(
             file_group_files(&tree, Path::new("root"), true),
             vec![
@@ -1108,9 +1094,8 @@ mod tests {
 
     #[test]
     fn no_synthetic_group_when_real_file_group_marker_present() {
-        // A dir with 3 loose files, one literally named __file_group__.
-        // Grouping must be suppressed so the synthetic path stays unique;
-        // all three files render as individual rows.
+        // A real __file_group__ file suppresses grouping; all three files
+        // render as individual rows.
         let mut tree = dir(
             "root",
             vec![
@@ -1123,9 +1108,8 @@ mod tests {
 
         let rows = collect_cached_rows(&tree, "", None, true, None, None, None);
 
-        // No row is a synthetic group.
         assert!(!rows.iter().any(|r| r.is_file_group));
-        // The real __file_group__ file appears exactly once, as a normal file.
+        // The real __file_group__ file appears once, as a normal file.
         let marker_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.path.as_path() == Path::new("root/__file_group__"))

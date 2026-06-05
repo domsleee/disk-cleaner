@@ -177,6 +177,18 @@ pub struct ScanProgress {
 /// "where is my disk space" panel.
 pub const SUBTREE_REPORT_MIN_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
+/// Stream a "subtree complete" event to the UI if the subtree is big enough.
+pub(crate) fn report_subtree(progress: &ScanProgress, dir: &Path, size: u64) {
+    if size >= SUBTREE_REPORT_MIN_BYTES
+        && let Ok(mut completed) = progress.completed_subtrees.lock()
+    {
+        completed.push(CompletedSubtree {
+            path: dir.to_path_buf(),
+            size,
+        });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CompletedSubtree {
     pub path: PathBuf,
@@ -597,6 +609,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let size = children.iter().map(|c| c.size()).sum();
 
+    // Stream "subtree complete" event to the UI for live display of
+    // the biggest items found so far.
+    report_subtree(progress, dir, size);
+
     FileNode::Dir(Box::new(DirNode {
         name: dir_name,
         size,
@@ -622,6 +638,25 @@ mod tests {
             cancelled: AtomicBool::new(false),
             completed_subtrees: Mutex::new(Vec::new()),
         })
+    }
+
+    #[test]
+    fn report_subtree_pushes_at_threshold() {
+        let progress = new_progress();
+        report_subtree(&progress, Path::new("/big"), SUBTREE_REPORT_MIN_BYTES);
+
+        let completed = progress.completed_subtrees.lock().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].path, PathBuf::from("/big"));
+        assert_eq!(completed[0].size, SUBTREE_REPORT_MIN_BYTES);
+    }
+
+    #[test]
+    fn report_subtree_skips_below_threshold() {
+        let progress = new_progress();
+        report_subtree(&progress, Path::new("/small"), SUBTREE_REPORT_MIN_BYTES - 1);
+
+        assert!(progress.completed_subtrees.lock().unwrap().is_empty());
     }
 
     #[test]

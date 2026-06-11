@@ -119,6 +119,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    // BENCH_WARMUP=0 skips the warmup scan — required for cold-cache runs
+    // (e.g. freshly attached disk image) where the first scan IS the sample.
+    let warmup = std::env::var("BENCH_WARMUP").map_or(true, |v| v != "0");
     let path = std::path::Path::new(&dir);
     assert!(path.exists(), "Directory does not exist: {dir}");
 
@@ -128,13 +131,13 @@ fn main() {
     eprintln!();
 
     // Warmup run (not measured)
-    eprint!("  Warmup...");
-    {
+    if warmup {
+        eprint!("  Warmup...");
         let p = new_progress();
         let tree = scanner::scan_directory(path, p);
         std::hint::black_box(tree);
+        eprintln!(" done");
     }
-    eprintln!(" done");
 
     let mut times = Vec::with_capacity(runs);
     let mut bpn_vals = Vec::with_capacity(runs);

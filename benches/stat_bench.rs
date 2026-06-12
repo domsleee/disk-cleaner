@@ -119,8 +119,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
-    // BENCH_WARMUP=0 skips the warmup scan — required for cold-cache runs
-    // (e.g. freshly attached disk image) where the first scan IS the sample.
+    // BENCH_WARMUP=0: cold-cache runs sample the first scan.
     let warmup = std::env::var("BENCH_WARMUP").map_or(true, |v| v != "0");
     let path = std::path::Path::new(&dir);
     assert!(path.exists(), "Directory does not exist: {dir}");

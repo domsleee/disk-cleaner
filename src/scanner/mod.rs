@@ -127,9 +127,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 fn scan_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        // Oversubscribing measured slower cold and warm (APFS metadata
-        // lock contention); rayon's core-count default wins. SCAN_THREADS
-        // overrides for tuning experiments (0 = rayon default).
+        // 0 = rayon default (core count); oversubscribing measured slower.
         let threads = std::env::var("SCAN_THREADS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())

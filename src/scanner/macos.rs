@@ -185,9 +185,6 @@ pub fn walk_dir_bulk(
                 break;
             }
 
-            // Slight over-reserve (count covers files + subdirs); cheaper
-            // than a pre-count parse pass. shrink_to_fit below trims the
-            // long-lived allocation; sub_dirs is transient.
             file_children.reserve(count as usize);
             sub_dirs.reserve(count as usize);
 
@@ -310,8 +307,7 @@ pub fn walk_dir_bulk(
         Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
     };
 
-    // Small-dir sequential fallback — rayon job spawn per subdir costs more
-    // than it buys for skinny trees.
+    // Small-dir sequential fallback — skip rayon for few subdirs.
     const PAR_THRESHOLD: usize = 4;
     let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
         sub_dirs.into_iter().filter_map(walk_child).collect()
@@ -319,8 +315,7 @@ pub fn walk_dir_bulk(
         sub_dirs.into_par_iter().filter_map(walk_child).collect()
     };
 
-    // Files were already summed into batch_total_size during parse; only
-    // subdir sizes remain.
+    // batch_total_size already covers files; only subdir sizes remain.
     let size = batch_total_size + dir_children.iter().map(|c| c.size()).sum::<u64>();
     file_children.extend(dir_children);
     file_children.shrink_to_fit();

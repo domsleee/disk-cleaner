@@ -17,37 +17,48 @@
 set -euo pipefail
 
 IMAGE="/tmp/disk-cleaner-coldbench.sparseimage"
-VOLUME="/Volumes/coldbench"
+MOUNT="/tmp/disk-cleaner-coldbench-mnt"
+MARKER="$MOUNT/.fixture-complete"
 RUNS="${RUNS:-5}"
 
 cd "$(dirname "$0")/.."
 
+attach() { hdiutil attach -quiet -mountpoint "$MOUNT" "$IMAGE"; }
+detach() { hdiutil detach -quiet "$MOUNT" 2>/dev/null || true; }
+trap detach EXIT
+
 if [[ "${1:-}" == "--clean" ]]; then
-  hdiutil detach -quiet "$VOLUME" 2>/dev/null || true
+  detach
   rm -f "$IMAGE"
   echo "Removed $IMAGE"
   exit 0
 fi
 
-detach() { hdiutil detach -quiet "$VOLUME" 2>/dev/null || true; }
-trap detach EXIT
-
-# --- Fixture (created once, reused) ---
+# --- Fixture (created once, reused; marker guards partial creation) ---
+if [[ -f "$IMAGE" ]]; then
+  attach
+  if [[ ! -f "$MARKER" ]]; then
+    echo "Incomplete fixture image, recreating..."
+    detach
+    rm -f "$IMAGE"
+  fi
+fi
 if [[ ! -f "$IMAGE" ]]; then
   echo "=== Creating fixture image (one-time) ==="
   hdiutil create -size 2g -fs APFS -volname coldbench -type SPARSE -quiet "$IMAGE"
-  hdiutil attach -quiet "$IMAGE"
+  attach
   for i in $(seq 1 50); do
     for j in $(seq 1 8); do
-      d="$VOLUME/top_$i/mid_$j"
+      d="$MOUNT/top_$i/mid_$j"
       mkdir -p "$d"
       (cd "$d" && touch file_{001..075}.dat \
         && for k in 1 2 3; do head -c 8192 /dev/zero > "blob_$k.bin"; done)
     done
   done
-  echo "Fixture: $(find "$VOLUME" -type f | wc -l | tr -d ' ') files"
-  detach
+  touch "$MARKER"
+  echo "Fixture: $(find "$MOUNT" -type f | wc -l | tr -d ' ') files"
 fi
+detach
 
 echo "=== Building stat_bench ==="
 cargo bench --bench stat_bench --no-run 2>&1 | tail -1
@@ -56,9 +67,9 @@ echo ""
 echo "=== Cold scan: $RUNS runs (detach/attach between each) ==="
 times=()
 for run in $(seq 1 "$RUNS"); do
-  hdiutil attach -quiet "$IMAGE"
+  attach
   sleep 1
-  ms=$(BENCH_DIR="$VOLUME" BENCH_RUNS=1 BENCH_WARMUP=0 \
+  ms=$(BENCH_DIR="$MOUNT" BENCH_RUNS=1 BENCH_WARMUP=0 \
        cargo bench --bench stat_bench 2>&1 \
        | awk '/Run  1:/ {print $3}')
   echo "  run $run: ${ms} ms"

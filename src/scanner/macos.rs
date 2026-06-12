@@ -214,17 +214,19 @@ pub fn walk_dir_bulk(
 
                 unsafe {
                     let base = buf.as_ptr().add(offset);
-                    let entry_len = *(base as *const u32) as usize;
+                    // read_unaligned: entries are 4-byte aligned, not 8;
+                    // typed derefs would be UB for the i64 field.
+                    let entry_len = base.cast::<u32>().read_unaligned() as usize;
                     if entry_len == 0 || offset + entry_len > BUF_SIZE {
                         break;
                     }
 
                     // Which file attrs were actually returned for this entry?
-                    let returned_file = *(base.add(16) as *const u32);
+                    let returned_file = base.add(16).cast::<u32>().read_unaligned();
 
                     // Name — attrreference_t at +24
-                    let name_dataoff = *(base.add(24) as *const i32);
-                    let name_bytelen = *(base.add(28) as *const u32) as usize;
+                    let name_dataoff = base.add(24).cast::<i32>().read_unaligned();
+                    let name_bytelen = base.add(28).cast::<u32>().read_unaligned() as usize;
 
                     let name_ptr = base.add(24).offset(name_dataoff as isize);
                     let name_end =
@@ -244,8 +246,8 @@ pub fn walk_dir_bulk(
                             .into_boxed_str(),
                     };
 
-                    let objtype = *(base.add(32) as *const u32);
-                    let flags = *(base.add(36) as *const u32);
+                    let objtype = base.add(32).cast::<u32>().read_unaligned();
+                    let flags = base.add(36).cast::<u32>().read_unaligned();
                     let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
 
                     match objtype {
@@ -254,7 +256,7 @@ pub fn walk_dir_bulk(
                         }
                         VREG => {
                             let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                                *(base.add(40) as *const i64) as u64
+                                base.add(40).cast::<i64>().read_unaligned() as u64
                             } else {
                                 0
                             };

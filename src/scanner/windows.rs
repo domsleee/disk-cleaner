@@ -1,7 +1,7 @@
 //! Windows bulk metadata walker using `GetFileInformationByHandleEx`.
 //!
 //! Uses `FileIdExtdDirectoryInfo` to fetch many directory entries per syscall,
-//! including name, file attributes, reparse tag, and file size.
+//! including name, file attributes, reparse tag, and on-disk allocation size.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -308,7 +308,11 @@ pub fn walk_dir_bulk(
                     let name_len = (&raw const (*info).FileNameLength).read_unaligned() as usize;
                     let attrs = (&raw const (*info).FileAttributes).read_unaligned();
                     let reparse_tag = (&raw const (*info).ReparsePointTag).read_unaligned();
-                    let logical_size = (&raw const (*info).EndOfFile).read_unaligned() as u64;
+                    // On-disk allocation, not logical size (EndOfFile): a disk
+                    // cleaner should report reclaimable bytes, so sparse and
+                    // compressed files count what they actually occupy. Matches
+                    // the macOS scanner's ATTR_FILE_ALLOCSIZE semantics.
+                    let alloc_size = (&raw const (*info).AllocationSize).read_unaligned() as u64;
                     let entry_len = if next_entry == 0 {
                         buf.len() - offset
                     } else {
@@ -329,13 +333,13 @@ pub fn walk_dir_bulk(
                             next_entry,
                             name_wide,
                             attrs,
-                            logical_size,
+                            alloc_size,
                             is_directory,
                             is_symlink,
                         ))
                     }
                 };
-                let Some((next_entry, name, attrs, logical_size, is_directory, is_symlink)) =
+                let Some((next_entry, name, attrs, alloc_size, is_directory, is_symlink)) =
                     parsed
                 else {
                     break;
@@ -359,8 +363,8 @@ pub fn walk_dir_bulk(
                     sub_dirs.push((name, hidden));
                 } else {
                     batch_file_count += 1;
-                    batch_total_size += logical_size;
-                    file_children.push(FileNode::File(FileLeaf::new(name, logical_size, hidden)));
+                    batch_total_size += alloc_size;
+                    file_children.push(FileNode::File(FileLeaf::new(name, alloc_size, hidden)));
                 }
 
                 if next_entry == 0 {

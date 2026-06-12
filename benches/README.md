@@ -54,6 +54,33 @@ cargo bench --bench stat_bench                              # default: ~/
 BENCH_DIR=/path/to/scan BENCH_RUNS=5 cargo bench --bench stat_bench
 ```
 
+### Cold-cache scan (`coldcache.ps1`, Windows)
+
+Scans a VHDX-backed NTFS volume that is dismounted/remounted before every
+run, so each scan starts with a cold NTFS metadata cache — no reboot needed.
+Hot-cache benches understate I/O-bound improvements; use this for experiments
+that target first-scan latency (traversal order, handle pipelining, I/O depth).
+Requires an elevated PowerShell. The fixture VHDX is created once under
+`target/coldcache/` and reused across builds, so A/B comparisons see the
+identical on-disk layout.
+
+```powershell
+# 5 cold runs against a generated 50k-file fixture (creates it on first use)
+.\benches\coldcache.ps1
+
+# Fixture copied from a real tree, 10 runs, plus a hot re-scan for contrast
+.\benches\coldcache.ps1 -SourcePath C:\Users\me\projects -Runs 10 -AlsoHot
+
+# Evict the .vhdx backing file from the host page cache too (block-level cold)
+.\benches\coldcache.ps1 -PurgeStandby
+
+# A/B: benchmark a saved binary from another ref against the same fixture
+.\benches\coldcache.ps1 -Exe C:\temp\scan_only_main.exe
+
+.\benches\coldcache.ps1 -Rebuild   # regenerate the fixture
+.\benches\coldcache.ps1 -Cleanup   # delete the fixture
+```
+
 ## Comparing branches
 
 ```sh

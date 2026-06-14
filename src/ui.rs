@@ -160,15 +160,15 @@ pub enum TreeAction {
 pub fn reveal_in_file_manager_label() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "Show in Explorer"
+        "Reveal in File Explorer"
     }
     #[cfg(target_os = "macos")]
     {
-        "Open in Finder"
+        "Reveal in Finder"
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        "Show in File Manager"
+        "Open Containing Folder"
     }
 }
 

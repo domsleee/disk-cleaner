@@ -155,6 +155,23 @@ pub enum TreeAction {
     CopyPath(PathBuf),
 }
 
+/// Label for the "reveal in file manager" context-menu entry, named for the
+/// platform's native file manager.
+pub fn reveal_in_file_manager_label() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Reveal in File Explorer"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Reveal in Finder"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "Open Containing Folder"
+    }
+}
+
 /// Minimum number of loose files in a folder to trigger grouping.
 const FILE_GROUP_THRESHOLD: usize = 2;
 
@@ -675,7 +692,7 @@ pub fn render_tree(
                     }
                 } else {
                     // Single-item context menu
-                    if ui.button("Open in Finder").clicked() {
+                    if ui.button(reveal_in_file_manager_label()).clicked() {
                         actions.push(TreeAction::RevealInFinder(ctx_path.clone()));
                         ui.close();
                     }

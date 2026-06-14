@@ -107,6 +107,35 @@ fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Reveal a path in the OS file manager, selecting/highlighting it where the
+/// platform supports it.
+fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer.exe expects `/select,<path>` as a single argument and
+        // wants Windows-style separators.
+        Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg("-R").arg(path).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select" on Linux file managers, so open the
+        // containing folder instead.
+        let target = path.parent().unwrap_or(path);
+        Command::new("xdg-open").arg(target).spawn()?;
+        Ok(())
+    }
+}
+
 /// Result from the background scan thread — includes pre-computed stats
 /// so they don't block the UI thread.
 struct ScanResult {
@@ -1773,12 +1802,9 @@ impl eframe::App for App {
                                 self.confirm_batch_delete = Some(self.pending_batch_delete());
                             }
                             ui::TreeAction::RevealInFinder(path) => {
-                                if let Err(e) = std::process::Command::new("open")
-                                    .arg("-R")
-                                    .arg(path)
-                                    .spawn()
-                                {
-                                    self.error = Some(format!("Could not reveal in Finder: {e}"));
+                                if let Err(e) = reveal_in_file_manager(path) {
+                                    self.error =
+                                        Some(format!("Could not reveal in file manager: {e}"));
                                 }
                             }
                             ui::TreeAction::CopyPath(path) => {

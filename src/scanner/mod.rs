@@ -541,7 +541,11 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 use std::os::unix::fs::MetadataExt;
                 metadata.blocks() * 512
             };
-            #[cfg(not(unix))]
+            // On-disk allocation, matching the Windows bulk walker. Falls
+            // back to logical size if the query fails.
+            #[cfg(windows)]
+            let len = windows::allocation_size(&entry.path()).unwrap_or(metadata.len());
+            #[cfg(not(any(unix, windows)))]
             let len = metadata.len();
             progress.file_count.fetch_add(1, Ordering::Relaxed);
             progress.total_size.fetch_add(len, Ordering::Relaxed);
@@ -1003,7 +1007,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("sub");
         fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("nested.txt"), "fallback").unwrap();
+        // 5000 bytes is non-resident, so its on-disk allocation is at least
+        // one cluster and strictly larger than the logical 5000 (regardless
+        // of cluster size). This lets us assert the fallback path reports
+        // on-disk allocation, not logical size.
+        let nested = sub.join("nested.bin");
+        fs::write(&nested, vec![0u8; 5000]).unwrap();
         fs::write(tmp.path().join("root.txt"), "root").unwrap();
 
         let _guard = windows::fail_open_relative_for_name("sub");
@@ -1020,6 +1029,18 @@ mod tests {
             sub_node.children().len(),
             1,
             "failed Windows bulk child open should fall back and still scan contents"
+        );
+        // The fallback (generic walk) must report on-disk allocation too,
+        // matching the bulk walker — not logical metadata.len() (5000).
+        let nested_size = sub_node.children()[0].size();
+        let nested_alloc = allocation_size(&nested);
+        assert_eq!(
+            nested_size, nested_alloc,
+            "fallback path should report on-disk allocation ({nested_alloc}), got {nested_size}"
+        );
+        assert!(
+            nested_size > 5000,
+            "on-disk allocation of a non-resident 5000-byte file must exceed its logical size"
         );
         assert_eq!(
             progress.file_count.load(Ordering::Relaxed),

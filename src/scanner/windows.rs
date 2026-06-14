@@ -26,8 +26,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdExtdDirectoryInfo,
+    FileIdExtdDirectoryRestartInfo, FileStandardInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
@@ -520,6 +520,48 @@ fn should_fail_open_relative(name: &str) -> bool {
                 .map(|target| target == name)
         })
         .unwrap_or(false)
+}
+
+/// On-disk allocation size of a single file, for the generic-walk fallback
+/// path so it stays consistent with the bulk walker's `AllocationSize`
+/// (rather than logical `metadata.len()`). Returns `None` on error so the
+/// caller can fall back to logical size. Queries the same `AllocationSize`
+/// field the bulk walker uses, via `FILE_STANDARD_INFO`.
+pub(super) fn allocation_size(path: &Path) -> Option<u64> {
+    // FILE_READ_ATTRIBUTES — enough to query metadata without read access,
+    // so this still works on files we couldn't open for reading.
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+
+    let wide = to_verbatim_wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let _guard = DirectoryHandle(handle);
+
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(info.AllocationSize as u64)
 }
 
 fn to_verbatim_wide(path: &Path) -> Vec<u16> {

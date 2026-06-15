@@ -87,6 +87,141 @@ fn write_fallback_report(
     Ok(report_path)
 }
 
+/// Paint a vertical-gradient-filled rounded rect.  Top is `base` lifted
+/// ~12% toward white, bottom is `base` darkened ~10%.  Adds depth so
+/// tiles read as solid objects rather than flat fills.
+fn paint_gradient_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    base: egui::Color32,
+    radius: f32,
+) {
+    let lift =
+        |c: u8, by: f32| -> u8 { ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8 };
+    let dim = |c: u8, by: f32| -> u8 { ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8 };
+    let top = egui::Color32::from_rgb(
+        lift(base.r(), 0.18),
+        lift(base.g(), 0.18),
+        lift(base.b(), 0.18),
+    );
+    let bot = egui::Color32::from_rgb(
+        dim(base.r(), 0.12),
+        dim(base.g(), 0.12),
+        dim(base.b(), 0.12),
+    );
+    // Build a Mesh: 4 verts, 2 triangles, vertex colours top→bot.
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bot);
+    mesh.colored_vertex(rect.left_bottom(), bot);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    // For simplicity, paint the mesh first (no rounded corners) and
+    // overlay a rounded-corner mask via stroked outline.
+    painter.add(egui::Shape::mesh(mesh));
+    // A faint rounded outline so the corners appear soft.
+    if radius > 0.0 {
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+}
+
+/// Paint a 45° animated stripe overlay on `rect` to telegraph
+/// "this region is still being computed".  Stripes drift over time
+/// using `t_seconds` so the eye reads it as motion.
+fn paint_shimmer(painter: &egui::Painter, rect: egui::Rect, t_seconds: f32) {
+    let stripe_w = 6.0_f32;
+    let pitch = stripe_w * 2.0;
+    // Translate by t along the diagonal — wraps every `pitch` pixels.
+    let drift = (t_seconds * 22.0) % pitch;
+    let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16);
+    // Cover the rect with /-stripes; clip to rect bounds.
+    let span = rect.width() + rect.height();
+    let n = (span / pitch).ceil() as i32 + 2;
+    // Walk diagonals: each stripe is the polygon between two parallel
+    // lines y = -x + c and y = -x + c + stripe_w.  We approximate with
+    // axis-aligned slabs that we then mask via egui's clip rect.
+    let saved_clip = painter.clip_rect();
+    let painter = painter.with_clip_rect(rect);
+    for i in -n..n {
+        let c = i as f32 * pitch + drift;
+        // Diagonal stripe: a thin parallelogram from (rect.left, top+c)
+        // sliding to (rect.right, top+c-rect.width)
+        let p0 = rect.left_top() + egui::vec2(0.0, c);
+        let p1 = rect.left_top() + egui::vec2(0.0, c + stripe_w);
+        let p2 = rect.left_top() + egui::vec2(rect.width(), c + stripe_w - rect.width());
+        let p3 = rect.left_top() + egui::vec2(rect.width(), c - rect.width());
+        painter.add(egui::Shape::convex_polygon(
+            vec![p0, p1, p2, p3],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    let _ = saved_clip; // keep clip rect alive; restored on drop of `painter`
+}
+
+// fit_text / fit_path moved to treemap module — both renderers
+// (during-scan + post-scan) use them now.
+use crate::treemap::{fit_path, fit_text};
+
+/// A tab-style toggle button: frameless text label with a 2-px accent
+/// underline drawn while `active`.  Inactive labels render in
+/// `weak_text_color`; active labels in the default text colour and
+/// `strong()`.  Replaces ad-hoc `selectable_label` and the inline
+/// underline-tab code so every toggle in the toolbar reads as the
+/// same kind of widget.
+fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let text = if active {
+        egui::RichText::new(label).strong().size(14.0)
+    } else {
+        egui::RichText::new(label)
+            .size(14.0)
+            .color(ui.visuals().weak_text_color())
+    };
+    let btn = egui::Button::new(text)
+        .frame(false)
+        .min_size(egui::vec2(0.0, 24.0));
+    let response = ui.add(btn);
+    if active {
+        let rect = response.rect;
+        let painter = ui.painter();
+        let accent = egui::Color32::from_rgb(100, 180, 255);
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                egui::vec2(rect.width(), 2.0),
+            ),
+            0.0,
+            accent,
+        );
+    }
+    response
+}
+
+/// Open a file/folder in the platform's default file manager.
+fn open_in_finder(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(path).spawn()?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+        Ok(())
+    }
+}
+
 fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -220,11 +355,27 @@ fn main() -> eframe::Result {
     let mut screenshot_prefix: Option<String> = None;
 
     let mut i = 0;
+    let mut screenshot_scanning_out: Option<PathBuf> = None;
+    let mut screenshot_scanning_multi: Option<(String, Vec<u64>)> = None;
+    let mut bench_zoom: Option<String> = None;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
+            }
+            "--bench-zoom" => {
+                // After the initial scan completes, switch to treemap
+                // mode and zoom into the named top-level child.
+                // Records the elapsed time of the next ~10 update()
+                // frames after the click, then exits.  Used to measure
+                // "click into a folder" lag from the command line.
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --bench-zoom requires a child name");
+                    std::process::exit(1);
+                }
+                bench_zoom = Some(args[i].clone());
             }
             "--screenshot" => {
                 i += 1;
@@ -233,6 +384,39 @@ fn main() -> eframe::Result {
                     std::process::exit(1);
                 }
                 screenshot_prefix = Some(args[i].clone());
+            }
+            "--screenshot-scanning" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --screenshot-scanning requires an output path");
+                    std::process::exit(1);
+                }
+                screenshot_scanning_out = Some(PathBuf::from(&args[i]));
+            }
+            "--screenshot-scanning-multi" => {
+                // --screenshot-scanning-multi <prefix> <t1,t2,...>
+                // Captures frames at the given times-since-scan-start (in
+                // milliseconds), saving as <prefix>_t<ms>.png each.  Exits
+                // after the last capture (or when scan ends, whichever
+                // comes first).
+                i += 1;
+                if i + 1 >= args.len() {
+                    eprintln!(
+                        "Error: --screenshot-scanning-multi requires <prefix> <times-ms-csv>"
+                    );
+                    std::process::exit(1);
+                }
+                let prefix = args[i].clone();
+                i += 1;
+                let times: Vec<u64> = args[i]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .collect();
+                if times.is_empty() {
+                    eprintln!("Error: no valid times in --screenshot-scanning-multi");
+                    std::process::exit(1);
+                }
+                screenshot_scanning_multi = Some((prefix, times));
             }
             other => {
                 if other.starts_with('-') {
@@ -294,6 +478,14 @@ fn main() -> eframe::Result {
                 } else {
                     ScreenshotState::Idle
                 },
+                screenshot_scanning_out: screenshot_scanning_out.clone(),
+                screenshot_scanning_armed_at: None,
+                screenshot_scanning_multi: screenshot_scanning_multi.clone(),
+                screenshot_scanning_multi_taken: 0,
+                bench_zoom_target: bench_zoom.clone(),
+                bench_zoom_armed: false,
+                bench_zoom_clicked_at: None,
+                bench_zoom_frames_left: 0,
                 ..Default::default()
             };
             if app.screenshot_prefix.is_some() {
@@ -402,6 +594,56 @@ struct App {
     screenshots_saved: u8,
     /// Background deletion state.
     deleter: BackgroundDeleter,
+    /// One-shot output path for the in-scan screenshot mode.
+    screenshot_scanning_out: Option<PathBuf>,
+    /// Time the scanning capture was armed (used to delay capture so
+    /// the live results panel has time to populate).
+    screenshot_scanning_armed_at: Option<Instant>,
+    /// Multi-shot scanning screenshot mode: (prefix, times-in-ms).
+    screenshot_scanning_multi: Option<(String, Vec<u64>)>,
+    /// How many of the multi-shot frames have been captured + saved.
+    screenshot_scanning_multi_taken: usize,
+    /// Click-lag bench mode: after scan, switch to treemap and zoom
+    /// into this top-level child name.  Measures next-frame timings.
+    bench_zoom_target: Option<String>,
+    bench_zoom_armed: bool,
+    bench_zoom_clicked_at: Option<Instant>,
+    bench_zoom_frames_left: u8,
+    /// Live scan-treemap layout: per-path target rect (recomputed every
+    /// 250 ms) and current rendered rect (lerped toward target each
+    /// frame).  Empty when not scanning.  See render_scanning_panel.
+    scan_tm_targets: std::collections::HashMap<PathBuf, egui::Rect>,
+    scan_tm_current: std::collections::HashMap<PathBuf, egui::Rect>,
+    scan_tm_last_layout: Option<Instant>,
+    /// Cached pre-grouped, pre-deduped scan-treemap data.  Rebuilt
+    /// only on the 250 ms throttle boundary so the per-frame render
+    /// path doesn't redo the O(N²) dedupe + grouping.
+    scan_tm_cache: ScanTreemapCache,
+}
+
+/// Pre-computed view of the live treemap data.  Populated on the
+/// 250 ms layout boundary inside render_scanning_panel.  Keeping it
+/// owned on App lets every frame between boundaries skip the dedupe
+/// and grouping work entirely.
+#[derive(Default)]
+struct ScanTreemapCache {
+    /// Top-level groups, biggest-first.  Each carries its top-N
+    /// deduped descendants.
+    groups: Vec<ScanGroup>,
+    /// Paths whose own walk has finalised — flat HashSet for O(1)
+    /// "is this tile still scanning?" lookup at render time.
+    finalised: std::collections::HashSet<PathBuf>,
+    /// Last raw `completed_subtrees.len()` we built from — lets us
+    /// short-circuit when nothing has been added since the last build.
+    built_for_len: usize,
+}
+
+struct ScanGroup {
+    top_path: PathBuf,
+    top_name: String,
+    running_total: u64,
+    own_size: Option<u64>,
+    descendants: Vec<scanner::CompletedSubtree>,
 }
 
 impl Default for App {
@@ -419,6 +661,7 @@ impl Default for App {
                 bulk_scan_fallback_count: 0.into(),
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
+                completed_subtrees: std::sync::Mutex::new(Vec::new()),
             }),
             receiver: None,
             error: None,
@@ -463,6 +706,18 @@ impl Default for App {
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
             deleter: BackgroundDeleter::default(),
+            screenshot_scanning_out: None,
+            screenshot_scanning_armed_at: None,
+            screenshot_scanning_multi: None,
+            screenshot_scanning_multi_taken: 0,
+            bench_zoom_target: None,
+            bench_zoom_armed: false,
+            bench_zoom_clicked_at: None,
+            bench_zoom_frames_left: 0,
+            scan_tm_targets: std::collections::HashMap::new(),
+            scan_tm_current: std::collections::HashMap::new(),
+            scan_tm_last_layout: None,
+            scan_tm_cache: ScanTreemapCache::default(),
         }
     }
 }
@@ -516,6 +771,7 @@ impl App {
             bulk_scan_fallback_count: 0.into(),
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
+            completed_subtrees: std::sync::Mutex::new(Vec::new()),
         });
         self.scan_progress = progress.clone();
 
@@ -529,12 +785,625 @@ impl App {
         self.last_scan_bulk_scan_fallback_count = 0;
         self.last_scan_fallback_details.clear();
         self.scan_frame_times.clear();
+        self.scan_tm_targets.clear();
+        self.scan_tm_current.clear();
+        self.scan_tm_last_layout = None;
+        self.scan_tm_cache = ScanTreemapCache::default();
 
         thread::spawn(move || {
             let tree = scanner::scan_directory(&path, progress);
             let stats = categories::compute_stats(&tree);
             let _ = tx.send(ScanResult { tree, stats });
         });
+    }
+
+    /// Live results UI shown during a scan.  Renders a top status strip
+    /// (file count, indeterminate bar, elapsed, cancel) and below it a
+    /// scrolling list of completed subtrees, sorted biggest-first to match
+    /// the post-scan tree view.  Rows are interactive: clicking opens in
+    /// Finder, right-click trashes.
+    fn render_scanning_panel(&mut self, ui: &mut egui::Ui) {
+        // ── Top status strip ──
+        let files = self.scan_progress.file_count.load(Ordering::Relaxed);
+        let size = self.scan_progress.total_size.load(Ordering::Relaxed);
+        let size_str = treemap::fmt_size_compact(size);
+        let path_str = self
+            .scan_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("Scanning {path_str}"))
+                    .strong()
+                    .size(13.0),
+            );
+            ui.label(
+                egui::RichText::new(format!("· {files} files · {size_str}"))
+                    .weak()
+                    .size(13.0),
+            );
+            if let Some(start) = self.scan_start_time {
+                ui.label(
+                    egui::RichText::new(format!("· {}", format_elapsed(start.elapsed())))
+                        .weak()
+                        .size(13.0),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    self.cancel_scan();
+                }
+            });
+        });
+
+        // Indeterminate progress bar — a fixed-width segment that slides
+        // across left-to-right, the conventional "I'm doing something but
+        // I don't know how much is left" affordance.  egui doesn't ship
+        // an indeterminate ProgressBar, so paint it directly.
+        let t = ui.ctx().input(|i| i.time) as f32;
+        let bar_height = 4.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), bar_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        // Track
+        painter.rect_filled(
+            rect,
+            bar_height / 2.0,
+            ui.visuals().widgets.inactive.bg_fill.linear_multiply(0.6),
+        );
+        // Marquee: 25% wide, slides at ~0.5 cycles/sec, eases via sine-mapped position
+        let track_w = rect.width();
+        let seg_w = (track_w * 0.25).max(40.0);
+        let cycle = 1.6_f32; // seconds for one full sweep
+        let phase = ((t / cycle).fract() * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+        let x_min = rect.min.x + (track_w - seg_w) * phase;
+        let seg_rect =
+            egui::Rect::from_min_size(egui::pos2(x_min, rect.min.y), egui::vec2(seg_w, bar_height));
+        painter.rect_filled(seg_rect, bar_height / 2.0, ui.visuals().selection.bg_fill);
+
+        ui.add_space(6.0);
+
+        // ── Canvas ──
+        // Reserve a bit of breathing room around the treemap so tiles
+        // don't run flush to the panel edges.  Looks designed instead
+        // of stuffed.
+        let avail = ui.available_size();
+        let (outer_rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let outer_painter = ui.painter_at(outer_rect);
+        outer_painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+        let canvas_rect = outer_rect.shrink(8.0);
+        let painter = ui.painter_at(canvas_rect);
+
+        let scan_root = self.scan_path.clone();
+        let scan_root_path = scan_root.clone().unwrap_or_else(|| PathBuf::from("/"));
+        let mut clicked_open: Option<PathBuf> = None;
+        let mut clicked_trash: Option<PathBuf> = None;
+
+        // ── Throttled re-layout + grouping (250 ms) ──
+        // Both the O(N²) dedupe AND the squarify pass live behind this
+        // boundary, so per-frame work is just lerp + paint.
+        let now_inst = Instant::now();
+        let canvas_changed = self
+            .scan_tm_targets
+            .values()
+            .next()
+            .map(|r| !canvas_rect.contains(r.center()))
+            .unwrap_or(true);
+        let due = self
+            .scan_tm_last_layout
+            .map(|t| now_inst.duration_since(t) >= Duration::from_millis(250))
+            .unwrap_or(true);
+
+        // Cheap length probe under the lock — lets us short-circuit if
+        // no events landed since the last rebuild even when the timer
+        // fires.
+        let raw_len = self
+            .scan_progress
+            .completed_subtrees
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0);
+
+        if raw_len == 0 {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Looking for big stuff…")
+                        .weak()
+                        .size(13.0),
+                );
+            });
+            return;
+        }
+
+        if (due || canvas_changed) && raw_len != self.scan_tm_cache.built_for_len {
+            // Snapshot the events.  Single clone, brief lock.
+            let raw: Vec<scanner::CompletedSubtree> = self
+                .scan_progress
+                .completed_subtrees
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+
+            // Bucket into groups by first path component below scan_root.
+            // HashMap → O(1) group lookup instead of O(G) linear scan.
+            let mut by_top: std::collections::HashMap<PathBuf, ScanGroup> =
+                std::collections::HashMap::new();
+            for item in &raw {
+                let rel = match item.path.strip_prefix(&scan_root_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let first = match rel.components().next() {
+                    Some(c) => c.as_os_str().to_string_lossy().into_owned(),
+                    None => continue,
+                };
+                let top_path = scan_root_path.join(&first);
+                let entry = by_top.entry(top_path.clone()).or_insert_with(|| ScanGroup {
+                    top_path: top_path.clone(),
+                    top_name: first,
+                    running_total: 0,
+                    own_size: None,
+                    descendants: Vec::new(),
+                });
+                if item.path == top_path {
+                    entry.own_size = Some(item.size);
+                } else {
+                    entry.descendants.push(item.clone());
+                }
+            }
+
+            // Dedupe descendants per-group with O(N log N) sort + an
+            // O(N·D) ancestor check where D is the max-kept depth.
+            // Bound D at 12 (the max rendered nested per tile) so the
+            // inner check stops early.
+            let mut groups: Vec<ScanGroup> = by_top.into_values().collect();
+            for g in &mut groups {
+                g.descendants.sort_unstable_by(|a, b| {
+                    b.size
+                        .cmp(&a.size)
+                        .then_with(|| a.path.as_os_str().len().cmp(&b.path.as_os_str().len()))
+                });
+                let mut kept: Vec<scanner::CompletedSubtree> =
+                    Vec::with_capacity(g.descendants.len().min(12));
+                for item in std::mem::take(&mut g.descendants) {
+                    if !kept.iter().any(|k| item.path.starts_with(&k.path)) {
+                        kept.push(item);
+                        if kept.len() >= 32 {
+                            // Stop dedupe once we have far more than we'd
+                            // ever render (12 nested) — anything past
+                            // here can't be the biggest visible tile.
+                            break;
+                        }
+                    }
+                }
+                let descendants_sum: u64 = kept.iter().map(|c| c.size).sum();
+                g.descendants = kept;
+                g.running_total = g.own_size.unwrap_or(0).max(descendants_sum);
+            }
+            groups.sort_unstable_by_key(|g| std::cmp::Reverse(g.running_total));
+
+            // Build flat finalised set for O(1) shimmer-or-not.
+            let finalised: std::collections::HashSet<PathBuf> =
+                raw.iter().map(|c| c.path.clone()).collect();
+
+            // Squarify top-level + nested into target rects.
+            let group_sizes: Vec<f64> = groups
+                .iter()
+                .map(|g| g.running_total.max(1) as f64)
+                .collect();
+            let group_rects = treemap::squarify(
+                &group_sizes,
+                canvas_rect.min.x,
+                canvas_rect.min.y,
+                canvas_rect.width(),
+                canvas_rect.height(),
+            );
+            self.scan_tm_targets.clear();
+            for (g, &r) in groups.iter().zip(group_rects.iter()) {
+                self.scan_tm_targets.insert(g.top_path.clone(), r);
+                if r.width() < 1.0 || r.height() < 1.0 {
+                    continue;
+                }
+                let inset = r.shrink(1.0);
+                let label_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
+                let nest_max = if inset.area() > 60_000.0 {
+                    12
+                } else if inset.area() > 18_000.0 {
+                    6
+                } else {
+                    0
+                };
+                if nest_max == 0 || g.descendants.is_empty() {
+                    continue;
+                }
+                let nested_top = &g.descendants[..g.descendants.len().min(nest_max)];
+                let nest_rect = egui::Rect::from_min_max(
+                    egui::pos2(inset.min.x + 4.0, inset.min.y + label_h),
+                    egui::pos2(inset.max.x - 4.0, inset.max.y - 4.0),
+                );
+                if nest_rect.width() < 30.0 || nest_rect.height() < 30.0 {
+                    continue;
+                }
+                let nsizes: Vec<f64> = nested_top.iter().map(|d| d.size.max(1) as f64).collect();
+                let nrects = treemap::squarify(
+                    &nsizes,
+                    nest_rect.min.x,
+                    nest_rect.min.y,
+                    nest_rect.width(),
+                    nest_rect.height(),
+                );
+                for (d, &nr) in nested_top.iter().zip(nrects.iter()) {
+                    self.scan_tm_targets.insert(d.path.clone(), nr);
+                }
+            }
+
+            self.scan_tm_cache = ScanTreemapCache {
+                groups,
+                finalised,
+                built_for_len: raw_len,
+            };
+            self.scan_tm_last_layout = Some(now_inst);
+        }
+
+        if self.scan_tm_cache.groups.is_empty() {
+            return;
+        }
+
+        // Lerp current rects toward targets every frame.
+        let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.05);
+        let k = 7.5_f32;
+        let blend = 1.0 - (-k * dt).exp();
+
+        // Insert any new path at its target's centre with zero size so
+        // it grows in.  Use HashMap::contains_key (O(1)) instead of the
+        // previous "build a HashSet of cloned paths" pattern (O(N) per
+        // frame).
+        for (path, &target) in &self.scan_tm_targets {
+            if !self.scan_tm_current.contains_key(path) {
+                let centre = target.center();
+                self.scan_tm_current.insert(
+                    path.clone(),
+                    egui::Rect::from_center_size(centre, egui::vec2(0.5, 0.5)),
+                );
+            }
+        }
+        // Drop paths that disappeared from targets — direct contains_key
+        // on the targets map, no Set rebuild.
+        self.scan_tm_current
+            .retain(|p, _| self.scan_tm_targets.contains_key(p));
+
+        // Apply lerp.  Track whether any tile is still "in motion" so we
+        // can stop requesting per-frame repaints once everything is at
+        // rest.
+        let mut still_moving = false;
+        for (path, cur) in self.scan_tm_current.iter_mut() {
+            if let Some(target) = self.scan_tm_targets.get(path) {
+                let dx_min = target.min.x - cur.min.x;
+                let dy_min = target.min.y - cur.min.y;
+                let dx_max = target.max.x - cur.max.x;
+                let dy_max = target.max.y - cur.max.y;
+                cur.min.x += dx_min * blend;
+                cur.min.y += dy_min * blend;
+                cur.max.x += dx_max * blend;
+                cur.max.y += dy_max * blend;
+                if dx_min.abs() > 0.5
+                    || dy_min.abs() > 0.5
+                    || dx_max.abs() > 0.5
+                    || dy_max.abs() > 0.5
+                {
+                    still_moving = true;
+                }
+            }
+        }
+
+        // Drive the marquee + shimmer regardless (those are always
+        // animating).  But schedule the next repaint so we don't spin
+        // at 60 fps when nothing is moving — 50 ms is plenty for
+        // shimmer/marquee continuity.
+        if still_moving {
+            ui.ctx().request_repaint();
+        } else {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+
+        // Top-level tile colour: stable name-hash palette
+        // (treemap::path_color) so the same group paints the same
+        // colour during-scan and post-scan, regardless of rank
+        // shifting as more events arrive.
+        let now = ui.ctx().input(|i| i.time) as f32;
+        let groups = &self.scan_tm_cache.groups;
+        let finalised = &self.scan_tm_cache.finalised;
+
+        for g in groups.iter() {
+            let rect = match self.scan_tm_current.get(&g.top_path) {
+                Some(r) => *r,
+                None => continue,
+            };
+            if rect.width() < 2.0 || rect.height() < 2.0 {
+                continue;
+            }
+            let inset = rect.shrink(1.0);
+            let base = treemap::path_color(&g.top_name);
+            let scanning = g.own_size.is_none();
+
+            // Vertical gradient: lighter at top, base at bottom.  Painted
+            // as a Mesh with vertex colours.
+            paint_gradient_rect(&painter, inset, base, 4.0);
+
+            // If this group is still scanning its own root walk, overlay
+            // a 45° animated stripe pattern to telegraph "in progress".
+            if scanning {
+                paint_shimmer(&painter, inset, now);
+            }
+
+            // Inner nested children, top 12 by size, only if tile is
+            // big enough to be useful.
+            let nest_max = if inset.area() > 60_000.0 {
+                12
+            } else if inset.area() > 18_000.0 {
+                6
+            } else {
+                0
+            };
+            if nest_max > 0 && !g.descendants.is_empty() {
+                let nested_top = &g.descendants[..g.descendants.len().min(nest_max)];
+                for d in nested_top {
+                    let nr = match self.scan_tm_current.get(&d.path) {
+                        Some(r) => *r,
+                        None => continue,
+                    };
+                    {
+                        if nr.width() < 8.0 || nr.height() < 8.0 {
+                            continue;
+                        }
+                        let inner = nr.shrink(1.0);
+                        // Slightly darker, gradient-filled variant for
+                        // nested tiles.
+                        let dim = base.linear_multiply(0.55);
+                        paint_gradient_rect(&painter, inner, dim, 3.0);
+                        // Stripe overlay if this nested item itself is
+                        // a synthetic intermediate (rare for descendants
+                        // since they came from a real CompletedSubtree;
+                        // we mark it as scanning if the dir hasn't been
+                        // fully walked yet via finalised set).
+                        if !finalised.contains(&d.path) {
+                            paint_shimmer(&painter, inner, now);
+                        }
+                        // Hairline stroke around nested children so
+                        // sibling tiles read as discrete shapes.
+                        painter.rect_stroke(
+                            nr.shrink(0.5),
+                            3.0,
+                            egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60),
+                            ),
+                            egui::epaint::StrokeKind::Inside,
+                        );
+                        // Nested label only if the tile has real room.
+                        if inner.width() > 70.0 && inner.height() > 22.0 {
+                            // Show the path *relative to the group root*.
+                            // Nested tiles can be 3-5 levels deep
+                            // (e.g. dom/git/yt-revenue/MoneyPrinterTurbo
+                            // under the Users group), so showing only
+                            // file_name() makes them look like direct
+                            // children of the group — misleading.
+                            let display = d
+                                .path
+                                .strip_prefix(&g.top_path)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| {
+                                    d.path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| d.path.display().to_string())
+                                });
+                            let avail_w = inner.width() - 8.0;
+                            // Name (top-left).  Use path-aware
+                            // truncation so the leaf component (the
+                            // bit users actually want) is always
+                            // preserved when possible.
+                            if let Some(galley) = fit_path(
+                                &painter,
+                                &display,
+                                egui::FontId::proportional(11.0),
+                                avail_w,
+                            ) {
+                                let pos = inner.left_top() + egui::vec2(4.0, 2.0);
+                                painter.galley(
+                                    pos,
+                                    galley,
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+                                );
+                            }
+                            // Size (bottom-left).  Suppress when this
+                            // nested ≥95 % of the parent's size (the
+                            // header band already shows the same
+                            // number).
+                            let near_full = d.size as f64 >= g.running_total as f64 * 0.95;
+                            if inner.height() > 36.0 && !near_full {
+                                let size_str = treemap::fmt_size_compact(d.size);
+                                if let Some(g_sz) = fit_text(
+                                    &painter,
+                                    &size_str,
+                                    egui::FontId::monospace(11.0),
+                                    avail_w,
+                                ) {
+                                    let pos = inner.left_bottom() + egui::vec2(4.0, -16.0);
+                                    painter.galley(
+                                        pos,
+                                        g_sz,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Hit-test for nested tiles.
+                        let resp = ui.interact(
+                            inner,
+                            egui::Id::new(("nest", &d.path)),
+                            egui::Sense::click(),
+                        );
+                        if resp.hovered() {
+                            painter.rect_stroke(
+                                inner.shrink(0.5),
+                                3.0,
+                                egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                egui::epaint::StrokeKind::Inside,
+                            );
+                        }
+                        if resp.clicked() {
+                            clicked_open = Some(d.path.clone());
+                        }
+                        let path_for_menu = d.path.clone();
+                        resp.context_menu(|ui| {
+                            if ui.button("Open in Finder").clicked() {
+                                clicked_open = Some(path_for_menu.clone());
+                                ui.close();
+                            }
+                            if ui.button("Move to Trash").clicked() {
+                                clicked_trash = Some(path_for_menu.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Skip the header band on tiny group tiles — at <85 px
+            // wide we'd just produce "1..." / "9..." gibberish in
+            // the band.  The tile still paints with its rank colour
+            // and stays clickable / right-clickable.
+            let draw_header = inset.width() >= 85.0 && inset.height() >= 24.0;
+
+            // Parent header band — solid backdrop so labels stay
+            // readable over nested children's tile colors.  Drawn last
+            // so it sits above nested tiles.
+            let header_h = if inset.height() > 80.0 { 36.0 } else { 22.0 };
+            let header_rect =
+                egui::Rect::from_min_size(inset.min, egui::vec2(inset.width(), header_h));
+            if draw_header {
+                // Slightly darker, opaque-ish band of the base color.
+                let band = base.linear_multiply(0.55);
+                painter.rect_filled(
+                    header_rect,
+                    egui::CornerRadius {
+                        nw: 4,
+                        ne: 4,
+                        sw: 0,
+                        se: 0,
+                    },
+                    egui::Color32::from_rgba_unmultiplied(band.r(), band.g(), band.b(), 230),
+                );
+
+                // ── Header text: measure both labels first, decide
+                //    what fits, draw without any overlap ──
+                let header_pad = 8.0_f32;
+                let avail = (inset.width() - header_pad * 2.0).max(0.0);
+                let size_str = treemap::fmt_size_compact(g.running_total);
+                let size_text = if scanning {
+                    format!("{size_str}  ·  scanning")
+                } else {
+                    size_str
+                };
+                let size_galley = fit_text(
+                    &painter,
+                    &size_text,
+                    egui::FontId::proportional(12.0),
+                    avail,
+                );
+                // Reserve right side for size, name gets the rest.
+                let size_w = size_galley
+                    .as_ref()
+                    .map(|g| g.size().x + 12.0)
+                    .unwrap_or(0.0);
+                let name_avail = (avail - size_w).max(0.0);
+                let name_galley = fit_text(
+                    &painter,
+                    &g.top_name,
+                    egui::FontId::proportional(14.5),
+                    name_avail,
+                );
+                // Vertically centre the larger of the two within header.
+                let header_mid_y = header_rect.center().y;
+                if let Some(ng) = name_galley {
+                    let pos = egui::pos2(
+                        header_rect.min.x + header_pad,
+                        header_mid_y - ng.size().y * 0.5,
+                    );
+                    painter.galley(pos, ng, egui::Color32::WHITE);
+                }
+                if let Some(sg) = size_galley {
+                    let pos = egui::pos2(
+                        header_rect.max.x - header_pad - sg.size().x,
+                        header_mid_y - sg.size().y * 0.5,
+                    );
+                    painter.galley(
+                        pos,
+                        sg,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                    );
+                }
+            }
+
+            // Whole-tile click handler (when no nested tile caught it).
+            let resp = ui.interact(
+                inset,
+                egui::Id::new(("group", &g.top_path)),
+                egui::Sense::click(),
+            );
+            if resp.hovered() {
+                // Bright 2-px inner stroke + a 1-px outer halo so the
+                // hover state is visible regardless of underlying tile
+                // colour.  At 110-alpha (the previous value) the
+                // highlight got swallowed by the gradient.
+                painter.rect_stroke(
+                    inset.shrink(1.0),
+                    4.0,
+                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    egui::epaint::StrokeKind::Inside,
+                );
+                painter.rect_stroke(
+                    inset,
+                    4.0,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+                    ),
+                    egui::epaint::StrokeKind::Outside,
+                );
+            }
+            if resp.clicked() && clicked_open.is_none() {
+                clicked_open = Some(g.top_path.clone());
+            }
+            let path_for_menu = g.top_path.clone();
+            resp.context_menu(|ui| {
+                if ui.button("Open in Finder").clicked() {
+                    clicked_open = Some(path_for_menu.clone());
+                    ui.close();
+                }
+                if ui.button("Move to Trash").clicked() {
+                    clicked_trash = Some(path_for_menu.clone());
+                    ui.close();
+                }
+            });
+        }
+
+        if let Some(p) = clicked_open {
+            let _ = open_in_finder(&p);
+        }
+        if let Some(p) = clicked_trash {
+            self.deleter.start(vec![p], false);
+        }
     }
 
     fn rebuild_rows_if_dirty(&mut self) {
@@ -861,10 +1730,210 @@ impl eframe::App for App {
             }
         }
 
+        // ── In-scan screenshot one-shot ──
+        if let Some(out) = self.screenshot_scanning_out.clone()
+            && self.scanning
+        {
+            {
+                if self.screenshot_scanning_armed_at.is_none() {
+                    self.screenshot_scanning_armed_at = Some(Instant::now());
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                } else if let Some(armed) = self.screenshot_scanning_armed_at
+                    && armed.elapsed() >= Duration::from_secs(3)
+                {
+                    // Take the shot now.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.screenshot_scanning_out = None; // one-shot
+                    // Save will happen below when the event arrives.
+                    let out_path = out.clone();
+                    let got = ctx.input(|i| {
+                        i.events.iter().find_map(|e| match e {
+                            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                            _ => None,
+                        })
+                    });
+                    if let Some(image) = got {
+                        let _ = save_screenshot_png(&image, out_path.to_string_lossy().as_ref());
+                        std::process::exit(0);
+                    }
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+        }
+
+        // ── In-scan multi-shot screenshots ──
+        // Capture frames at predefined ms-since-scan-start, save with
+        // suffixed filenames.  Continues until all times have fired or
+        // the scan ends (whichever first), then exits the process.
+        if let Some((prefix, times)) = self.screenshot_scanning_multi.clone() {
+            let scan_start = self.scan_start_time;
+            // Snapshot pending screenshot events first (frame N+1 from
+            // the prior trigger) and save under the matching filename.
+            let pending_image: Option<egui::ColorImage> = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.as_ref().clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = pending_image {
+                let idx = self.screenshot_scanning_multi_taken;
+                if idx > 0 && idx <= times.len() {
+                    let ms = times[idx - 1];
+                    let out = format!("{prefix}_t{ms:05}.png");
+                    let _ = save_screenshot_png(&img, &out);
+                    eprintln!("[multi] saved {out}");
+                }
+                if self.screenshot_scanning_multi_taken >= times.len() || !self.scanning {
+                    eprintln!("[multi] done — captured {} frames", times.len());
+                    std::process::exit(0);
+                }
+            }
+
+            // Trigger the next capture if its scheduled time has come.
+            if let Some(start) = scan_start
+                && self.scanning
+                && self.screenshot_scanning_multi_taken < times.len()
+            {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let next_ms = times[self.screenshot_scanning_multi_taken];
+                if elapsed_ms >= next_ms {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                        egui::UserData::default(),
+                    ));
+                    self.screenshot_scanning_multi_taken += 1;
+                }
+                // Keep ticking even when nothing happened this frame so
+                // the marquee animates and the elapsed counter advances.
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+
+            // If the scan ended before all times fired, exit anyway so
+            // we don't dangle.
+            if !self.scanning && self.screenshot_scanning_multi_taken > 0 {
+                eprintln!(
+                    "[multi] scan finished early; captured {}/{} frames",
+                    self.screenshot_scanning_multi_taken,
+                    times.len()
+                );
+                std::process::exit(0);
+            }
+        }
+
+        // Handle the screenshot event in a follow-up frame for the
+        // scanning capture mode (the event arrives 1+ frames later).
+        if self.scanning && self.screenshot_scanning_armed_at.is_some() {
+            let mut to_save: Option<egui::ColorImage> = None;
+            ctx.input(|i| {
+                for e in &i.events {
+                    if let egui::Event::Screenshot { image, .. } = e {
+                        to_save = Some(image.as_ref().clone());
+                    }
+                }
+            });
+            if let Some(img) = to_save {
+                // Use original CLI arg as fallback path
+                let out = std::env::args()
+                    .skip_while(|a| a != "--screenshot-scanning")
+                    .nth(1);
+                if let Some(p) = out {
+                    let _ = save_screenshot_png(&img, &p);
+                    std::process::exit(0);
+                }
+            }
+        }
+
         // Check if background deletion completed
         self.poll_delete_completion();
         if self.deleter.is_active() {
             ctx.request_repaint();
+        }
+
+        // ── Click-lag bench: simulate a click ──
+        // If target is "DEEP" or "deep" walk biggest-child chain to depth N.
+        // Otherwise zoom to a single named top-level child.
+        if let Some(target_name) = self.bench_zoom_target.clone()
+            && let Some(tree) = self.tree.as_ref()
+            && !self.bench_zoom_armed
+            && !self.scanning
+        {
+            let tree_mode = target_name.starts_with("tree:");
+            let resolved_name = target_name.strip_prefix("tree:").unwrap_or(&target_name);
+            let target = if resolved_name.eq_ignore_ascii_case("deep") {
+                let mut p = std::path::PathBuf::from(tree.name());
+                let mut node = tree;
+                for _ in 0..6 {
+                    let Some(child) = node
+                        .children()
+                        .iter()
+                        .max_by_key(|c| if c.is_dir() { c.size() } else { 0 })
+                    else {
+                        break;
+                    };
+                    if !child.is_dir() {
+                        break;
+                    }
+                    p.push(child.name());
+                    node = child;
+                }
+                Some(p)
+            } else {
+                tree.children()
+                    .iter()
+                    .find(|c| c.name() == resolved_name)
+                    .map(|c| std::path::PathBuf::from(tree.name()).join(c.name()))
+            };
+            if let Some(p) = target {
+                let click_t = Instant::now();
+                if tree_mode {
+                    // Simulate clicking the disclosure arrow on a tree
+                    // row — toggles expand and marks rows dirty.
+                    self.view_mode = ViewMode::Tree;
+                    if let Some(t) = self.tree.as_mut() {
+                        ui::toggle_expand(t, &p);
+                    }
+                    self.rows_dirty = true;
+                    eprintln!("[bench-zoom] tree-toggle on {}", p.display());
+                } else {
+                    self.view_mode = ViewMode::Treemap;
+                    self.treemap_zoom = Some(p.clone());
+                    self.treemap_zoom_anim = Some(ctx.input(|i| i.time));
+                    self.treemap_dirty = true;
+                    eprintln!("[bench-zoom] zoom into {}", p.display());
+                }
+                self.bench_zoom_clicked_at = Some(click_t);
+                self.bench_zoom_frames_left = 12;
+                self.bench_zoom_armed = true;
+            } else {
+                eprintln!(
+                    "[bench-zoom] no top-level child named '{}'; available:",
+                    target_name
+                );
+                for c in tree.children().iter().take(20) {
+                    eprintln!("  - {}", c.name());
+                }
+                std::process::exit(2);
+            }
+        }
+        if self.bench_zoom_armed && self.bench_zoom_frames_left > 0 {
+            let n = 12 - self.bench_zoom_frames_left;
+            let total = self
+                .bench_zoom_clicked_at
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let frame_dt = frame_start.elapsed();
+            eprintln!(
+                "[bench-zoom] frame {} dt={:?} total={:?}",
+                n, frame_dt, total
+            );
+            self.bench_zoom_frames_left -= 1;
+            ctx.request_repaint(); // force next frame so we measure
+            if self.bench_zoom_frames_left == 0 {
+                std::process::exit(0);
+            }
         }
 
         // ── Screenshot state machine ──
@@ -1209,35 +2278,7 @@ impl eframe::App for App {
                                 [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
                             {
                                 let is_active = self.view_mode == mode;
-                                let text = if is_active {
-                                    egui::RichText::new(label).strong().size(14.0)
-                                } else {
-                                    egui::RichText::new(label)
-                                        .size(14.0)
-                                        .color(ui.visuals().weak_text_color())
-                                };
-
-                                let btn = egui::Button::new(text)
-                                    .frame(false)
-                                    .min_size(egui::vec2(0.0, 24.0));
-                                let response = ui.add(btn);
-
-                                // Draw underline for active tab
-                                if is_active {
-                                    let rect = response.rect;
-                                    let painter = ui.painter();
-                                    let accent = egui::Color32::from_rgb(100, 180, 255);
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                            egui::vec2(rect.width(), 2.0),
-                                        ),
-                                        0.0,
-                                        accent,
-                                    );
-                                }
-
-                                if response.clicked() {
+                                if tab_button(ui, label, is_active).clicked() {
                                     self.view_mode = mode;
                                 }
                             }
@@ -1265,37 +2306,29 @@ impl eframe::App for App {
                         // }
 
                         // Hidden files toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_hidden, "Show hidden")
-                                .clicked()
-                            {
-                                self.show_hidden = !self.show_hidden;
-                                self.mark_dirty();
-                                // Persist preference
-                                if let Some(ref path) = self.last_scan_path {
-                                    save_config(path, self.show_hidden);
-                                }
-                                // Recompute stats
-                                if let Some(ref tree) = self.tree {
-                                    self.category_stats = Some(categories::compute_stats(tree));
-                                }
+                        if self.tree.is_some()
+                            && tab_button(ui, "Show hidden", self.show_hidden).clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.mark_dirty();
+                            // Persist preference
+                            if let Some(ref path) = self.last_scan_path {
+                                save_config(path, self.show_hidden);
+                            }
+                            // Recompute stats
+                            if let Some(ref tree) = self.tree {
+                                self.category_stats = Some(categories::compute_stats(tree));
                             }
                         }
 
                         // File types panel toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_categories, "File Types")
-                                .clicked()
-                            {
-                                self.show_categories = !self.show_categories;
-                                if !self.show_categories {
-                                    self.category_filter = None;
-                                    self.mark_dirty();
-                                }
+                        if self.tree.is_some()
+                            && tab_button(ui, "File Types", self.show_categories).clicked()
+                        {
+                            self.show_categories = !self.show_categories;
+                            if !self.show_categories {
+                                self.category_filter = None;
+                                self.mark_dirty();
                             }
                         }
 
@@ -1524,63 +2557,12 @@ impl eframe::App for App {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Full-page scanning UI
+            // Live results UI during scan: status strip up top, interactive
+            // results list below.  Looks and behaves like the post-scan tree
+            // — just incomplete and growing.
             if self.scanning {
-                ui.vertical_centered(|ui| {
-                    let available = ui.available_height();
-                    ui.add_space(available * 0.3);
-
-                    ui.spinner();
-                    ui.add_space(12.0);
-
-                    let path_str = self
-                        .scan_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    ui.heading("Scanning");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&path_str).weak().size(13.0));
-                    ui.add_space(16.0);
-
-                    let files = self.scan_progress.file_count.load(Ordering::Relaxed);
-                    let size = self.scan_progress.total_size.load(Ordering::Relaxed);
-                    let size_str = bytesize::ByteSize::b(size).to_string();
-                    ui.label(format!("{files} files — {size_str}"));
-
-                    // Progress bar: estimated scan progress based on used disk space
-                    if self.scan_is_volume
-                        && let Some((total, available)) = self.scan_disk_info
-                    {
-                        let used = total.saturating_sub(available);
-                        if used > 0 {
-                            ui.add_space(12.0);
-                            let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                            let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
-                            ui.add(bar);
-                        }
-                    }
-
-                    // Elapsed time
-                    if let Some(start) = self.scan_start_time {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Elapsed: {}",
-                                format_elapsed(start.elapsed())
-                            ))
-                            .weak()
-                            .size(13.0),
-                        );
-                    }
-
-                    ui.add_space(24.0);
-                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0))
-                        .min_size(egui::vec2(120.0, 36.0));
-                    if ui.add(cancel_btn).clicked() {
-                        self.cancel_scan();
-                    }
-                });
+                self.render_scanning_panel(ui);
+                ui.ctx().request_repaint(); // keep indeterminate bar + list live
                 return;
             }
 
@@ -1969,6 +2951,24 @@ impl eframe::App for App {
         // Record frame time while scanning (only when debug output is enabled)
         if self.scanning && debug_enabled() {
             self.scan_frame_times.push(frame_start.elapsed());
+        }
+
+        // Per-frame profile: print frames slower than 8 ms (i.e. would
+        // miss 120 fps).  Gated on DISK_CLEANER_PROFILE so it doesn't
+        // spam in normal use.  Very useful for diagnosing click-lag.
+        if std::env::var_os("DISK_CLEANER_PROFILE").is_some() {
+            let dt = frame_start.elapsed();
+            if dt > std::time::Duration::from_millis(8) {
+                let mode = if self.scanning {
+                    "scan"
+                } else {
+                    match self.view_mode {
+                        ViewMode::Tree => "tree",
+                        ViewMode::Treemap => "treemap",
+                    }
+                };
+                eprintln!("[frame] {} {:?}", mode, dt);
+            }
         }
     }
 }

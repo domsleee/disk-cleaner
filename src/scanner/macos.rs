@@ -344,7 +344,11 @@ pub fn walk_dir_bulk(
 
     file_children.extend(dir_children);
     file_children.shrink_to_fit();
-    let size = file_children.iter().map(|c| c.size()).sum();
+    let size: u64 = file_children.iter().map(|c| c.size()).sum();
+
+    // Stream "subtree complete" event to the UI for live display of
+    // the biggest items found so far.
+    super::report_subtree(progress, dir, size);
 
     FileNode::Dir(Box::new(DirNode {
         name: dir_name,

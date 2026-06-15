@@ -161,6 +161,38 @@ pub struct ScanProgress {
     pub bulk_scan_fallback_count: AtomicU64,
     pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
+    /// Subtrees that have finished scanning, in completion order.
+    /// The walker pushes one entry per directory as it returns.  The UI
+    /// reads this during a scan to render a live "biggest so far" list
+    /// — without waiting for the full tree to be assembled.
+    ///
+    /// Only directories whose recursive size exceeds [`SUBTREE_REPORT_MIN_BYTES`]
+    /// are reported, to keep the lock-protected vector small.
+    pub completed_subtrees: Mutex<Vec<CompletedSubtree>>,
+}
+
+/// Minimum recursive size for a subtree to be reported to the UI during
+/// the scan.  Filters out the tens-of-thousands of trivial leaf dirs in
+/// a typical scan; only keeps things big enough to be interesting in a
+/// "where is my disk space" panel.
+pub const SUBTREE_REPORT_MIN_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+
+/// Stream a "subtree complete" event to the UI if the subtree is big enough.
+pub(crate) fn report_subtree(progress: &ScanProgress, dir: &Path, size: u64) {
+    if size >= SUBTREE_REPORT_MIN_BYTES
+        && let Ok(mut completed) = progress.completed_subtrees.lock()
+    {
+        completed.push(CompletedSubtree {
+            path: dir.to_path_buf(),
+            size,
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletedSubtree {
+    pub path: PathBuf,
+    pub size: u64,
 }
 
 #[cfg(target_os = "windows")]
@@ -345,13 +377,14 @@ fn platform_skip_paths(root: &Path) -> HashSet<PathBuf> {
     // /Volumes/ contains mount points like "Macintosh HD" (root alias) and
     // "Macintosh HD - Data" (Data volume alias) plus external drives.
     // When scanning root, traversing these re-counts the same data.
-    if !root.starts_with("/Volumes/") && root != Path::new("/Volumes") {
-        if let Ok(entries) = std::fs::read_dir("/Volumes") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path != root {
-                    skip.insert(path);
-                }
+    if !root.starts_with("/Volumes/")
+        && root != Path::new("/Volumes")
+        && let Ok(entries) = std::fs::read_dir("/Volumes")
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != root {
+                skip.insert(path);
             }
         }
     }
@@ -576,6 +609,10 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 
     let size = children.iter().map(|c| c.size()).sum();
 
+    // Stream "subtree complete" event to the UI for live display of
+    // the biggest items found so far.
+    report_subtree(progress, dir, size);
+
     FileNode::Dir(Box::new(DirNode {
         name: dir_name,
         size,
@@ -599,7 +636,27 @@ mod tests {
             bulk_scan_fallback_count: AtomicU64::new(0),
             fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
+            completed_subtrees: Mutex::new(Vec::new()),
         })
+    }
+
+    #[test]
+    fn report_subtree_pushes_at_threshold() {
+        let progress = new_progress();
+        report_subtree(&progress, Path::new("/big"), SUBTREE_REPORT_MIN_BYTES);
+
+        let completed = progress.completed_subtrees.lock().unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].path, PathBuf::from("/big"));
+        assert_eq!(completed[0].size, SUBTREE_REPORT_MIN_BYTES);
+    }
+
+    #[test]
+    fn report_subtree_skips_below_threshold() {
+        let progress = new_progress();
+        report_subtree(&progress, Path::new("/small"), SUBTREE_REPORT_MIN_BYTES - 1);
+
+        assert!(progress.completed_subtrees.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub fn extension_color(name: &str, is_dir: bool) -> egui::Color32 {
     }
 }
 
+#[cfg(test)]
 fn darken(c: egui::Color32, amount: u8) -> egui::Color32 {
     egui::Color32::from_rgb(
         c.r().saturating_sub(amount),
@@ -199,70 +200,64 @@ fn squarify_impl(
 // ─── Tree navigation helpers ────────────────────────────────────
 
 /// Find a node by path in the file tree.
+///
+/// Walks `target`'s path components from the root, doing a sibling
+/// scan at each level — O(depth × avg_siblings) instead of O(N) full
+/// tree walk.  For a 700 k-node tree the old version took ~20 ms when
+/// the target wasn't the first child of root (find_node would
+/// recursively descend every child until it found a match); this one
+/// finishes in microseconds regardless of where the target is.
 pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    let mut buf = PathBuf::from(node.name());
-    find_node_inner(node, target, &mut buf)
-}
-
-fn find_node_inner<'a>(
-    node: &'a FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-) -> Option<&'a FileNode> {
-    if buf.as_path() == target {
+    let root_path = Path::new(node.name());
+    if target == root_path {
         return Some(node);
     }
-    for child in node.children() {
-        buf.push(child.name());
-        if let Some(found) = find_node_inner(child, target, buf) {
-            buf.pop();
-            return Some(found);
-        }
-        buf.pop();
+    let rel = target.strip_prefix(root_path).ok()?;
+    let mut current = node;
+    for component in rel.components() {
+        let comp_str = component.as_os_str();
+        let child = current
+            .children()
+            .iter()
+            .find(|c| std::ffi::OsStr::new(c.name()) == comp_str)?;
+        current = child;
     }
-    None
+    Some(current)
 }
 
 /// Build breadcrumb trail from root to `target`.
+///
+/// Same O(depth × siblings) sibling-scan as `find_node` — was an
+/// O(N) full-tree walk before (`breadcrumbs_walk` recursed into every
+/// branch until it found the target).  For deep zoom paths in big
+/// trees this was the second source of click lag.
 pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
     let root_path = PathBuf::from(root.name());
     let mut trail = vec![(root.name().to_string(), root_path.clone())];
     if root_path.as_path() == target {
         return trail;
     }
-    let mut buf = root_path;
-    if breadcrumbs_walk(root, target, &mut buf, &mut trail) {
-        trail
-    } else {
-        vec![(root.name().to_string(), PathBuf::from(root.name()))]
+    let rel = match target.strip_prefix(&root_path) {
+        Ok(r) => r,
+        Err(_) => return vec![(root.name().to_string(), root_path)],
+    };
+    let mut current = root;
+    let mut acc = root_path;
+    for component in rel.components() {
+        let comp_str = component.as_os_str();
+        let Some(child) = current
+            .children()
+            .iter()
+            .find(|c| std::ffi::OsStr::new(c.name()) == comp_str)
+        else {
+            // Path went off the tree — fall back to root-only trail.
+            return vec![(root.name().to_string(), PathBuf::from(root.name()))];
+        };
+        acc.push(child.name());
+        trail.push((child.name().to_string(), acc.clone()));
+        current = child;
     }
-}
-
-fn breadcrumbs_walk(
-    node: &FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-    trail: &mut Vec<(String, PathBuf)>,
-) -> bool {
-    for child in node.children() {
-        buf.push(child.name());
-        let child_path = buf.clone();
-        if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
-            buf.pop();
-            return true;
-        }
-        if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
-                buf.pop();
-                return true;
-            }
-            trail.pop();
-        }
-        buf.pop();
-    }
-    false
+    trail
 }
 
 // ─── Cached treemap layout ─────────────────────────────────────
@@ -287,25 +282,18 @@ pub struct TreemapTile {
     pub color: egui::Color32,
     pub child_count: Option<usize>,
     pub nested: Vec<NestedTile>,
-    /// Pre-formatted short label (name only).
-    pub label_short: Box<str>,
-    /// Pre-formatted tall label (name + size).
-    pub label_tall: Box<str>,
-    /// Pre-computed text color for this tile's background.
-    pub text_color: egui::Color32,
-    /// Pre-computed darkened header color (dirs only, unused for files).
-    pub header_color: egui::Color32,
-    /// Pre-computed text color for header background (dirs only).
-    pub header_text_color: egui::Color32,
 }
 
 pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
-    pub name: Box<str>,
     #[allow(dead_code)]
     pub is_dir: bool,
     pub color: egui::Color32,
+    /// Recursive size of this child — needed so we can render the
+    /// "X GB" label inside the nested tile (matches the during-scan
+    /// view's nested tile layout).
+    pub size: u64,
 }
 
 pub struct OtherBucket {
@@ -313,10 +301,8 @@ pub struct OtherBucket {
     #[cfg_attr(not(test), allow(dead_code))]
     pub count: usize,
     pub size: u64,
-    /// Pre-formatted short label.
+    /// Pre-formatted short label, e.g. "Other (123 files)".
     pub label_short: Box<str>,
-    /// Pre-formatted tall label.
-    pub label_tall: Box<str>,
 }
 
 /// Build a cached treemap layout from the given tree and parameters.
@@ -333,6 +319,8 @@ pub fn build_treemap_cache(
     let root_path = PathBuf::from(root.name());
 
     // Resolve the node we're viewing and its full path
+    let prof = std::env::var("DISK_CLEANER_PROFILE").is_ok();
+    let t_find = std::time::Instant::now();
     let (view_node, view_path) = if let Some(zp) = zoom_path {
         match find_node(root, zp) {
             Some(n) => (n, zp.clone()),
@@ -341,15 +329,22 @@ pub fn build_treemap_cache(
     } else {
         (root, root_path.clone())
     };
+    if prof {
+        eprintln!("[treemap]   find_node:    {:?}", t_find.elapsed());
+    }
 
     let view_size = view_node.size();
-    let view_size_label: Box<str> = format!("  ({})", ByteSize::b(view_size)).into();
+    let view_size_label: Box<str> = format!("  ({})", fmt_size_compact(view_size)).into();
 
     // Cache breadcrumbs (avoids O(N) tree walk every frame)
+    let t_bc = std::time::Instant::now();
     let cached_breadcrumbs = zoom_path
         .as_ref()
         .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+        .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
+    if prof {
+        eprintln!("[treemap]   breadcrumbs:  {:?}", t_bc.elapsed());
+    }
 
     // Empty directory — return empty cache
     if view_node.children().is_empty() {
@@ -430,6 +425,7 @@ pub fn build_treemap_cache(
     if has_other {
         sizes.push(other_size as f64);
     }
+    let t_sq = std::time::Instant::now();
     let rects = squarify(
         &sizes,
         full_rect.min.x,
@@ -437,10 +433,27 @@ pub fn build_treemap_cache(
         full_rect.width(),
         full_rect.height(),
     );
+    if prof {
+        eprintln!(
+            "[treemap]   squarify-top: {:?} ({} sizes)",
+            t_sq.elapsed(),
+            sizes.len()
+        );
+    }
 
     // Build tiles for real children, tracking global nested budget
+    let t_tiles = std::time::Instant::now();
     let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
+    // Every level uses the rank palette by rank-in-parent-by-size.
+    // Originally I gated this on root_view-only and fell back to
+    // extension_color for zoomed-in views — but extension_color
+    // returns the same dark grey for every directory, which makes a
+    // zoomed-in dir-of-dirs look like a flat slab of identical tiles.
+    // Rank palette cycles through 8 hues so adjacent siblings always
+    // read as distinct, regardless of depth.  Files inside zoomed
+    // views still get a useful colour because they're sized within
+    // the same rank order as their dir siblings.
     for (i, child) in children.iter().enumerate() {
         let r = rects[i].shrink(GAP);
         if r.width() <= 0.0 || r.height() <= 0.0 || r.area() < MIN_PAINT_AREA {
@@ -448,20 +461,25 @@ pub fn build_treemap_cache(
         }
         let child_path = view_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        // Stable name-based colour so the same item paints the same
+        // colour during-scan and post-scan.
+        let color = path_color(child.name());
         let child_count = if is_dir {
             Some(child.children().len())
         } else {
             None
         };
 
-        // Build nested sub-tiles for directory tiles large enough (respecting global budget)
+        // Always propagate the parent rank colour to nested children.
+        // Inside any directory tile the nested sub-tiles read as
+        // dimmed variants of the parent so the whole subtree looks
+        // like a coherent block rather than a rainbow.
         let nested = if is_dir
             && nested_budget > 0
             && r.width() > 40.0
             && r.height() > DIR_HEADER_H + 16.0
         {
-            let tiles = build_nested_tiles(child, &child_path, r, nested_budget);
+            let tiles = build_nested_tiles(child, &child_path, r, nested_budget, Some(color));
             nested_budget = nested_budget.saturating_sub(tiles.len());
             tiles
         } else {
@@ -470,25 +488,10 @@ pub fn build_treemap_cache(
 
         let name: Box<str> = child.name().into();
         let size = child.size();
-        let size_str = ByteSize::b(size).to_string();
-        let header_color = darken(color, 15);
-        let label_short: Box<str> = name.clone();
-        let label_tall: Box<str> = if is_dir {
-            // For dirs: "name (size)" used in header
-            format!("{} ({})", name, size_str).into()
-        } else {
-            // For files: "name\nsize" used in tall tiles
-            format!("{}\n{}", name, size_str).into()
-        };
 
         tiles.push(TreemapTile {
             rect: r,
             path: child_path,
-            label_short,
-            label_tall,
-            text_color: text_color_for_bg(color),
-            header_color,
-            header_text_color: text_color_for_bg(header_color),
             name,
             size,
             is_dir,
@@ -496,6 +499,15 @@ pub fn build_treemap_cache(
             child_count,
             nested,
         });
+    }
+    if prof {
+        let total_nested: usize = tiles.iter().map(|t| t.nested.len()).sum();
+        eprintln!(
+            "[treemap]   tiles+nest:   {:?} ({} tiles, {} total nested)",
+            t_tiles.elapsed(),
+            tiles.len(),
+            total_nested
+        );
     }
 
     // Build Other bucket if needed
@@ -507,8 +519,6 @@ pub fn build_treemap_cache(
             count: other_count,
             size: other_size,
             label_short: format!("Other ({})", other_count).into(),
-            label_tall: format!("Other ({} files)\n{}", other_count, ByteSize::b(other_size))
-                .into(),
         })
     } else {
         None
@@ -527,11 +537,19 @@ pub fn build_treemap_cache(
 /// Build nested sub-tiles for the children of a directory tile.
 /// `budget` caps how many nested tiles to create (global limit).
 /// Extracts the nested layout logic from `paint_directory`.
+///
+/// `parent_color` is the parent dir tile's colour.  When provided,
+/// nested children are coloured with a darker variant of it so the
+/// whole subtree reads as one block (matches the during-scan view).
+/// When None, nested children fall back to extension/category
+/// colours — useful in zoomed-in views where the user wants
+/// content-type cues.
 fn build_nested_tiles(
     node: &FileNode,
     node_path: &Path,
     rect: egui::Rect,
     budget: usize,
+    parent_color: Option<egui::Color32>,
 ) -> Vec<NestedTile> {
     let content_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + 1.0, rect.min.y + DIR_HEADER_H),
@@ -563,19 +581,24 @@ fn build_nested_tiles(
 
     let mut result = Vec::with_capacity(nested.len());
     for (j, child) in nested.iter().enumerate() {
-        let cr = child_rects[j].shrink(0.5);
+        let cr = child_rects[j].shrink(1.0);
         if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
             continue;
         }
         let child_path = node_path.join(child.name());
         let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
+        let color = match parent_color {
+            // Slightly-dimmed variant of the parent.  Same logic as
+            // the during-scan view's nested tiles.
+            Some(p) => p.linear_multiply(0.55),
+            None => extension_color(child.name(), is_dir),
+        };
         result.push(NestedTile {
             rect: cr,
             path: child_path,
-            name: child.name().into(),
             is_dir,
             color,
+            size: child.size(),
         });
     }
     result
@@ -590,9 +613,8 @@ pub enum TreemapAction {
 
 // ─── Rendering ──────────────────────────────────────────────────
 
-const GAP: f32 = 1.5;
+const GAP: f32 = 1.0;
 const DIR_HEADER_H: f32 = 20.0;
-const MIN_LABEL_W: f32 = 32.0;
 /// Hard cap on visible top-level entries to prevent lag with huge directories.
 const MAX_VISIBLE_ENTRIES: usize = 200;
 /// Minimum rect area (px²) worth painting — below this we skip.
@@ -631,7 +653,7 @@ pub fn render_treemap(
         inline_crumbs = zoom_path
             .as_ref()
             .map(|p| breadcrumbs(root, p))
-            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+            .unwrap_or_else(|| vec![(root.name().to_string(), root_path.clone())]);
         &inline_crumbs
     };
     let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
@@ -644,7 +666,7 @@ pub fn render_treemap(
         } else {
             root.size()
         };
-        inline_size_label = format!("  ({})", ByteSize::b(view_size));
+        inline_size_label = format!("  ({})", fmt_size_compact(view_size));
         &inline_size_label
     };
 
@@ -688,8 +710,13 @@ pub fn render_treemap(
     };
 
     // ── Treemap canvas ──
+    // Reserve breathing room around the canvas so tiles don't run
+    // flush to the panel edge — matches the during-scan view.
     let available = ui.available_size();
-    let (full_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let (outer_rect, response) = ui.allocate_exact_size(available, egui::Sense::click());
+    let outer_painter = ui.painter_at(outer_rect);
+    outer_painter.rect_filled(outer_rect, 0.0, egui::Color32::from_rgb(8, 9, 11));
+    let full_rect = outer_rect.shrink(8.0);
     let painter = ui.painter_at(full_rect);
 
     // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
@@ -700,6 +727,7 @@ pub fn render_treemap(
                 || (c.layout_size.1 - full_rect.height()).abs() > 1.0
         });
     if needs_rebuild {
+        let t0 = std::time::Instant::now();
         *cache = Some(build_treemap_cache(
             root,
             zoom_path,
@@ -707,6 +735,25 @@ pub fn render_treemap(
             show_hidden,
             full_rect,
         ));
+        let dt = t0.elapsed();
+        if std::env::var("DISK_CLEANER_PROFILE").is_ok() {
+            let zoom_str = zoom_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<root>".to_string());
+            let n_tiles = cache.as_ref().unwrap().tiles.len();
+            let n_nested: usize = cache
+                .as_ref()
+                .unwrap()
+                .tiles
+                .iter()
+                .map(|t| t.nested.len())
+                .sum();
+            eprintln!(
+                "[treemap] rebuild: {:?} for zoom={} ({} tiles, {} nested)",
+                dt, zoom_str, n_tiles, n_nested
+            );
+        }
         *cache_dirty = false;
     }
     let cache = cache.as_ref().unwrap();
@@ -770,6 +817,37 @@ pub fn render_treemap(
         }
     }
 
+    // Hover stroke — visible 2-px white inner outline + soft outer
+    // halo on the tile being pointed at.  Matches the during-scan
+    // hover treatment.
+    if let Some(idx) = hovered_tile {
+        let r = cache.tiles[idx].rect;
+        painter.rect_stroke(
+            r.shrink(1.0),
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::epaint::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            r,
+            2.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 80),
+            ),
+            egui::epaint::StrokeKind::Outside,
+        );
+    }
+    if hovered_other && let Some(ref other) = cache.other {
+        let r = other.rect;
+        painter.rect_stroke(
+            r.shrink(1.0),
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+
     // Hover tooltip
     if let Some(idx) = hovered_tile {
         let tile = &cache.tiles[idx];
@@ -817,6 +895,144 @@ pub fn render_treemap(
     actions
 }
 
+/// Lay out `text` only if its measured width fits `max_w` — returns
+/// the laid-out galley or None.  Lets callers avoid drawing labels
+/// that would visually overlap their tile bounds.
+pub fn fit_text_exact(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    let g = painter.layout_no_wrap(text.to_string(), font_id, egui::Color32::WHITE);
+    if g.size().x <= max_w { Some(g) } else { None }
+}
+
+/// Lay out `text` so it fits `max_w`, head-truncating with an ellipsis
+/// if needed via binary search on the measured width.  Returns None if
+/// even one character + ellipsis doesn't fit.
+pub fn fit_text(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if let Some(g) = fit_text_exact(painter, text, font_id.clone(), max_w) {
+        return Some(g);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    let mut best: Option<std::sync::Arc<egui::Galley>> = None;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars.iter().take(mid).collect::<String>() + "…";
+        if let Some(g) = fit_text_exact(painter, &candidate, font_id.clone(), max_w) {
+            best = Some(g);
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
+/// Lay out a path so the leaf component stays visible: drops leading
+/// components in favour of "…/" until the result fits `max_w`.  Falls
+/// back to head-truncating the leaf alone when even ".../leaf" is too
+/// wide.
+pub fn fit_path(
+    painter: &egui::Painter,
+    path: &str,
+    font_id: egui::FontId,
+    max_w: f32,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if let Some(g) = fit_text_exact(painter, path, font_id.clone(), max_w) {
+        return Some(g);
+    }
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    for skip in 1..parts.len() {
+        let candidate = format!("…/{}", parts[skip..].join("/"));
+        if let Some(g) = fit_text_exact(painter, &candidate, font_id.clone(), max_w) {
+            return Some(g);
+        }
+    }
+    fit_text(
+        painter,
+        parts.last().copied().unwrap_or(path),
+        font_id,
+        max_w,
+    )
+}
+
+/// Format `bytes` into a short label suitable for cramped treemap
+/// tiles.  Always one digit + optional one-decimal + unit, e.g.
+/// `"1.5 GB"`, `"562 MB"`, `"4.4 GB"`, `"512 KB"`.  Significantly
+/// shorter than `bytesize::ByteSize::b().to_string()` ("1.5 GiB" with
+/// space + 3-letter unit).  Length is bounded so callers don't need
+/// to ellipsis-truncate it for typical tiles.
+pub fn fmt_size_compact(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b < 1024.0 {
+        return format!("{} B", bytes);
+    }
+    if b < 1024.0 * 1024.0 {
+        let kb = b / 1024.0;
+        return if kb < 10.0 {
+            format!("{:.1} KB", kb)
+        } else {
+            format!("{:.0} KB", kb)
+        };
+    }
+    if b < 1024.0 * 1024.0 * 1024.0 {
+        let mb = b / 1024.0 / 1024.0;
+        return if mb < 10.0 {
+            format!("{:.1} MB", mb)
+        } else {
+            format!("{:.0} MB", mb)
+        };
+    }
+    let gb = b / 1024.0 / 1024.0 / 1024.0;
+    if gb < 10.0 {
+        format!("{:.1} GB", gb)
+    } else {
+        format!("{:.0} GB", gb)
+    }
+}
+
+/// Stable colour for a tile keyed by its leaf name.  FNV-1a hash mod
+/// palette length — same name always gets the same colour, across
+/// the during-scan / post-scan handoff and across re-runs.
+///
+/// Tile *size* still encodes "how big is this thing"; tile *colour*
+/// now encodes "which thing is this", which is what users actually
+/// track in a disk cleaner ("the green one is disk-cleaner").
+pub fn path_color(name: &str) -> egui::Color32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    PALETTE[(h as usize) % PALETTE.len()]
+}
+
+const PALETTE: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(58, 93, 139), // blue
+    egui::Color32::from_rgb(42, 109, 77), // green
+    egui::Color32::from_rgb(122, 74, 48), // brown
+    egui::Color32::from_rgb(74, 58, 107), // purple
+    egui::Color32::from_rgb(90, 74, 58),  // tan
+    egui::Color32::from_rgb(48, 90, 100), // teal
+    egui::Color32::from_rgb(110, 60, 90), // mauve
+    egui::Color32::from_rgb(86, 86, 56),  // olive
+];
+
 // ─── Painting helpers ───────────────────────────────────────────
 
 fn apply_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
@@ -826,40 +1042,130 @@ fn apply_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * alpha) as u8)
 }
 
+/// Paint a vertical gradient (top lighter, bottom darker) using a
+/// 2-triangle vertex-coloured Mesh.  Same look as the live-scan
+/// treemap so the two views are visually consistent.
+fn paint_gradient_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    base: egui::Color32,
+    radius: f32,
+) {
+    let lift =
+        |c: u8, by: f32| -> u8 { ((c as f32) + (255.0 - c as f32) * by).clamp(0.0, 255.0) as u8 };
+    let dim = |c: u8, by: f32| -> u8 { ((c as f32) * (1.0 - by)).clamp(0.0, 255.0) as u8 };
+    let top = egui::Color32::from_rgba_unmultiplied(
+        lift(base.r(), 0.18),
+        lift(base.g(), 0.18),
+        lift(base.b(), 0.18),
+        base.a(),
+    );
+    let bot = egui::Color32::from_rgba_unmultiplied(
+        dim(base.r(), 0.12),
+        dim(base.g(), 0.12),
+        dim(base.b(), 0.12),
+        base.a(),
+    );
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bot);
+    mesh.colored_vertex(rect.left_bottom(), bot);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+    if radius > 0.0 {
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30)),
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+}
+
 fn paint_cached_leaf(
     painter: &egui::Painter,
     tile: &TreemapTile,
     is_focused: bool,
     alpha: f32,
-    font: &egui::FontId,
+    _font: &egui::FontId,
 ) {
     let color = apply_alpha(tile.color, alpha);
-    painter.rect_filled(tile.rect, 2.0, color);
+    paint_gradient_rect(painter, tile.rect, color, 4.0);
 
     if is_focused {
         painter.rect_stroke(
             tile.rect,
-            2.0,
+            4.0,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
     }
 
-    // Label if large enough — clip to tile rect, use pre-computed strings
-    if tile.rect.width() > MIN_LABEL_W && tile.rect.height() > 14.0 {
-        let clipped = painter.with_clip_rect(tile.rect);
-        let tc = apply_alpha(tile.text_color, alpha);
-        let text: &str = if tile.rect.height() > 30.0 {
-            &tile.label_tall
-        } else {
-            &tile.label_short
-        };
-        clipped.text(
-            tile.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font.clone(),
-            tc,
+    // Skip labels on tiny leaves — same threshold as dir tiles so the
+    // two views read consistently.
+    if tile.rect.width() < 85.0 || tile.rect.height() < 24.0 {
+        return;
+    }
+
+    // Header band: same darkened-base + name-left + size-right
+    // treatment used by dir tiles.  Files don't have nested children
+    // backdropping the band, but applying it anyway keeps every tile
+    // in the treemap visually consistent — the eye reads a tile as
+    // "header on top + body below" regardless of dir vs file.
+    let header_h = if tile.rect.height() > 80.0 {
+        28.0
+    } else {
+        22.0
+    };
+    let header_rect =
+        egui::Rect::from_min_size(tile.rect.min, egui::vec2(tile.rect.width(), header_h));
+    let body = apply_alpha(tile.color, alpha);
+    let band = body.linear_multiply(0.55);
+    let band = egui::Color32::from_rgba_unmultiplied(
+        band.r(),
+        band.g(),
+        band.b(),
+        (band.a() as f32 * 0.92).clamp(0.0, 255.0) as u8,
+    );
+    painter.rect_filled(
+        header_rect,
+        egui::CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
+        band,
+    );
+
+    let header_pad = 8.0_f32;
+    let avail = (tile.rect.width() - header_pad * 2.0).max(0.0);
+    let size_str = fmt_size_compact(tile.size);
+    let size_g = fit_text(painter, &size_str, egui::FontId::proportional(12.0), avail);
+    let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
+    let name_avail = (avail - size_w).max(0.0);
+    let name_g = fit_text(
+        painter,
+        tile.name.as_ref(),
+        egui::FontId::proportional(13.5),
+        name_avail,
+    );
+    let mid_y = header_rect.center().y;
+    if let Some(ng) = name_g {
+        let pos = egui::pos2(header_rect.min.x + header_pad, mid_y - ng.size().y * 0.5);
+        painter.galley(pos, ng, egui::Color32::WHITE);
+    }
+    if let Some(sg) = size_g {
+        let pos = egui::pos2(
+            header_rect.max.x - header_pad - sg.size().x,
+            mid_y - sg.size().y * 0.5,
+        );
+        painter.galley(
+            pos,
+            sg,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
         );
     }
 }
@@ -868,16 +1174,14 @@ fn paint_other_bucket(
     painter: &egui::Painter,
     other: &OtherBucket,
     alpha: f32,
-    font: &egui::FontId,
+    _font: &egui::FontId,
 ) {
     let rect = other.rect;
     let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
-    painter.rect_filled(rect, 2.0, bg);
-
-    // Dashed-style border to distinguish from real blocks
+    paint_gradient_rect(painter, rect, bg, 4.0);
     painter.rect_stroke(
         rect,
-        2.0,
+        4.0,
         egui::Stroke::new(
             1.0,
             apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha),
@@ -885,21 +1189,26 @@ fn paint_other_bucket(
         egui::StrokeKind::Inside,
     );
 
-    if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
-        let clipped = painter.with_clip_rect(rect);
-        let tc = apply_alpha(egui::Color32::from_rgb(200, 200, 200), alpha);
-        let text: &str = if rect.height() > 30.0 {
-            &other.label_tall
-        } else {
-            &other.label_short
-        };
-        clipped.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            font.clone(),
-            tc,
-        );
+    if rect.width() <= 50.0 || rect.height() <= 18.0 {
+        return;
+    }
+    let pad = 4.0;
+    let avail_w = rect.width() - pad * 2.0;
+    let inner = rect.shrink(pad);
+    let text_color = apply_alpha(egui::Color32::from_rgb(220, 220, 220), alpha);
+    if let Some(g) = fit_text(
+        painter,
+        &other.label_short,
+        egui::FontId::proportional(11.0),
+        avail_w,
+    ) {
+        painter.galley(inner.left_top(), g, text_color);
+    }
+    if rect.height() > 36.0 {
+        let size_str = fmt_size_compact(other.size);
+        if let Some(g) = fit_text(painter, &size_str, egui::FontId::monospace(11.0), avail_w) {
+            painter.galley(inner.left_bottom() + egui::vec2(0.0, -14.0), g, text_color);
+        }
     }
 }
 
@@ -909,52 +1218,43 @@ fn paint_cached_directory(
     is_focused: bool,
     focused_path: &Option<PathBuf>,
     alpha: f32,
-    font_header: &egui::FontId,
-    font_nested: &egui::FontId,
+    _font_header: &egui::FontId,
+    _font_nested: &egui::FontId,
 ) {
     let rect = tile.rect;
     let bg = apply_alpha(tile.color, alpha);
-    let header_bg = apply_alpha(tile.header_color, alpha);
 
-    // Background
-    painter.rect_filled(rect, 2.0, bg);
+    // Gradient background.
+    paint_gradient_rect(painter, rect, bg, 4.0);
 
     if is_focused {
         painter.rect_stroke(
             rect,
-            2.0,
+            4.0,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
     }
 
-    // Header
-    let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), DIR_HEADER_H));
-    painter.rect_filled(header_rect, 2.0, header_bg);
-
-    // Header text — clip to header rect, use pre-computed label
-    if rect.width() > MIN_LABEL_W {
-        let clipped = painter.with_clip_rect(header_rect);
-        let tc = apply_alpha(tile.header_text_color, alpha);
-        clipped.text(
-            header_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            tile.label_tall.as_ref(),
-            font_header.clone(),
-            tc,
-        );
-    }
-
-    // Nested children (pre-computed in cache) — single clip group for entire tile
-    if tile.nested.is_empty() {
-        return;
-    }
+    // ── Nested children first, so the header band paints on top and
+    //    stays readable.
     let tile_painter = painter.with_clip_rect(rect);
     let has_focus = focused_path.is_some();
     for nested in &tile.nested {
         let cr = nested.rect;
         let color = apply_alpha(nested.color, alpha);
-        tile_painter.rect_filled(cr, 1.0, color);
+        paint_gradient_rect(&tile_painter, cr, color, 3.0);
+        // Hairline stroke around the nested rect so the eye can tell
+        // sibling tiles apart even when their gradients are similar
+        // (target inside disk-cleaner, MoneyPrinterTurbo inside
+        // yt-revenue, etc.).  Use a very low-alpha black so it reads
+        // as a soft separator, not a hard outline.
+        tile_painter.rect_stroke(
+            cr,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60)),
+            egui::epaint::StrokeKind::Inside,
+        );
 
         if has_focus {
             let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
@@ -968,17 +1268,116 @@ fn paint_cached_directory(
             }
         }
 
-        // Label only for tiles large enough to be readable.
-        if cr.width() > 60.0 && cr.height() > 16.0 {
-            let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
-            tile_painter.text(
-                cr.center(),
-                egui::Align2::CENTER_CENTER,
-                nested.name.as_ref(),
-                font_nested.clone(),
-                tc,
-            );
+        // Path-aware label + size — exactly the same layout the
+        // during-scan view paints for its nested tiles.  Tiles
+        // smaller than ~70px wide just stay empty rather than
+        // showing "1..." or "12..." gibberish.
+        if cr.width() > 70.0 && cr.height() > 22.0 {
+            let inner = cr.shrink(3.0);
+            let avail_w = inner.width();
+            let display = nested
+                .path
+                .strip_prefix(&tile.path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| {
+                    nested
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| nested.path.display().to_string())
+                });
+            let text_color = apply_alpha(text_color_for_bg(nested.color), alpha * 0.95);
+            // Name top-left.
+            if let Some(g) = fit_path(
+                &tile_painter,
+                &display,
+                egui::FontId::proportional(11.0),
+                avail_w,
+            ) {
+                tile_painter.galley(inner.left_top(), g, text_color);
+            }
+            // Size bottom-left.  Suppress when the nested tile is
+            // ≥95 % of the parent's size — header already shows the
+            // same number, so painting it again is visual noise.
+            let near_full = nested.size as f64 >= tile.size as f64 * 0.95;
+            if cr.height() > 36.0 && !near_full {
+                let size_str = fmt_size_compact(nested.size);
+                if let Some(g) = fit_text(
+                    &tile_painter,
+                    &size_str,
+                    egui::FontId::monospace(11.0),
+                    avail_w,
+                ) {
+                    tile_painter.galley(
+                        inner.left_bottom() + egui::vec2(0.0, -14.0),
+                        g,
+                        text_color,
+                    );
+                }
+            }
         }
+    }
+
+    // ── Header band: only draw when the tile is large enough for
+    //    *something readable* to fit.  Without this gate, narrow
+    //    repo tiles in the bottom-right grid render with truncated
+    //    "1...", "2..." gibberish.  85 px is roughly enough room
+    //    for a 5-char name + a 4-char size like "562 MB".
+    if rect.width() < 85.0 || rect.height() < 24.0 {
+        return;
+    }
+    // ── Header band: solid darkened backdrop + name (left) + size
+    //    (right).  Use the same darkening as the during-scan view
+    //    (multiply tile colour by 0.55) so the header reads as a
+    //    distinct band, not a faint variant of the body.
+    let header_h = if rect.height() > 80.0 { 28.0 } else { 22.0 };
+    let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), header_h));
+    let body = apply_alpha(tile.color, alpha);
+    let band_color = body.linear_multiply(0.55);
+    let band_color = egui::Color32::from_rgba_unmultiplied(
+        band_color.r(),
+        band_color.g(),
+        band_color.b(),
+        (band_color.a() as f32 * 0.92).clamp(0.0, 255.0) as u8,
+    );
+    painter.rect_filled(
+        header_rect,
+        egui::CornerRadius {
+            nw: 2,
+            ne: 2,
+            sw: 0,
+            se: 0,
+        },
+        band_color,
+    );
+
+    let header_pad = 8.0;
+    let avail = (rect.width() - header_pad * 2.0).max(0.0);
+    let size_str = fmt_size_compact(tile.size);
+    let size_g = fit_text(painter, &size_str, egui::FontId::proportional(12.0), avail);
+    let size_w = size_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
+    let name_avail = (avail - size_w).max(0.0);
+    let name_g = fit_text(
+        painter,
+        tile.name.as_ref(),
+        egui::FontId::proportional(13.5),
+        name_avail,
+    );
+    let mid_y = header_rect.center().y;
+    if let Some(ng) = name_g {
+        let pos = egui::pos2(header_rect.min.x + header_pad, mid_y - ng.size().y * 0.5);
+        painter.galley(pos, ng, egui::Color32::WHITE);
+    }
+    if let Some(sg) = size_g {
+        let pos = egui::pos2(
+            header_rect.max.x - header_pad - sg.size().x,
+            mid_y - sg.size().y * 0.5,
+        );
+        painter.galley(
+            pos,
+            sg,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+        );
     }
 }
 
@@ -1525,8 +1924,54 @@ mod tests {
         let tile = &cache.tiles[0];
         assert_eq!(&*tile.name, "movie.mp4");
         assert_eq!(tile.path, std::path::PathBuf::from("root/movie.mp4"));
-        assert_eq!(tile.color, extension_color("movie.mp4", false));
+        // Tile colour is now hashed from the leaf name, not the rank.
+        assert_eq!(tile.color, path_color("movie.mp4"));
         assert!(!tile.is_dir);
         assert_eq!(tile.child_count, None);
+    }
+
+    #[test]
+    fn path_color_is_stable_across_calls() {
+        // Same name always maps to the same palette entry, regardless
+        // of how many other names come before it.  This is the whole
+        // point — during-scan and post-scan views render the same
+        // dir in the same colour.
+        let a = path_color("disk-cleaner");
+        let b = path_color("disk-cleaner");
+        assert_eq!(a, b);
+        // And different names *probably* differ (palette has 8 hues
+        // so collisions are possible; just check we're not always
+        // returning the same thing).
+        let mut seen = std::collections::HashSet::new();
+        for name in [
+            "yt-revenue",
+            "disk-cleaner",
+            "finance",
+            "paperclip",
+            "wezterm",
+            "wordle",
+            "bananagrams",
+            "ollama",
+        ] {
+            seen.insert(path_color(name));
+        }
+        // 8 inputs → expect at least 3 distinct colours via FNV.
+        assert!(
+            seen.len() >= 3,
+            "palette spread too narrow: only {} distinct colours",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn zoomed_view_uses_path_color() {
+        // Zoomed-in tiles also use the name-hash palette so the same
+        // dir keeps the same colour at any zoom depth.
+        let tree = dir("root", vec![dir("sub", vec![leaf("video.mp4", 300)])]);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let zoomed = Some(std::path::PathBuf::from("root/sub"));
+        let cache = build_treemap_cache(&tree, &zoomed, None, true, rect);
+        assert_eq!(cache.tiles.len(), 1);
+        assert_eq!(cache.tiles[0].color, path_color("video.mp4"));
     }
 }

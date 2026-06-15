@@ -239,6 +239,103 @@ fn bench_squarify(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Real-world click-rebuild simulation
+// ---------------------------------------------------------------------------
+// Scans ~/git once, then times build_treemap_cache for several zoom paths
+// (root + a few deep clicks).  This measures what actually happens when the
+// user clicks a tile in the post-scan treemap.
+fn bench_real_click_rebuild(c: &mut Criterion) {
+    use disk_cleaner::scanner;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let target = match std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("git"))
+    {
+        Some(p) if p.is_dir() => p,
+        _ => return,
+    };
+
+    let progress = Arc::new(scanner::ScanProgress {
+        file_count: AtomicU64::new(0),
+        total_size: AtomicU64::new(0),
+        fallback_count: AtomicU64::new(0),
+        access_denied_fallback_count: AtomicU64::new(0),
+        bulk_scan_fallback_count: AtomicU64::new(0),
+        fallback_details: std::sync::Mutex::new(Vec::new()),
+        cancelled: AtomicBool::new(false),
+        completed_subtrees: std::sync::Mutex::new(Vec::new()),
+    });
+    let tree = scanner::scan_directory(&target, progress);
+    let n = count_nodes(&tree);
+
+    let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 700.0));
+
+    // Collect zoom paths: the 3 biggest top-level children, plus root.
+    let mut top: Vec<&FileNode> = tree.children().iter().collect();
+    top.sort_by_key(|c| std::cmp::Reverse(c.size()));
+    let big1 = top.first().map(|c| target.join(c.name()));
+    let big2 = top.get(1).map(|c| target.join(c.name()));
+    let big3 = top.get(2).map(|c| target.join(c.name()));
+
+    let mut group = c.benchmark_group("treemap_click_rebuild_real");
+    group.sample_size(20);
+
+    group.bench_with_input(BenchmarkId::new("root", n), &tree, |b, t| {
+        b.iter(|| treemap::build_treemap_cache(t, &None, None, true, rect))
+    });
+    if let Some(p) = &big1 {
+        let p = Some(p.clone());
+        group.bench_with_input(BenchmarkId::new("zoom_top1", n), &tree, |b, t| {
+            b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect))
+        });
+    }
+    if let Some(p) = &big2 {
+        let p = Some(p.clone());
+        group.bench_with_input(BenchmarkId::new("zoom_top2", n), &tree, |b, t| {
+            b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect))
+        });
+    }
+    if let Some(p) = &big3 {
+        let p = Some(p.clone());
+        group.bench_with_input(BenchmarkId::new("zoom_top3", n), &tree, |b, t| {
+            b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect))
+        });
+    }
+
+    // Drill into the biggest subtree several levels deep — simulates
+    // a power-user clicking through a chain of directories.
+    let mut deep = target.clone();
+    let mut depth = 0;
+    let mut node = &tree;
+    while let Some(child) = node
+        .children()
+        .iter()
+        .max_by_key(|c| if c.is_dir() { c.size() } else { 0 })
+    {
+        if !child.is_dir() {
+            break;
+        }
+        deep.push(child.name());
+        node = child;
+        depth += 1;
+        if depth > 12 {
+            break;
+        }
+        let p = Some(deep.clone());
+        group.bench_with_input(
+            BenchmarkId::new(format!("zoom_depth{depth}"), n),
+            &tree,
+            |b, t| b.iter(|| treemap::build_treemap_cache(t, &p, None, true, rect)),
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_build_cache,
@@ -247,5 +344,6 @@ criterion_group!(
     bench_fontid_alloc,
     bench_navigation_at_scale,
     bench_squarify,
+    bench_real_click_rebuild,
 );
 criterion_main!(benches);

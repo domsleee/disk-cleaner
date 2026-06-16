@@ -402,6 +402,12 @@ struct App {
     screenshots_saved: u8,
     /// Background deletion state.
     deleter: BackgroundDeleter,
+    /// Last OS theme observed, used to re-assert the dark title bar on Windows
+    /// when the system theme changes (see `keep_titlebar_dark`).
+    last_os_theme: Option<egui::Theme>,
+    /// Whether the window was focused on the previous frame, used to re-assert
+    /// the dark title bar when focus is regained.
+    was_focused: bool,
 }
 
 impl Default for App {
@@ -463,11 +469,39 @@ impl Default for App {
             screenshot_state: ScreenshotState::Idle,
             screenshots_saved: 0,
             deleter: BackgroundDeleter::default(),
+            last_os_theme: None,
+            was_focused: true,
         }
     }
 }
 
 impl App {
+    /// Keep the OS window title bar dark.
+    ///
+    /// eframe/egui only applies the window decoration theme when a
+    /// `ViewportCommand::SetTheme` is sent; it never re-applies it in response
+    /// to OS events. On Windows the forced dark title bar is dropped back to
+    /// the system default when the OS theme changes or the window regains
+    /// focus, so we re-assert it on those transitions. This is event-driven
+    /// (fires only on a theme or focus change), not every frame.
+    fn keep_titlebar_dark(&mut self, ctx: &egui::Context) {
+        let (os_theme, focused) = ctx.input(|i| {
+            (
+                i.raw.system_theme,
+                i.viewport().focused.unwrap_or(self.was_focused),
+            )
+        });
+
+        let theme_changed = os_theme != self.last_os_theme;
+        let focus_regained = focused && !self.was_focused;
+        self.last_os_theme = os_theme;
+        self.was_focused = focused;
+
+        if theme_changed || focus_regained {
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+        }
+    }
+
     fn cancel_scan(&mut self) {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
@@ -774,6 +808,8 @@ impl eframe::App for App {
                 eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
             }
         }
+
+        self.keep_titlebar_dark(ctx);
 
         // Apply debounced search query after 150ms of no typing
         if let Some(changed_at) = self.search_changed_at {

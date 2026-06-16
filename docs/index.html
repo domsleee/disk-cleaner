@@ -305,7 +305,8 @@
     line-height: 1.8;
     color: var(--text-secondary);
   }
-  .terminal-body .prompt { color: var(--amber); }
+  .terminal-body .prompt { color: var(--amber); user-select: none; }
+  .terminal-body .prompt::before { content: "$ "; }
   .terminal-body .comment { color: var(--text-muted); font-style: italic; }
   .terminal-body .cursor {
     display: inline-block;
@@ -490,9 +491,9 @@
     </div>
     <div class="terminal-body">
       <div><span class="comment"># or build from source (requires Rust 1.70+)</span></div>
-      <div><span class="prompt">$</span> git clone https://github.com/domsleee/disk-cleaner.git</div>
-      <div><span class="prompt">$</span> cd disk-cleaner</div>
-      <div><span class="prompt">$</span> cargo run --release<span class="cursor"></span></div>
+      <div><span class="prompt"></span>git clone https://github.com/domsleee/disk-cleaner.git</div>
+      <div><span class="prompt"></span>cd disk-cleaner</div>
+      <div><span class="prompt"></span>cargo run --release<span class="cursor"></span></div>
     </div>
   </div>
 </section>

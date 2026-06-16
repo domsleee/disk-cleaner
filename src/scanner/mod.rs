@@ -442,9 +442,13 @@ fn scan_directory_inner(
     let mut root_node = walk_dir(root, &progress, &skip);
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
-    // Override name to be the full path (walk_dir used file_name only)
+    // Override name to be the full path (walk_dir used file_name only).
+    // The scan root is explicitly chosen by the user, so it must always be
+    // visible — drive roots like `C:\` carry FILE_ATTRIBUTE_HIDDEN on Windows,
+    // which would otherwise hide the whole tree when "Show hidden" is off.
     if let FileNode::Dir(d) = &mut root_node {
         d.name = root.to_string_lossy().into_owned().into_boxed_str();
+        d.hidden = false;
     }
     root_node
 }
@@ -861,6 +865,26 @@ mod tests {
             .find(|c| c.name() == "normal.txt")
             .expect("normal file should appear in scan");
         assert!(!normal_node.is_hidden(), "normal file should not be hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_hidden_scan_root_is_never_marked_hidden() {
+        // Drive roots like `C:\` carry FILE_ATTRIBUTE_HIDDEN on Windows. The
+        // scan root is chosen explicitly by the user, so it must always be
+        // visible — otherwise the UI filter hides the entire tree when
+        // "Show hidden" is off.
+        let tmp = tempfile::tempdir().unwrap();
+        set_hidden_attribute(tmp.path());
+        fs::write(tmp.path().join("normal.txt"), "hello").unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+
+        assert!(
+            !root.is_hidden(),
+            "scan root must not be hidden even when it has FILE_ATTRIBUTE_HIDDEN"
+        );
     }
 
     #[test]

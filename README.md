@@ -1,6 +1,6 @@
 # Disk Cleaner
 
-[![CI](https://github.com/domsleee/disk-cleaner/actions/workflows/release.yml/badge.svg)](https://github.com/domsleee/disk-cleaner/actions)
+[![CI](https://github.com/domsleee/disk-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/domsleee/disk-cleaner/actions/workflows/ci.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/domsleee/disk-cleaner)](https://github.com/domsleee/disk-cleaner/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -46,15 +46,15 @@ The binary will be at `target/release/disk-cleaner`.
 
 ## Screenshots
 
-**Home screen** — pick a volume or open a directory to scan.
+**Home screen:** pick a volume or open a directory to scan.
 
 ![Home screen](docs/screenshots/app_home.png)
 
-**Tree view** — browse the file tree sorted by size, filter by type.
+**Tree view:** browse the file tree sorted by size, filter by type.
 
 ![Scan results](docs/screenshots/app_tree.png)
 
-**Treemap** — visual overview of disk usage.
+**Treemap:** visual overview of disk usage.
 
 ![Treemap](docs/screenshots/app_treemap.png)
 

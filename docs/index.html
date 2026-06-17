@@ -92,9 +92,9 @@
     from { opacity: 0; transform: translateY(24px); }
     to { opacity: 1; transform: translateY(0); }
   }
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
+  @keyframes fadeUpHero {
+    from { opacity: 0; transform: translateY(48px); }
+    to { opacity: 1; transform: translateY(0); }
   }
   @keyframes blink {
     0%, 100% { opacity: 1; }
@@ -106,6 +106,8 @@
   .anim-d2 { animation-delay: 0.16s; }
   .anim-d3 { animation-delay: 0.28s; }
   .anim-d4 { animation-delay: 0.45s; }
+  /* Big hero screenshot gets a bigger slide so the motion reads */
+  .hero-window.anim { animation-name: fadeUpHero; }
 
   /* ---- Hero ---- */
   .hero {
@@ -426,16 +428,6 @@
     .features { grid-template-columns: 1fr; }
     .screenshots-grid { grid-template-columns: 1fr; }
     section { padding: 56px 20px; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    /* Opacity fades are not "motion" — keep them. Only drop movement:
-       the entry slide, hover lifts, and the lightbox zoom. */
-    .anim { animation-name: fadeIn; }
-    .screenshot-card:hover { transform: none; }
-    .btn:hover { transform: none; }
-    .lightbox img,
-    .lightbox.active img { transform: none; }
   }
 </style>
 </head>

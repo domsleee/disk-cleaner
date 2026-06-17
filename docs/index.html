@@ -63,13 +63,17 @@
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  /* Always show the vertical scrollbar so it can't flicker on/off during
+     load (an absent-then-present scrollbar shifts layout on every refresh). */
+  html { overflow-y: scroll; }
+
   body {
     font-family: var(--sans);
     background: var(--bg);
     color: var(--text);
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   /* Noise overlay for texture */

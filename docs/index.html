@@ -3,13 +3,61 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Disk Cleaner — Fast Native Disk Usage Analyzer</title>
+<title>Disk Cleaner: Fast Native Disk Usage Analyzer</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='bg' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='%231e3050'/><stop offset='1' stop-color='%232c5282'/></linearGradient></defs><rect width='32' height='32' rx='7' fill='url(%23bg)'/><path d='M16,16.16 L16.00,6.16 A10,10 0 0,1 22.85,23.45 Z' fill='%2364b4ff'/><path d='M16,16.16 L22.85,23.45 A10,10 0 0,1 9.15,23.45 Z' fill='%2350d28c'/><path d='M16,16.16 L9.15,23.45 A10,10 0 0,1 6.49,13.07 Z' fill='%23b482f0'/><path d='M16,16.16 L6.49,13.07 A10,10 0 0,1 11.18,7.40 Z' fill='%23ffc846'/><path d='M16,16.16 L11.18,7.40 A10,10 0 0,1 16.00,6.16 Z' fill='%23ff6e5a'/></svg>">
 <meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<!-- Open Graph / social link previews -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Disk Cleaner">
+<meta property="og:title" content="Disk Cleaner: Fast Native Disk Usage Analyzer">
+<meta property="og:description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
+<meta property="og:url" content="https://domsleee.github.io/disk-cleaner/">
+<meta property="og:image" content="https://domsleee.github.io/disk-cleaner/screenshots/app_tree_full-1280.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="853">
+<meta property="og:image:alt" content="Disk Cleaner showing a file tree sorted by size with a category sidebar">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Disk Cleaner: Fast Native Disk Usage Analyzer">
+<meta name="twitter:description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
+<meta name="twitter:image" content="https://domsleee.github.io/disk-cleaner/screenshots/app_tree_full-1280.png">
+<link rel="preload" href="fonts/dm-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
 <style>
+  /* Self-hosted fonts: ready at first paint, no Google round-trip. */
+  @font-face {
+    font-family: "DM Sans";
+    src: url("fonts/dm-sans.woff2") format("woff2");
+    font-weight: 400 600;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "JetBrains Mono";
+    src: url("fonts/jetbrains-mono.woff2") format("woff2");
+    font-weight: 400 500;
+    font-style: normal;
+    font-display: swap;
+  }
+  /* Fallback faces sized to match the web fonts (metrics computed from the
+     real font tables) so a swap causes no layout shift or visible flash. */
+  @font-face {
+    font-family: "DM Sans Fallback";
+    src: local("Arial");
+    size-adjust: 125.28%;
+    ascent-override: 79.18%;
+    descent-override: 24.74%;
+    line-gap-override: 0%;
+  }
+  @font-face {
+    font-family: "JetBrains Mono Fallback";
+    src: local("Consolas");
+    size-adjust: 109.13%;
+    ascent-override: 93.47%;
+    descent-override: 27.49%;
+    line-gap-override: 0%;
+  }
+
   :root {
     --bg: #09090b;
     --surface: #111113;
@@ -20,16 +68,35 @@
     --text-secondary: #a1a1aa;
     --text-muted: #8b8b96;
     --amber: #f59e0b;
-    --amber-dim: rgba(245, 158, 11, 0.10);
     --amber-border: rgba(245, 158, 11, 0.20);
     --amber-glow: rgba(245, 158, 11, 0.06);
-    --sans: "DM Sans", -apple-system, sans-serif;
-    --mono: "JetBrains Mono", "SF Mono", monospace;
+    --sans: "DM Sans", "DM Sans Fallback", -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", "JetBrains Mono Fallback", "SF Mono", Consolas, monospace;
     --max-w: 960px;
     --radius: 12px;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  /* Force a classic, always-visible scrollbar. On Windows "auto-hide scroll
+     bars", Chrome uses overlay scrollbars that fade in/out (looks like the
+     bar toggling on load); giving ::-webkit-scrollbar an explicit width flips
+     it to a classic bar. scrollbar-width/color are the standard path (Chrome
+     121+ gives them precedence; Firefox uses them too). */
+  html {
+    overflow-y: scroll;
+    scrollbar-width: auto;
+    scrollbar-color: #2a2a30 transparent;
+  }
+  html::-webkit-scrollbar { width: 12px; height: 12px; }
+  html::-webkit-scrollbar-track { background: transparent; }
+  html::-webkit-scrollbar-thumb {
+    background-color: #2a2a30;
+    border-radius: 8px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  html::-webkit-scrollbar-thumb:hover { background-color: #3a3a42; }
 
   body {
     font-family: var(--sans);
@@ -37,7 +104,7 @@
     color: var(--text);
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   /* Noise overlay for texture */
@@ -60,9 +127,9 @@
     from { opacity: 0; transform: translateY(24px); }
     to { opacity: 1; transform: translateY(0); }
   }
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
+  @keyframes fadeUpHero {
+    from { opacity: 0; transform: translateY(48px); }
+    to { opacity: 1; transform: translateY(0); }
   }
   @keyframes blink {
     0%, 100% { opacity: 1; }
@@ -74,7 +141,8 @@
   .anim-d2 { animation-delay: 0.16s; }
   .anim-d3 { animation-delay: 0.28s; }
   .anim-d4 { animation-delay: 0.45s; }
-  .anim-d5 { animation-delay: 0.6s; }
+  /* Big hero screenshot gets a bigger slide so the motion reads */
+  .hero-window.anim { animation-name: fadeUpHero; }
 
   /* ---- Hero ---- */
   .hero {
@@ -132,7 +200,6 @@
     text-decoration: none;
     transition: transform 0.2s ease, box-shadow 0.2s ease;
   }
-  .btn { text-decoration: none; }
   .btn:hover { text-decoration: none; transform: translateY(-1px); }
   .btn-primary {
     background: var(--amber);
@@ -169,6 +236,7 @@
   }
   .hero-window img {
     width: 100%;
+    height: auto;
     display: block;
   }
 
@@ -251,6 +319,7 @@
   }
   .screenshot-card img {
     width: 100%;
+    height: auto;
     display: block;
   }
   .screenshot-card figcaption {
@@ -305,8 +374,9 @@
     line-height: 1.8;
     color: var(--text-secondary);
   }
-  .terminal-body .prompt { color: var(--amber); }
-  .terminal-body .comment { color: var(--text-muted); font-style: italic; }
+  .terminal-body .prompt { color: var(--amber); user-select: none; }
+  .terminal-body .prompt::before { content: "$ "; }
+  .terminal-body .comment { color: var(--text-muted); font-style: italic; user-select: none; }
   .terminal-body .cursor {
     display: inline-block;
     width: 8px;
@@ -367,9 +437,25 @@
   .lightbox.active img {
     transform: scale(1);
   }
-  .screenshot-card img,
-  .hero-window img {
+  .lightbox-close {
+    position: absolute;
+    top: 20px;
+    right: 24px;
+    width: 40px;
+    height: 40px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-raised);
+    color: var(--text);
+    font-size: 1.5rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .lightbox-close:hover { background: var(--surface); }
+  .shot {
+    display: block;
     cursor: zoom-in;
+    text-decoration: none;
   }
 
   /* ---- Responsive ---- */
@@ -378,7 +464,6 @@
     .features { grid-template-columns: 1fr; }
     .screenshots-grid { grid-template-columns: 1fr; }
     section { padding: 56px 20px; }
-    section h2 { font-size: 1.8rem; }
   }
 </style>
 </head>
@@ -389,29 +474,35 @@
 <div class="hero">
   <h1 class="anim anim-d1">Disk Cleaner</h1>
   <p class="tagline anim anim-d2">
-    See what's eating your storage and clean it up.<br>
+    Find what's filling your disk.<br>
     Native, fast, built with Rust.
   </p>
   <div class="cta anim anim-d3">
     <a id="download-btn" href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       <span id="download-label">Download</span>
     </a>
     <a href="https://github.com/domsleee/disk-cleaner" class="btn btn-secondary">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
       View on GitHub
     </a>
   </div>
   <p id="other-platforms" class="anim anim-d3" style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px;"></p>
+  <a class="shot" href="screenshots/app_tree_full-full.webp" aria-label="View larger: file tree with category sidebar">
   <div class="hero-window anim anim-d4">
-    <img src="screenshots/app_tree_full.png" alt="Disk Cleaner showing file tree sorted by size with category sidebar">
+    <picture>
+      <source type="image/avif" srcset="screenshots/app_tree_full-1280.avif">
+      <source type="image/webp" srcset="screenshots/app_tree_full-1280.webp 1280w, screenshots/app_tree_full-full.webp 2400w" sizes="(max-width: 768px) 92vw, 880px">
+      <img src="screenshots/app_tree_full-1280.png" width="2400" height="1600" fetchpriority="high" alt="Disk Cleaner showing file tree sorted by size with category sidebar">
+    </picture>
   </div>
+  </a>
 </div>
 
 <!-- ============ Features ============ -->
 <section>
   <span class="section-label">Features</span>
-  <h2>Everything you need to reclaim disk space</h2>
+  <h2>Scan, sort, and delete large files</h2>
   <div class="features">
     <div class="feature">
       <h3>Parallel Scanning</h3>
@@ -445,23 +536,47 @@
 <!-- ============ Screenshots ============ -->
 <section>
   <span class="section-label">In action</span>
-  <h2>See it for yourself</h2>
+  <h2>Screenshots</h2>
   <div class="screenshots-grid">
     <figure class="screenshot-card">
-      <img src="screenshots/app_home.png" alt="Home screen with volume selection" loading="lazy">
-      <figcaption><strong>Home</strong> &mdash; Pick a volume or directory to scan</figcaption>
+      <a class="shot" href="screenshots/app_home-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_home-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_home-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_home-1280.png" width="2400" height="1600" alt="Home screen with volume selection" loading="lazy">
+        </picture>
+      </a>
+      <figcaption><strong>Home</strong>: Pick a volume or directory to scan</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_tree.png" alt="Tree view sorted by size" loading="lazy">
-      <figcaption><strong>Tree View</strong> &mdash; Files sorted by size with visual bars</figcaption>
+      <a class="shot" href="screenshots/app_tree-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_tree-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_tree-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_tree-1280.png" width="2400" height="1600" alt="Tree view sorted by size" loading="lazy">
+        </picture>
+      </a>
+      <figcaption><strong>Tree View</strong>: Files sorted by size with visual bars</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_tree_full.png" alt="Tree view with category sidebar" loading="lazy">
-      <figcaption><strong>Categories</strong> &mdash; Filter and break down by file type</figcaption>
+      <a class="shot" href="screenshots/app_tree_full-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_tree_full-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_tree_full-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_tree_full-1280.png" width="2400" height="1600" alt="Tree view with category sidebar" loading="lazy">
+        </picture>
+      </a>
+      <figcaption><strong>Categories</strong>: Filter and break down by file type</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_treemap.png" alt="Treemap visualization" loading="lazy">
-      <figcaption><strong>Treemap</strong> &mdash; Visual overview of disk usage</figcaption>
+      <a class="shot" href="screenshots/app_treemap-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_treemap-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_treemap-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_treemap-1280.png" width="2400" height="1600" alt="Treemap visualization" loading="lazy">
+        </picture>
+      </a>
+      <figcaption><strong>Treemap</strong>: Visual overview of disk usage</figcaption>
     </figure>
   </div>
 </section>
@@ -474,12 +589,12 @@
   <h2>Download or build from source</h2>
   <div class="cta" style="margin-bottom: 32px;">
     <a id="download-btn-install" href="https://github.com/domsleee/disk-cleaner/releases/latest" class="btn btn-primary">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      <span id="download-label-install">Download for Mac</span>
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      <span id="download-label-install">Download latest release</span>
     </a>
   </div>
   <p id="install-note" style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 24px;">
-    <noscript>Universal binary for Mac, Windows, and Linux. <a href="https://github.com/domsleee/disk-cleaner/releases/latest">All downloads</a></noscript>
+    <noscript>Downloads for macOS, Windows, and Linux. <a href="https://github.com/domsleee/disk-cleaner/releases/latest">All downloads</a></noscript>
   </p>
   <div class="terminal">
     <div class="terminal-bar">
@@ -490,17 +605,18 @@
     </div>
     <div class="terminal-body">
       <div><span class="comment"># or build from source (requires Rust 1.70+)</span></div>
-      <div><span class="prompt">$</span> git clone https://github.com/domsleee/disk-cleaner.git</div>
-      <div><span class="prompt">$</span> cd disk-cleaner</div>
-      <div><span class="prompt">$</span> cargo run --release<span class="cursor"></span></div>
+      <div><span class="prompt"></span>git clone https://github.com/domsleee/disk-cleaner.git</div>
+      <div><span class="prompt"></span>cd disk-cleaner</div>
+      <div><span class="prompt"></span>cargo run --release<span class="cursor"></span></div>
     </div>
   </div>
 </section>
 
 </main>
 <!-- ============ Lightbox ============ -->
-<div class="lightbox" id="lightbox">
-  <img src="" alt="">
+<div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Screenshot preview">
+  <button class="lightbox-close" id="lightbox-close" type="button" aria-label="Close preview">&times;</button>
+  <img alt="">
 </div>
 
 <!-- ============ Footer ============ -->
@@ -515,9 +631,9 @@
 
   const labels = { mac: 'Download for Mac', windows: 'Download for Windows', linux: 'Download for Linux' };
   const notes = {
-    mac: 'Universal binary \u2014 works on Apple Silicon and Intel. First launch: right-click \u2192 Open to bypass Gatekeeper.',
+    mac: 'Works on Apple Silicon and Intel Macs. First launch: right-click, then Open to bypass Gatekeeper.',
     windows: 'Windows 10+ (64-bit)',
-    linux: 'Linux x86_64 \u2014 requires GTK3'
+    linux: 'Linux x86_64, requires GTK3'
   };
   const assetSuffix = { mac: '-mac.dmg', windows: '-windows-x86_64.zip', linux: '-linux-x86_64.tar.gz' };
   const others = {
@@ -539,19 +655,19 @@
   }
   if (notes[os]) note.textContent = notes[os];
   if (others[os] && otherEl) {
-    otherEl.innerHTML = `Also available for ${others[os].join(' and ')} \u2014 <a href="https://github.com/domsleee/disk-cleaner/releases/latest">all downloads</a>`;
+    otherEl.innerHTML = `Also available for ${others[os].join(' and ')}. <a href="https://github.com/domsleee/disk-cleaner/releases/latest">All downloads</a>`;
   }
 
   // Fetch latest release and link directly to the platform-specific asset
   try {
     const r = await fetch('https://api.github.com/repos/domsleee/disk-cleaner/releases/latest');
     if (!r.ok) {
-      // Any failure (404, 403, 429, 5xx) — fall back to releases list
+      // Any failure (404, 403, 429, 5xx): fall back to releases list
       const fallback = 'https://github.com/domsleee/disk-cleaner/releases';
       if (dlBtn) dlBtn.href = fallback;
       if (dlBtnInstall) dlBtnInstall.href = fallback;
       if (r.status === 404 && note) {
-        note.textContent = 'No release yet \u2014 build from source or check back soon.';
+        note.textContent = 'No release yet. Build from source or check back soon.';
       }
     } else {
       const release = await r.json();
@@ -573,18 +689,37 @@
 (() => {
   const lb = document.getElementById('lightbox');
   const lbImg = lb.querySelector('img');
+  const closeBtn = document.getElementById('lightbox-close');
+  let lastFocused = null;
 
-  document.querySelectorAll('.screenshot-card img, .hero-window img').forEach(img => {
-    img.addEventListener('click', () => {
-      lbImg.src = img.src;
-      lbImg.alt = img.alt;
-      lb.classList.add('active');
+  const open = (href, alt) => {
+    lastFocused = document.activeElement;
+    lbImg.src = href;
+    lbImg.alt = alt || '';
+    lb.classList.add('active');
+    closeBtn.focus();
+  };
+  const close = () => {
+    if (!lb.classList.contains('active')) return;
+    lb.classList.remove('active');
+    lbImg.removeAttribute('src');
+    if (lastFocused) lastFocused.focus();
+  };
+
+  // Anchors hold the full-res image in href: JS opens it in the lightbox,
+  // and without JS the link still opens the full image (progressive enhancement).
+  document.querySelectorAll('a.shot').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const img = a.querySelector('img');
+      open(a.getAttribute('href'), img ? img.alt : '');
     });
   });
 
-  lb.addEventListener('click', () => lb.classList.remove('active'));
+  closeBtn.addEventListener('click', close);
+  lb.addEventListener('click', close);
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') lb.classList.remove('active');
+    if (e.key === 'Escape') close();
   });
 })();
 </script>

@@ -8,7 +8,7 @@
 <meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">
 <style>
   :root {
     --bg: #09090b;
@@ -308,7 +308,7 @@
   }
   .terminal-body .prompt { color: var(--amber); user-select: none; }
   .terminal-body .prompt::before { content: "$ "; }
-  .terminal-body .comment { color: var(--text-muted); font-style: italic; }
+  .terminal-body .comment { color: var(--text-muted); font-style: italic; user-select: none; }
   .terminal-body .cursor {
     display: inline-block;
     width: 8px;
@@ -398,12 +398,13 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after {
-      animation-duration: 0.001ms !important;
-      animation-iteration-count: 1 !important;
-      transition-duration: 0.001ms !important;
-    }
-    .anim { opacity: 1; }
+    /* Opacity fades are not "motion" — keep them. Only drop movement:
+       the entry slide, hover lifts, and the lightbox zoom. */
+    .anim { animation-name: fadeIn; }
+    .screenshot-card:hover { transform: none; }
+    .btn:hover { transform: none; }
+    .lightbox img,
+    .lightbox.active img { transform: none; }
   }
 </style>
 </head>
@@ -414,7 +415,7 @@
 <div class="hero">
   <h1 class="anim anim-d1">Disk Cleaner</h1>
   <p class="tagline anim anim-d2">
-    See what's eating your storage and clean it up.<br>
+    Find what's filling your disk.<br>
     Native, fast, built with Rust.
   </p>
   <div class="cta anim anim-d3">

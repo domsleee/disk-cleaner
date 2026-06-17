@@ -6,10 +6,43 @@
 <title>Disk Cleaner: Fast Native Disk Usage Analyzer</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='bg' x1='0' y1='0' x2='0' y2='1'><stop offset='0' stop-color='%231e3050'/><stop offset='1' stop-color='%232c5282'/></linearGradient></defs><rect width='32' height='32' rx='7' fill='url(%23bg)'/><path d='M16,16.16 L16.00,6.16 A10,10 0 0,1 22.85,23.45 Z' fill='%2364b4ff'/><path d='M16,16.16 L22.85,23.45 A10,10 0 0,1 9.15,23.45 Z' fill='%2350d28c'/><path d='M16,16.16 L9.15,23.45 A10,10 0 0,1 6.49,13.07 Z' fill='%23b482f0'/><path d='M16,16.16 L6.49,13.07 A10,10 0 0,1 11.18,7.40 Z' fill='%23ffc846'/><path d='M16,16.16 L11.18,7.40 A10,10 0 0,1 16.00,6.16 Z' fill='%23ff6e5a'/></svg>">
 <meta name="description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">
+<link rel="preload" href="fonts/dm-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
 <style>
+  /* Self-hosted fonts: ready at first paint, no Google round-trip. */
+  @font-face {
+    font-family: "DM Sans";
+    src: url("fonts/dm-sans.woff2") format("woff2");
+    font-weight: 400 600;
+    font-style: normal;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "JetBrains Mono";
+    src: url("fonts/jetbrains-mono.woff2") format("woff2");
+    font-weight: 400 500;
+    font-style: normal;
+    font-display: swap;
+  }
+  /* Fallback faces sized to match the web fonts (metrics computed from the
+     real font tables) so a swap causes no layout shift or visible flash. */
+  @font-face {
+    font-family: "DM Sans Fallback";
+    src: local("Arial");
+    size-adjust: 125.28%;
+    ascent-override: 79.18%;
+    descent-override: 24.74%;
+    line-gap-override: 0%;
+  }
+  @font-face {
+    font-family: "JetBrains Mono Fallback";
+    src: local("Consolas");
+    size-adjust: 109.13%;
+    ascent-override: 93.47%;
+    descent-override: 27.49%;
+    line-gap-override: 0%;
+  }
+
   :root {
     --bg: #09090b;
     --surface: #111113;
@@ -22,8 +55,8 @@
     --amber: #f59e0b;
     --amber-border: rgba(245, 158, 11, 0.20);
     --amber-glow: rgba(245, 158, 11, 0.06);
-    --sans: "DM Sans", -apple-system, sans-serif;
-    --mono: "JetBrains Mono", "SF Mono", monospace;
+    --sans: "DM Sans", "DM Sans Fallback", -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", "JetBrains Mono Fallback", "SF Mono", Consolas, monospace;
     --max-w: 960px;
     --radius: 12px;
   }
@@ -56,7 +89,7 @@
 
   /* ---- Animations ---- */
   @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0; transform: translateY(24px); }
     to { opacity: 1; transform: translateY(0); }
   }
   @keyframes fadeIn {
@@ -68,13 +101,11 @@
     50% { opacity: 0; }
   }
 
-  .anim { opacity: 0; animation: fadeUp 0.45s cubic-bezier(0.16, 1, 0.3, 1) both; }
-  .anim-d1 { animation-delay: 0.05s; }
-  .anim-d2 { animation-delay: 0.1s; }
-  .anim-d3 { animation-delay: 0.16s; }
-  .anim-d4 { animation-delay: 0.22s; }
-  /* Big hero screenshot fades in place, no slide/pop */
-  .hero-window.anim { animation-name: fadeIn; }
+  .anim { opacity: 0; animation: fadeUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) both; }
+  .anim-d1 { animation-delay: 0.08s; }
+  .anim-d2 { animation-delay: 0.16s; }
+  .anim-d3 { animation-delay: 0.28s; }
+  .anim-d4 { animation-delay: 0.45s; }
 
   /* ---- Hero ---- */
   .hero {

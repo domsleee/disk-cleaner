@@ -63,9 +63,25 @@
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  /* Always show the vertical scrollbar so it can't flicker on/off during
-     load (an absent-then-present scrollbar shifts layout on every refresh). */
-  html { overflow-y: scroll; }
+  /* Force a classic, always-visible scrollbar. On Windows "auto-hide scroll
+     bars", Chrome uses overlay scrollbars that fade in/out (looks like the
+     bar toggling on load); giving ::-webkit-scrollbar an explicit width flips
+     it to a classic bar. scrollbar-width/color are the standard path (Chrome
+     121+ gives them precedence; Firefox uses them too). */
+  html {
+    overflow-y: scroll;
+    scrollbar-width: auto;
+    scrollbar-color: #2a2a30 transparent;
+  }
+  html::-webkit-scrollbar { width: 12px; height: 12px; }
+  html::-webkit-scrollbar-track { background: transparent; }
+  html::-webkit-scrollbar-thumb {
+    background-color: #2a2a30;
+    border-radius: 8px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  html::-webkit-scrollbar-thumb:hover { background-color: #3a3a42; }
 
   body {
     font-family: var(--sans);

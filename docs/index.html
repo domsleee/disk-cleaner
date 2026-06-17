@@ -437,9 +437,10 @@
     cursor: pointer;
   }
   .lightbox-close:hover { background: var(--surface); }
-  .screenshot-card img,
-  .hero-window img {
+  .shot {
+    display: block;
     cursor: zoom-in;
+    text-decoration: none;
   }
 
   /* ---- Responsive ---- */
@@ -472,9 +473,15 @@
     </a>
   </div>
   <p id="other-platforms" class="anim anim-d3" style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px;"></p>
+  <a class="shot" href="screenshots/app_tree_full-full.webp" aria-label="View larger: file tree with category sidebar">
   <div class="hero-window anim anim-d4">
-    <img src="screenshots/app_tree_full.png" width="2400" height="1600" alt="Disk Cleaner showing file tree sorted by size with category sidebar">
+    <picture>
+      <source type="image/avif" srcset="screenshots/app_tree_full-1280.avif">
+      <source type="image/webp" srcset="screenshots/app_tree_full-1280.webp 1280w, screenshots/app_tree_full-full.webp 2400w" sizes="(max-width: 768px) 92vw, 880px">
+      <img src="screenshots/app_tree_full-1280.png" width="2400" height="1600" fetchpriority="high" alt="Disk Cleaner showing file tree sorted by size with category sidebar">
+    </picture>
   </div>
+  </a>
 </div>
 
 <!-- ============ Features ============ -->
@@ -517,19 +524,43 @@
   <h2>Screenshots</h2>
   <div class="screenshots-grid">
     <figure class="screenshot-card">
-      <img src="screenshots/app_home.png" width="2400" height="1600" alt="Home screen with volume selection" loading="lazy">
+      <a class="shot" href="screenshots/app_home-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_home-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_home-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_home-1280.png" width="2400" height="1600" alt="Home screen with volume selection" loading="lazy">
+        </picture>
+      </a>
       <figcaption><strong>Home</strong>: Pick a volume or directory to scan</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_tree.png" width="2400" height="1600" alt="Tree view sorted by size" loading="lazy">
+      <a class="shot" href="screenshots/app_tree-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_tree-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_tree-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_tree-1280.png" width="2400" height="1600" alt="Tree view sorted by size" loading="lazy">
+        </picture>
+      </a>
       <figcaption><strong>Tree View</strong>: Files sorted by size with visual bars</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_tree_full.png" width="2400" height="1600" alt="Tree view with category sidebar" loading="lazy">
+      <a class="shot" href="screenshots/app_tree_full-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_tree_full-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_tree_full-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_tree_full-1280.png" width="2400" height="1600" alt="Tree view with category sidebar" loading="lazy">
+        </picture>
+      </a>
       <figcaption><strong>Categories</strong>: Filter and break down by file type</figcaption>
     </figure>
     <figure class="screenshot-card">
-      <img src="screenshots/app_treemap.png" width="2400" height="1600" alt="Treemap visualization" loading="lazy">
+      <a class="shot" href="screenshots/app_treemap-full.webp">
+        <picture>
+          <source type="image/avif" srcset="screenshots/app_treemap-1280.avif">
+          <source type="image/webp" srcset="screenshots/app_treemap-1280.webp" sizes="(max-width: 768px) 90vw, 460px">
+          <img src="screenshots/app_treemap-1280.png" width="2400" height="1600" alt="Treemap visualization" loading="lazy">
+        </picture>
+      </a>
       <figcaption><strong>Treemap</strong>: Visual overview of disk usage</figcaption>
     </figure>
   </div>
@@ -646,10 +677,10 @@
   const closeBtn = document.getElementById('lightbox-close');
   let lastFocused = null;
 
-  const open = (img) => {
+  const open = (href, alt) => {
     lastFocused = document.activeElement;
-    lbImg.src = img.src;
-    lbImg.alt = img.alt;
+    lbImg.src = href;
+    lbImg.alt = alt || '';
     lb.classList.add('active');
     closeBtn.focus();
   };
@@ -660,13 +691,13 @@
     if (lastFocused) lastFocused.focus();
   };
 
-  document.querySelectorAll('.screenshot-card img, .hero-window img').forEach(img => {
-    img.tabIndex = 0;
-    img.setAttribute('role', 'button');
-    if (img.alt) img.setAttribute('aria-label', `View larger: ${img.alt}`);
-    img.addEventListener('click', () => open(img));
-    img.addEventListener('keydown', e => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(img); }
+  // Anchors hold the full-res image in href: JS opens it in the lightbox,
+  // and without JS the link still opens the full image (progressive enhancement).
+  document.querySelectorAll('a.shot').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const img = a.querySelector('img');
+      open(a.getAttribute('href'), img ? img.alt : '');
     });
   });
 

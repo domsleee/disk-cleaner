@@ -21,8 +21,6 @@
 <meta name="twitter:title" content="Disk Cleaner: Fast Native Disk Usage Analyzer">
 <meta name="twitter:description" content="A fast, native desktop app to visualize disk usage and clean up large files. Built with Rust and egui.">
 <meta name="twitter:image" content="https://domsleee.github.io/disk-cleaner/screenshots/app_tree_full-1280.png">
-<link rel="preload" href="fonts/dm-sans.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
 <style>
   /* Self-hosted fonts: ready at first paint, no Google round-trip. */
   @font-face {
@@ -30,14 +28,14 @@
     src: url("fonts/dm-sans.woff2") format("woff2");
     font-weight: 400 600;
     font-style: normal;
-    font-display: swap;
+    font-display: optional;
   }
   @font-face {
     font-family: "JetBrains Mono";
     src: url("fonts/jetbrains-mono.woff2") format("woff2");
     font-weight: 400 500;
     font-style: normal;
-    font-display: swap;
+    font-display: optional;
   }
   /* Fallback faces sized to match the web fonts (metrics computed from the
      real font tables) so a swap causes no layout shift or visible flash. */

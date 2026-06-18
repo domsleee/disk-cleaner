@@ -554,7 +554,11 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
                 use std::os::unix::fs::MetadataExt;
                 metadata.blocks() * 512
             };
-            #[cfg(not(unix))]
+            // On-disk allocation, matching the Windows bulk walker. Falls
+            // back to logical size if the query fails.
+            #[cfg(windows)]
+            let len = windows::allocation_size(&entry.path()).unwrap_or(metadata.len());
+            #[cfg(not(any(unix, windows)))]
             let len = metadata.len();
             progress.file_count.fetch_add(1, Ordering::Relaxed);
             progress.total_size.fetch_add(len, Ordering::Relaxed);
@@ -606,6 +610,29 @@ mod tests {
         })
     }
 
+    /// On-disk allocation size via `FILE_STANDARD_INFO` — the reference
+    /// value the scanner is expected to report on Windows.
+    #[cfg(target_os = "windows")]
+    fn allocation_size(path: &Path) -> u64 {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+        };
+
+        let file = fs::File::open(path).unwrap();
+        let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStandardInfo,
+                (&mut info as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "GetFileInformationByHandleEx failed");
+        info.AllocationSize as u64
+    }
+
     #[test]
     fn scan_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -637,7 +664,23 @@ mod tests {
             let expected_per_file = fs::metadata(tmp.path().join("a.txt")).unwrap().blocks() * 512;
             assert_eq!(root.size(), expected_per_file * 2);
         }
-        #[cfg(not(unix))]
+        // Windows reports on-disk allocation. These files are tiny enough to
+        // be MFT-resident, where the directory index and FILE_STANDARD_INFO
+        // can disagree by an 8-byte rounding unit — so assert a band rather
+        // than exact equality. Exact checks live in the dedicated
+        // windows_reports_allocation_* tests, which use non-resident files.
+        #[cfg(windows)]
+        {
+            let reference = allocation_size(&tmp.path().join("a.txt"))
+                + allocation_size(&tmp.path().join("b.txt"));
+            assert!(
+                root.size() >= 7 && root.size() <= reference + 16,
+                "expected size in [7, {}], got {}",
+                reference + 16,
+                root.size()
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             assert_eq!(root.size(), 7);
         }
@@ -663,7 +706,20 @@ mod tests {
             let block_size = fs::metadata(sub.join("file.bin")).unwrap().blocks() * 512;
             assert_eq!(root.size(), block_size * 2);
         }
-        #[cfg(not(unix))]
+        // Band rather than exact equality — see scan_flat_files for why
+        // (MFT-resident allocation reporting is inconsistent).
+        #[cfg(windows)]
+        {
+            let reference = allocation_size(&sub.join("file.bin"))
+                + allocation_size(&tmp.path().join("root.txt"));
+            assert!(
+                root.size() >= 101 && root.size() <= reference + 16,
+                "expected size in [101, {}], got {}",
+                reference + 16,
+                root.size()
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             assert_eq!(root.size(), 101);
         }
@@ -730,6 +786,97 @@ mod tests {
         assert_eq!(
             scanned_size, on_disk,
             "scanner should report on-disk size, not apparent size"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_reports_allocation_not_logical_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file.bin");
+        // 5000 bytes is non-resident and can't be cluster-aligned (clusters
+        // are powers of two >= 512), so allocation must differ from logical.
+        fs::write(&path, vec![0u8; 5000]).unwrap();
+
+        let on_disk = allocation_size(&path);
+        assert_ne!(on_disk, 5000, "allocation should be cluster-rounded");
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress);
+        assert_eq!(
+            root.size(),
+            on_disk,
+            "scanner should report on-disk allocation, not logical size"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sparse_file_reports_allocation_not_apparent_size() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::windows::io::AsRawHandle;
+
+        const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+        // Declared manually to avoid enabling the Win32_System_IO feature
+        // of windows-sys for a single test.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn DeviceIoControl(
+                handle: *mut core::ffi::c_void,
+                code: u32,
+                in_buf: *const core::ffi::c_void,
+                in_len: u32,
+                out_buf: *mut core::ffi::c_void,
+                out_len: u32,
+                returned: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sparse_path = tmp.path().join("sparse.raw");
+
+        // Create a sparse file: mark sparse, then write one byte at 100MB.
+        // Apparent size = 100MB+1, but only the final cluster is allocated.
+        let mut file = fs::File::create(&sparse_path).unwrap();
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "FSCTL_SET_SPARSE failed");
+        file.seek(SeekFrom::Start(100_000_000)).unwrap();
+        file.write_all(b"x").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let apparent = fs::metadata(&sparse_path).unwrap().len();
+        let on_disk = allocation_size(&sparse_path);
+        assert_eq!(apparent, 100_000_001);
+        assert!(
+            on_disk < 1_000_000,
+            "expected sparse file to allocate <1MB on disk, got {on_disk}"
+        );
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+        assert_eq!(
+            root.size(),
+            on_disk,
+            "scanner should report on-disk allocation, not apparent size"
+        );
+        assert_eq!(
+            progress.total_size.load(Ordering::Relaxed),
+            on_disk,
+            "progress counter should also report on-disk allocation"
         );
     }
 
@@ -893,7 +1040,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("sub");
         fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("nested.txt"), "fallback").unwrap();
+        // 5000 bytes is non-resident, so its on-disk allocation is at least
+        // one cluster and strictly larger than the logical 5000 (regardless
+        // of cluster size). This lets us assert the fallback path reports
+        // on-disk allocation, not logical size.
+        let nested = sub.join("nested.bin");
+        fs::write(&nested, vec![0u8; 5000]).unwrap();
         fs::write(tmp.path().join("root.txt"), "root").unwrap();
 
         let _guard = windows::fail_open_relative_for_name("sub");
@@ -910,6 +1062,18 @@ mod tests {
             sub_node.children().len(),
             1,
             "failed Windows bulk child open should fall back and still scan contents"
+        );
+        // The fallback (generic walk) must report on-disk allocation too,
+        // matching the bulk walker — not logical metadata.len() (5000).
+        let nested_size = sub_node.children()[0].size();
+        let nested_alloc = allocation_size(&nested);
+        assert_eq!(
+            nested_size, nested_alloc,
+            "fallback path should report on-disk allocation ({nested_alloc}), got {nested_size}"
+        );
+        assert!(
+            nested_size > 5000,
+            "on-disk allocation of a non-resident 5000-byte file must exceed its logical size"
         );
         assert_eq!(
             progress.file_count.load(Ordering::Relaxed),

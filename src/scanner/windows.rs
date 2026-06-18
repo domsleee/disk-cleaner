@@ -1,7 +1,7 @@
 //! Windows bulk metadata walker using `GetFileInformationByHandleEx`.
 //!
 //! Uses `FileIdExtdDirectoryInfo` to fetch many directory entries per syscall,
-//! including name, file attributes, reparse tag, and file size.
+//! including name, file attributes, reparse tag, and on-disk allocation size.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -26,8 +26,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdExtdDirectoryInfo,
+    FileIdExtdDirectoryRestartInfo, FileStandardInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 
 use crate::tree::{DirNode, FileLeaf, FileNode};
@@ -308,7 +308,11 @@ pub fn walk_dir_bulk(
                     let name_len = (&raw const (*info).FileNameLength).read_unaligned() as usize;
                     let attrs = (&raw const (*info).FileAttributes).read_unaligned();
                     let reparse_tag = (&raw const (*info).ReparsePointTag).read_unaligned();
-                    let logical_size = (&raw const (*info).EndOfFile).read_unaligned() as u64;
+                    // On-disk allocation, not logical size (EndOfFile): a disk
+                    // cleaner should report reclaimable bytes, so sparse and
+                    // compressed files count what they actually occupy. Matches
+                    // the macOS scanner's ATTR_FILE_ALLOCSIZE semantics.
+                    let alloc_size = (&raw const (*info).AllocationSize).read_unaligned() as u64;
                     let entry_len = if next_entry == 0 {
                         buf.len() - offset
                     } else {
@@ -329,13 +333,13 @@ pub fn walk_dir_bulk(
                             next_entry,
                             name_wide,
                             attrs,
-                            logical_size,
+                            alloc_size,
                             is_directory,
                             is_symlink,
                         ))
                     }
                 };
-                let Some((next_entry, name, attrs, logical_size, is_directory, is_symlink)) =
+                let Some((next_entry, name, attrs, alloc_size, is_directory, is_symlink)) =
                     parsed
                 else {
                     break;
@@ -359,8 +363,8 @@ pub fn walk_dir_bulk(
                     sub_dirs.push((name, hidden));
                 } else {
                     batch_file_count += 1;
-                    batch_total_size += logical_size;
-                    file_children.push(FileNode::File(FileLeaf::new(name, logical_size, hidden)));
+                    batch_total_size += alloc_size;
+                    file_children.push(FileNode::File(FileLeaf::new(name, alloc_size, hidden)));
                 }
 
                 if next_entry == 0 {
@@ -487,6 +491,48 @@ fn should_fail_open_relative(name: &str) -> bool {
                 .map(|target| target == name)
         })
         .unwrap_or(false)
+}
+
+/// On-disk allocation size of a single file, for the generic-walk fallback
+/// path so it stays consistent with the bulk walker's `AllocationSize`
+/// (rather than logical `metadata.len()`). Returns `None` on error so the
+/// caller can fall back to logical size. Queries the same `AllocationSize`
+/// field the bulk walker uses, via `FILE_STANDARD_INFO`.
+pub(super) fn allocation_size(path: &Path) -> Option<u64> {
+    // FILE_READ_ATTRIBUTES — enough to query metadata without read access,
+    // so this still works on files we couldn't open for reading.
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+
+    let wide = to_verbatim_wide(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let _guard = DirectoryHandle(handle);
+
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(info.AllocationSize as u64)
 }
 
 fn to_verbatim_wide(path: &Path) -> Vec<u16> {

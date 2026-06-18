@@ -11,7 +11,7 @@ TARGET="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 SCAN_BIN="./target/release/scan_only"
 
 echo "=== Building scan_only (release) ==="
-cargo build --release --bin scan_only 2>&1
+cargo build --release --bin scan_only --features internal-tools 2>&1
 
 if ! command -v dust &>/dev/null; then
   echo "Error: dust not found. Install with: cargo install du-dust"

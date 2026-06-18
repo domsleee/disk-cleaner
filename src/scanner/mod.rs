@@ -127,7 +127,13 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 fn scan_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
+        // 0 = rayon default (core count); oversubscribing measured slower.
+        let threads = std::env::var("SCAN_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
         rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
             .spawn_handler(|thread| {
                 let mut b = std::thread::Builder::new();
                 if let Some(name) = thread.name() {

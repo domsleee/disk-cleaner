@@ -55,7 +55,7 @@ mod macos {
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-    const ICON_PX: usize = 32;
+    const ICON_PX: usize = 64;
 
     fn nsimage_to_rgba(image: &NSImage, size: usize) -> Option<Vec<u8>> {
         unsafe {

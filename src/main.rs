@@ -1732,6 +1732,16 @@ impl eframe::App for App {
                             let card_interact = ui
                                 .interact(card_rect, card_id, egui::Sense::click())
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Highlight border on hover — a clickable card needs
+                            // more feedback than just a cursor change.
+                            if card_interact.hovered() {
+                                ui.painter().rect_stroke(
+                                    card_rect,
+                                    6.0,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(52, 152, 219)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                             if card_interact.clicked() {
                                 scan_path = Some(vol.path.clone());
                             }

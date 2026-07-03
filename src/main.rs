@@ -54,6 +54,20 @@ fn middle_truncate(s: &str, max: usize) -> String {
     format!("{head_s}\u{2026}{tail_s}")
 }
 
+/// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn write_fallback_report(
     scan_path: Option<&std::path::Path>,
     duration: Option<Duration>,
@@ -1611,32 +1625,43 @@ impl eframe::App for App {
                     ui.vertical_centered(|ui| {
                         ui.add_space(((avail - 240.0) * 0.5).max(24.0));
 
+                        // Spinner above a strong, centered title.
                         ui.spinner();
-                        ui.add_space(12.0);
-                        ui.heading(format!("Scanning {target}"));
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(&path_str).weak().size(12.0));
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!("Scanning {target}"))
+                                .size(22.0)
+                                .strong(),
+                        );
+                        // Show the path only for folders — a volume's name already
+                        // identifies it, so "/" would just be noise.
+                        if !self.scan_is_volume {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&path_str).weak().size(12.0));
+                        }
                         ui.add_space(20.0);
 
-                        // Live stat readout — the counters are the point, so make
-                        // them the hero rather than a small caption.
-                        egui::Frame::group(ui.style())
-                            .inner_margin(12.0)
-                            .show(ui, |ui| {
-                                ui.set_width(430.0);
-                                ui.columns(3, |cols| {
-                                    let stat = |ui: &mut egui::Ui, k: &str, v: &str| {
-                                        ui.vertical_centered(|ui| {
-                                            ui.label(egui::RichText::new(k).size(10.0).weak());
-                                            ui.add_space(2.0);
-                                            ui.label(egui::RichText::new(v).size(19.0).strong());
-                                        });
-                                    };
-                                    stat(&mut cols[0], "FILES", &files.to_string());
-                                    stat(&mut cols[1], "SIZE", &size_str);
-                                    stat(&mut cols[2], "ELAPSED", &elapsed_str);
-                                });
+                        // Live stat readout — unboxed columns; the counters are the
+                        // point, so give them weight (accent the growing size).
+                        egui::Frame::default().show(ui, |ui| {
+                            ui.set_width(360.0);
+                            ui.columns(3, |cols| {
+                                let stat = |ui: &mut egui::Ui, k: &str, v: &str, accent: bool| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new(k).size(10.0).weak());
+                                        ui.add_space(2.0);
+                                        let mut t = egui::RichText::new(v).size(21.0).strong();
+                                        if accent {
+                                            t = t.color(egui::Color32::from_rgb(90, 176, 255));
+                                        }
+                                        ui.label(t);
+                                    });
+                                };
+                                stat(&mut cols[0], "Files", &group_thousands(files), false);
+                                stat(&mut cols[1], "Size", &size_str, true);
+                                stat(&mut cols[2], "Elapsed", &elapsed_str, false);
                             });
+                        });
 
                         // Progress bar (volume scans estimate against used space).
                         // Painted flat like the volume capacity bars — the default
@@ -1647,15 +1672,19 @@ impl eframe::App for App {
                             let used = total.saturating_sub(available);
                             if used > 0 {
                                 let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
+                                let pct = fraction * 100.0;
+                                // "<1%" instead of a flat "0%" while size-based
+                                // progress rounds down but files are streaming in.
+                                let pct_str = if fraction > 0.0 && pct < 1.0 {
+                                    "<1%".to_string()
+                                } else {
+                                    format!("{pct:.0}%")
+                                };
                                 ui.add_space(14.0);
-                                ui.label(
-                                    egui::RichText::new(format!("{:.0}%", fraction * 100.0))
-                                        .weak()
-                                        .size(12.0),
-                                );
+                                ui.label(egui::RichText::new(pct_str).weak().size(12.0));
                                 ui.add_space(4.0);
                                 let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(430.0, 8.0),
+                                    egui::vec2(360.0, 8.0),
                                     egui::Sense::hover(),
                                 );
                                 let painter = ui.painter();

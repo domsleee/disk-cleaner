@@ -1756,22 +1756,30 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    // Rescan the last location — a fresh walk, not a resume.
+                    // Rescan the last location — but skip it when that path is
+                    // already a volume card above; a whole-volume rescan would
+                    // just duplicate the card.
                     if let Some(ref last) = self.last_scan_path.clone() {
-                        let full = last.display().to_string();
-                        let label = format!("Scan Again: {}", middle_truncate(&full, 48));
-                        if ui
-                            .button(label)
-                            .on_hover_text(format!("{full}\nStarts a fresh scan"))
-                            .clicked()
-                        {
-                            self.start_scan(last.clone());
+                        let is_listed_volume = self.volumes.iter().any(|v| v.path == *last);
+                        if !is_listed_volume {
+                            let full = last.display().to_string();
+                            let name = last
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| full.clone());
+                            if ui
+                                .button(format!("Rescan {}", middle_truncate(&name, 40)))
+                                .on_hover_text(format!("{full}\nStarts a fresh scan"))
+                                .clicked()
+                            {
+                                self.start_scan(last.clone());
+                            }
+                            ui.add_space(8.0);
                         }
-                        ui.add_space(8.0);
                     }
 
-                    // Choose a folder — primary action on home page
-                    if ui.button("Choose Folder to Scan...").clicked()
+                    // Primary action — pick any folder to scan.
+                    if ui.button("Scan a Folder...").clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         self.start_scan(path);

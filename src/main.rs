@@ -1647,7 +1647,10 @@ impl eframe::App for App {
                 }
 
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
+                    // Vertically center the content so it doesn't float at the
+                    // top with dead space below; estimate height from volume count.
+                    let est_content = 210.0 + self.volumes.len().max(1) as f32 * 90.0;
+                    ui.add_space(((ui.available_height() - est_content) * 0.5).max(24.0));
                     // App name lives in the window title bar — lead with the
                     // instruction here instead of repeating it.
                     ui.heading("Select a volume to scan");
@@ -1756,9 +1759,23 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    // Rescan the last location — but skip it when that path is
-                    // already a volume card above; a whole-volume rescan would
-                    // just duplicate the card.
+                    // Primary action — pick any folder to scan.
+                    let scan_btn = egui::Button::new(
+                        egui::RichText::new("Scan a Folder...")
+                            .size(14.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(61, 123, 240))
+                    .min_size(egui::vec2(0.0, 34.0));
+                    if ui.add(scan_btn).clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.start_scan(path);
+                    }
+
+                    // Rescan the last location — secondary, and only when that
+                    // path isn't already a volume card above (a whole-volume
+                    // rescan would just duplicate the card).
                     if let Some(ref last) = self.last_scan_path.clone() {
                         let is_listed_volume = self.volumes.iter().any(|v| v.path == *last);
                         if !is_listed_volume {
@@ -1767,6 +1784,7 @@ impl eframe::App for App {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| full.clone());
+                            ui.add_space(8.0);
                             if ui
                                 .button(format!("Rescan {}", middle_truncate(&name, 40)))
                                 .on_hover_text(format!("{full}\nStarts a fresh scan"))
@@ -1774,15 +1792,7 @@ impl eframe::App for App {
                             {
                                 self.start_scan(last.clone());
                             }
-                            ui.add_space(8.0);
                         }
-                    }
-
-                    // Primary action — pick any folder to scan.
-                    if ui.button("Scan a Folder...").clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.start_scan(path);
                     }
 
                     if let Some(ref err) = self.error {

@@ -11,8 +11,8 @@
 #   SCAN_THREADS=16 ./benches/coldscan.sh  # thread-count experiments
 #   ./benches/coldscan.sh --clean        # delete cached image and exit
 #
-# Fixture: 31,200 files / 450 dirs, created once and reused across
-# invocations (image kept at $IMAGE).
+# Fixture: 31,200 data files (+ 1 completion marker) / 450 dirs, created
+# once and reused across invocations (image kept at $IMAGE).
 
 set -euo pipefail
 
@@ -20,6 +20,11 @@ IMAGE="/tmp/disk-cleaner-coldbench.sparseimage"
 MOUNT="/tmp/disk-cleaner-coldbench-mnt"
 MARKER="$MOUNT/.fixture-complete"
 RUNS="${RUNS:-5}"
+
+if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 1 )); then
+  echo "RUNS must be a positive integer, got: '$RUNS'" >&2
+  exit 1
+fi
 
 cd "$(dirname "$0")/.."
 
@@ -72,9 +77,13 @@ for run in $(seq 1 "$RUNS"); do
   ms=$(BENCH_DIR="$MOUNT" BENCH_RUNS=1 BENCH_WARMUP=0 \
        cargo bench --bench stat_bench 2>&1 \
        | awk '/Run  1:/ {print $3}')
+  detach
+  if ! [[ "$ms" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "  run $run: failed to parse scan time (got: '$ms')" >&2
+    exit 1
+  fi
   echo "  run $run: ${ms} ms"
   times+=("$ms")
-  detach
 done
 
 echo ""

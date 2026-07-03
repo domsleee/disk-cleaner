@@ -56,9 +56,12 @@ BENCH_DIR=/path/to/scan BENCH_RUNS=5 cargo bench --bench stat_bench
 
 ### Cold-cache scan (`coldscan.sh`, macOS)
 
-True cold scans without sudo: fixture lives on an APFS sparse image,
-detached/reattached between runs to evict the volume's metadata cache.
-All other benches are warm-cache.
+Cold metadata cache without sudo: fixture lives on an APFS sparse image,
+detached/reattached between runs to evict the volume's vnode/metadata
+cache. Note the image's backing file may stay in the boot volume's page
+cache, so this measures a cold mount, not necessarily cold storage — it
+is a consistent A/B baseline, not a disk-seek benchmark. All other
+benches are warm-cache.
 
 ```sh
 ./benches/coldscan.sh                  # 5 cold runs, mean ± stddev

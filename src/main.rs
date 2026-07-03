@@ -40,6 +40,20 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+/// Shorten a path for a button label, keeping the root and leaf visible.
+fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_s}\u{2026}{tail_s}")
+}
+
 fn write_fallback_report(
     scan_path: Option<&std::path::Path>,
     duration: Option<Duration>,
@@ -1632,12 +1646,26 @@ impl eframe::App for App {
                     self.volumes_last_refresh = Some(std::time::Instant::now());
                 }
 
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.heading("Disk Cleaner");
+                let avail = ui.available_height();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_min_height(avail);
+                    ui.vertical_centered(|ui| {
+                    // Center the content when it fits; the ScrollArea keeps the
+                    // buttons reachable when it doesn't. Estimate height from the
+                    // volume list (each card ~90px, plus the "Volumes" header).
+                    let est_content = 150.0
+                        + if self.volumes.is_empty() {
+                            0.0
+                        } else {
+                            30.0 + self.volumes.len() as f32 * 90.0
+                        };
+                    ui.add_space(((avail - est_content) * 0.5).max(24.0));
+                    // App name lives in the window title bar — lead with the
+                    // instruction here instead of repeating it.
+                    ui.heading("Select a volume to scan");
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Select a volume to scan and reclaim disk space")
+                        egui::RichText::new("Reclaim disk space by finding what's using it")
                             .weak()
                             .size(13.0),
                     );
@@ -1716,6 +1744,16 @@ impl eframe::App for App {
                             let card_interact = ui
                                 .interact(card_rect, card_id, egui::Sense::click())
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            // Highlight border on hover — a clickable card needs
+                            // more feedback than just a cursor change.
+                            if card_interact.hovered() {
+                                ui.painter().rect_stroke(
+                                    card_rect,
+                                    6.0,
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(52, 152, 219)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                             if card_interact.clicked() {
                                 scan_path = Some(vol.path.clone());
                             }
@@ -1730,26 +1768,47 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    // Resume last scan
-                    if let Some(ref last) = self.last_scan_path.clone() {
-                        let label = format!("Resume: {}", last.display());
-                        if ui.button(label).clicked() {
-                            self.start_scan(last.clone());
-                        }
-                        ui.add_space(8.0);
-                    }
-
-                    // Open Directory — primary action on home page
-                    if ui.button("Open Directory...").clicked()
+                    // Primary action — pick any folder to scan.
+                    let scan_btn = egui::Button::new(
+                        egui::RichText::new("Scan a Folder...")
+                            .size(14.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(37, 99, 235))
+                    .min_size(egui::vec2(0.0, 34.0));
+                    if ui.add(scan_btn).clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         self.start_scan(path);
+                    }
+
+                    // Rescan the last location — secondary, and only when that
+                    // path isn't already a volume card above (a whole-volume
+                    // rescan would just duplicate the card).
+                    if let Some(ref last) = self.last_scan_path.clone() {
+                        let is_listed_volume = self.volumes.iter().any(|v| v.path == *last);
+                        if !is_listed_volume {
+                            let full = last.display().to_string();
+                            let name = last
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| full.clone());
+                            ui.add_space(8.0);
+                            if ui
+                                .button(format!("Rescan {}", middle_truncate(&name, 40)))
+                                .on_hover_text(format!("{full}\nStarts a fresh scan"))
+                                .clicked()
+                            {
+                                self.start_scan(last.clone());
+                            }
+                        }
                     }
 
                     if let Some(ref err) = self.error {
                         ui.add_space(12.0);
                         ui.colored_label(egui::Color32::RED, err);
                     }
+                    });
                 });
                 return;
             }

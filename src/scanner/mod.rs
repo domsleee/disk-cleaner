@@ -64,6 +64,37 @@ pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// macOS: keep only local, writable, disk-backed mounts (real drives).
+/// Drops mounted disk images (read-only DMGs), network shares, and
+/// pseudo/auto filesystems — none of which are meaningful to "clean".
+#[cfg(target_os = "macos")]
+fn is_real_drive(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(cpath.as_ptr(), &mut sfs) } != 0 {
+        return false;
+    }
+    // statfs reports the fs *containing* path, so require path to BE the
+    // mount point — else a plain dir under /Volumes inherits the writable
+    // Data volume and passes.
+    let on = unsafe { std::ffi::CStr::from_ptr(sfs.f_mntonname.as_ptr()) };
+    let is_mount_point = on.to_bytes() == path.as_os_str().as_bytes();
+    let local = sfs.f_flags & libc::MNT_LOCAL as u32 != 0;
+    let read_only = sfs.f_flags & libc::MNT_RDONLY as u32 != 0;
+    // Real block device (/dev/diskN), not //server/share or map auto_home.
+    let from = unsafe { std::ffi::CStr::from_ptr(sfs.f_mntfromname.as_ptr()) };
+    let disk_backed = from.to_bytes().starts_with(b"/dev/");
+    is_mount_point && local && !read_only && disk_backed
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_real_drive(_path: &Path) -> bool {
+    true
+}
+
 /// List mounted volumes. On macOS, reads `/Volumes/` and includes root `/`.
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
@@ -97,7 +128,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
                 continue;
             }
 
-            if path.is_dir() {
+            if path.is_dir() && is_real_drive(&path) {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())

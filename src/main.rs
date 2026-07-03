@@ -40,6 +40,20 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+/// Shorten a path for a button label, keeping the root and leaf visible.
+fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_s}\u{2026}{tail_s}")
+}
+
 fn write_fallback_report(
     scan_path: Option<&std::path::Path>,
     duration: Option<Duration>,
@@ -1730,17 +1744,22 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
 
-                    // Resume last scan
+                    // Rescan the last location — a fresh walk, not a resume.
                     if let Some(ref last) = self.last_scan_path.clone() {
-                        let label = format!("Resume: {}", last.display());
-                        if ui.button(label).clicked() {
+                        let full = last.display().to_string();
+                        let label = format!("Scan Again: {}", middle_truncate(&full, 48));
+                        if ui
+                            .button(label)
+                            .on_hover_text(format!("{full}\nStarts a fresh scan"))
+                            .clicked()
+                        {
                             self.start_scan(last.clone());
                         }
                         ui.add_space(8.0);
                     }
 
-                    // Open Directory — primary action on home page
-                    if ui.button("Open Directory...").clicked()
+                    // Choose a folder — primary action on home page
+                    if ui.button("Choose Folder to Scan...").clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         self.start_scan(path);

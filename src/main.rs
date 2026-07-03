@@ -1648,10 +1648,12 @@ impl eframe::App for App {
 
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    ui.heading("Disk Cleaner");
+                    // App name lives in the window title bar — lead with the
+                    // instruction here instead of repeating it.
+                    ui.heading("Select a volume to scan");
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Select a volume to scan and reclaim disk space")
+                        egui::RichText::new("Reclaim disk space by finding what's using it")
                             .weak()
                             .size(13.0),
                     );

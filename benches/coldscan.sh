@@ -21,11 +21,6 @@ MOUNT="/tmp/disk-cleaner-coldbench-mnt"
 MARKER="$MOUNT/.fixture-complete"
 RUNS="${RUNS:-5}"
 
-if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 1 )); then
-  echo "RUNS must be a positive integer, got: '$RUNS'" >&2
-  exit 1
-fi
-
 cd "$(dirname "$0")/.."
 
 attach() { hdiutil attach -quiet -mountpoint "$MOUNT" "$IMAGE"; }
@@ -37,6 +32,13 @@ if [[ "${1:-}" == "--clean" ]]; then
   rm -f "$IMAGE"
   echo "Removed $IMAGE"
   exit 0
+fi
+
+# Reject 0 and leading-zero/octal forms (checked after --clean, which
+# ignores RUNS).
+if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "RUNS must be a positive integer, got: '$RUNS'" >&2
+  exit 1
 fi
 
 # --- Fixture (created once, reused; marker guards partial creation) ---

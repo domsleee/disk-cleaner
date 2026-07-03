@@ -54,6 +54,20 @@ fn middle_truncate(s: &str, max: usize) -> String {
     format!("{head_s}\u{2026}{tail_s}")
 }
 
+/// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn write_fallback_report(
     scan_path: Option<&std::path::Path>,
     duration: Option<Duration>,
@@ -1230,8 +1244,9 @@ impl eframe::App for App {
             self.confirm_delete = None;
         }
 
-        // Top panel with toolbar (hidden on home page where it only has "Open Directory")
-        let show_toolbar = self.tree.is_some() || self.scanning;
+        // Toolbar only in the results view — hidden on home and while scanning,
+        // where it would leave a lone orphaned button.
+        let show_toolbar = self.tree.is_some() && !self.scanning;
         if show_toolbar {
             egui::TopBottomPanel::top("toolbar")
                 .show_separator_line(false)
@@ -1241,7 +1256,7 @@ impl eframe::App for App {
                         // Standardize widget height so buttons and selectable labels align
                         ui.spacing_mut().interact_size.y = 24.0;
 
-                        if ui.button("Open Directory...").clicked()
+                        if ui.button("Scan a Folder...").clicked()
                             && let Some(path) = rfd::FileDialog::new().pick_folder()
                         {
                             self.start_scan(path);
@@ -1578,60 +1593,125 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Full-page scanning UI
             if self.scanning {
-                ui.vertical_centered(|ui| {
-                    let available = ui.available_height();
-                    ui.add_space(available * 0.3);
+                let files = self.scan_progress.file_count.load(Ordering::Relaxed);
+                let size = self.scan_progress.total_size.load(Ordering::Relaxed);
+                let size_str = bytesize::ByteSize::b(size).to_string();
+                let elapsed_str = self
+                    .scan_start_time
+                    .map(|s| format_elapsed(s.elapsed()))
+                    .unwrap_or_else(|| "0s".to_string());
+                let path_str = self
+                    .scan_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                // Prefer the volume label for a volume root, else the folder name.
+                let target = self
+                    .volumes
+                    .iter()
+                    .find(|v| Some(&v.path) == self.scan_path.as_ref())
+                    .map(|v| v.name.clone())
+                    .or_else(|| {
+                        self.scan_path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| path_str.clone());
 
-                    ui.spinner();
-                    ui.add_space(12.0);
+                let avail = ui.available_height();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_min_height(avail);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(((avail - 240.0) * 0.5).max(24.0));
 
-                    let path_str = self
-                        .scan_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default();
-                    ui.heading("Scanning");
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&path_str).weak().size(13.0));
-                    ui.add_space(16.0);
-
-                    let files = self.scan_progress.file_count.load(Ordering::Relaxed);
-                    let size = self.scan_progress.total_size.load(Ordering::Relaxed);
-                    let size_str = bytesize::ByteSize::b(size).to_string();
-                    ui.label(format!("{files} files — {size_str}"));
-
-                    // Progress bar: estimated scan progress based on used disk space
-                    if self.scan_is_volume
-                        && let Some((total, available)) = self.scan_disk_info
-                    {
-                        let used = total.saturating_sub(available);
-                        if used > 0 {
-                            ui.add_space(12.0);
-                            let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                            let bar = egui::ProgressBar::new(fraction).desired_width(300.0);
-                            ui.add(bar);
-                        }
-                    }
-
-                    // Elapsed time
-                    if let Some(start) = self.scan_start_time {
-                        ui.add_space(8.0);
+                        // Spinner above a strong, centered title.
+                        ui.spinner();
+                        ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Elapsed: {}",
-                                format_elapsed(start.elapsed())
-                            ))
-                            .weak()
-                            .size(13.0),
+                            egui::RichText::new(format!("Scanning {target}"))
+                                .size(22.0)
+                                .strong(),
                         );
-                    }
+                        // Show the path only for folders — a volume's name already
+                        // identifies it, so "/" would just be noise.
+                        if !self.scan_is_volume {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&path_str).weak().size(12.0));
+                        }
+                        ui.add_space(20.0);
 
-                    ui.add_space(24.0);
-                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0))
-                        .min_size(egui::vec2(120.0, 36.0));
-                    if ui.add(cancel_btn).clicked() {
-                        self.cancel_scan();
-                    }
+                        // Live stat readout — unboxed columns; the counters are the
+                        // point, so give them weight (accent the growing size).
+                        egui::Frame::default().show(ui, |ui| {
+                            ui.set_width(360.0);
+                            ui.columns(3, |cols| {
+                                let stat = |ui: &mut egui::Ui, k: &str, v: &str, accent: bool| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(egui::RichText::new(k).size(10.0).weak());
+                                        ui.add_space(2.0);
+                                        let mut t = egui::RichText::new(v).size(21.0).strong();
+                                        if accent {
+                                            t = t.color(egui::Color32::from_rgb(90, 176, 255));
+                                        }
+                                        ui.label(t);
+                                    });
+                                };
+                                stat(&mut cols[0], "Files", &group_thousands(files), false);
+                                stat(&mut cols[1], "Size", &size_str, true);
+                                stat(&mut cols[2], "Elapsed", &elapsed_str, false);
+                            });
+                        });
+
+                        // Progress bar (volume scans estimate against used space).
+                        // Painted flat like the volume capacity bars — the default
+                        // ProgressBar's rounded cap reads as a slider thumb.
+                        if self.scan_is_volume
+                            && let Some((total, available)) = self.scan_disk_info
+                        {
+                            let used = total.saturating_sub(available);
+                            if used > 0 {
+                                let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
+                                let pct = fraction * 100.0;
+                                // "<1%" instead of a flat "0%" while size-based
+                                // progress rounds down but files are streaming in.
+                                let pct_str = if fraction > 0.0 && pct < 1.0 {
+                                    "<1%".to_string()
+                                } else {
+                                    format!("{pct:.0}%")
+                                };
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new(pct_str).weak().size(12.0));
+                                ui.add_space(4.0);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(360.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter();
+                                painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+                                let fill_w = rect.width() * fraction;
+                                if fill_w > 0.5 {
+                                    let fill = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(fill_w.max(3.0), 8.0),
+                                    );
+                                    painter.rect_filled(
+                                        fill,
+                                        3.0,
+                                        egui::Color32::from_rgb(37, 99, 235),
+                                    );
+                                }
+                            }
+                        }
+
+                        ui.add_space(24.0);
+                        let cancel_btn =
+                            egui::Button::new(egui::RichText::new("Cancel").size(14.0))
+                                .min_size(egui::vec2(120.0, 34.0));
+                        if ui.add(cancel_btn).clicked() {
+                            self.cancel_scan();
+                        }
+                    });
                 });
                 return;
             }

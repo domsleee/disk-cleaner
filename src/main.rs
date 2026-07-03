@@ -1263,7 +1263,7 @@ impl eframe::App for App {
                         }
 
                         if self.tree.is_some()
-                            && ui.button("Re-scan").clicked()
+                            && ui.button("Rescan").clicked()
                             && let Some(path) = self.scan_path.clone()
                         {
                             self.start_scan(path);

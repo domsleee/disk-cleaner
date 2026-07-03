@@ -490,6 +490,13 @@ pub fn render_tree(
         // Prevent shift+click from selecting label text (OS text highlight).
         ui.style_mut().interaction.selectable_labels = false;
         let full_width = ui.max_rect();
+        // Clamp where the size column sits so it stays beside the names on
+        // wide windows instead of pinned to the far-right edge.
+        const MAX_CONTENT_WIDTH: f32 = 900.0;
+        let content_right = full_width
+            .right()
+            .min(full_width.left() + MAX_CONTENT_WIDTH);
+        let right_inset = full_width.right() - content_right;
         for i in range {
             let row = &rows[i];
             let indent = row.depth as f32 * 20.0;
@@ -556,7 +563,10 @@ pub fn render_tree(
                 let right_reserved = text_margin + text_width + bar_gap + bar_width;
 
                 // Name — truncate so it never overlaps the size bar area.
-                let name_max_w = (ui.available_width() - right_reserved - 4.0).max(20.0);
+                // Floor at 0 (not a fixed 20px) so a deeply-indented name clips
+                // to nothing rather than spilling over the pulled-in size bar.
+                let name_max_w =
+                    (ui.available_width() - right_inset - right_reserved - 4.0).max(0.0);
                 let name_text = if row.is_hidden || row.is_file_group {
                     egui::RichText::new(&*row.name).monospace().weak()
                 } else {
@@ -577,7 +587,7 @@ pub fn render_tree(
                 // center().y drifts with scroll position).
                 let row_center_y = ui.min_rect().center().y;
                 let painter = ui.painter();
-                let text_x = full_width.right() - text_margin - text_width;
+                let text_x = content_right - text_margin - text_width;
                 let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
@@ -600,8 +610,10 @@ pub fn render_tree(
             });
 
             let toggle_right = row_response.inner;
+            // Match the interaction area to the visible content width so clicks
+            // and hover in the blank right-hand gutter don't target the row.
             let row_rect = egui::Rect::from_x_y_ranges(
-                full_width.x_range(),
+                full_width.left()..=content_right,
                 row_response.response.rect.y_range(),
             );
 
@@ -756,7 +768,7 @@ pub fn render_tree(
                 let spacing_half = ui.spacing().item_spacing.y / 2.0;
                 let y = row_rect.y_range();
                 let highlight_rect = egui::Rect::from_x_y_ranges(
-                    full_width.x_range(),
+                    full_width.left()..=content_right,
                     (y.min - spacing_half)..=(y.max + spacing_half),
                 );
                 ui.painter().set(

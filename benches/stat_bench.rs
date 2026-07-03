@@ -126,7 +126,7 @@ fn main() {
 
     eprintln!("=== Statistical Benchmark ===");
     eprintln!("Directory : {dir}");
-    eprintln!("Runs      : {runs} (+ 1 warmup)");
+    eprintln!("Runs      : {runs} (+ {} warmup)", warmup as u8);
     eprintln!();
 
     // Warmup run (not measured)

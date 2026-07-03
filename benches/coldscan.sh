@@ -93,6 +93,7 @@ printf '%s\n' "${times[@]}" | awk '
   { sum += $1; sumsq += $1 * $1; n++ }
   END {
     mean = sum / n
-    sd = (n > 1) ? sqrt((sumsq - sum * sum / n) / (n - 1)) : 0
-    printf "Cold scan: %.1f ± %.1f ms (%d runs)\n", mean, sd, n
+    var = (n > 1) ? (sumsq - sum * sum / n) / (n - 1) : 0
+    if (var < 0) var = 0   # guard fp cancellation on identical samples
+    printf "Cold scan: %.1f ± %.1f ms (%d runs)\n", mean, sqrt(var), n
   }'

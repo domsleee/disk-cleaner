@@ -7,3 +7,6 @@ docs/DESIGN.md
 docs/IDEA.md
 docs/UI_AUDIT.md
 .gstack/
+
+# Local Claude Code worktrees / session state
+.claude/

@@ -1646,11 +1646,20 @@ impl eframe::App for App {
                     self.volumes_last_refresh = Some(std::time::Instant::now());
                 }
 
-                ui.vertical_centered(|ui| {
-                    // Vertically center the content so it doesn't float at the
-                    // top with dead space below; estimate height from volume count.
-                    let est_content = 210.0 + self.volumes.len().max(1) as f32 * 90.0;
-                    ui.add_space(((ui.available_height() - est_content) * 0.5).max(24.0));
+                let avail = ui.available_height();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_min_height(avail);
+                    ui.vertical_centered(|ui| {
+                    // Center the content when it fits; the ScrollArea keeps the
+                    // buttons reachable when it doesn't. Estimate height from the
+                    // volume list (each card ~90px, plus the "Volumes" header).
+                    let est_content = 150.0
+                        + if self.volumes.is_empty() {
+                            0.0
+                        } else {
+                            30.0 + self.volumes.len() as f32 * 90.0
+                        };
+                    ui.add_space(((avail - est_content) * 0.5).max(24.0));
                     // App name lives in the window title bar — lead with the
                     // instruction here instead of repeating it.
                     ui.heading("Select a volume to scan");
@@ -1765,7 +1774,7 @@ impl eframe::App for App {
                             .size(14.0)
                             .color(egui::Color32::WHITE),
                     )
-                    .fill(egui::Color32::from_rgb(61, 123, 240))
+                    .fill(egui::Color32::from_rgb(37, 99, 235))
                     .min_size(egui::vec2(0.0, 34.0));
                     if ui.add(scan_btn).clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1799,6 +1808,7 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                         ui.colored_label(egui::Color32::RED, err);
                     }
+                    });
                 });
                 return;
             }

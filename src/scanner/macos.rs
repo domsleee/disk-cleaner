@@ -309,8 +309,10 @@ pub fn walk_dir_bulk(
         Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
     };
 
-    // Small-dir sequential fallback — skip rayon for few subdirs.
-    const PAR_THRESHOLD: usize = 4;
+    // Skip rayon only when there's nothing to parallelize (0 or 1 subdir);
+    // fan-out is a poor proxy for work, so a higher threshold risks
+    // serializing a handful of huge subtrees.
+    const PAR_THRESHOLD: usize = 1;
     let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
         sub_dirs.into_iter().filter_map(walk_child).collect()
     } else {

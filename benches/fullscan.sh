@@ -22,7 +22,7 @@ echo "Target: $TARGET"
 echo ""
 
 echo "Building scan_only (release)..."
-cargo build --release --bin scan_only 2>&1
+cargo build --release --bin scan_only --features internal-tools 2>&1
 echo ""
 
 echo "Scanning..."

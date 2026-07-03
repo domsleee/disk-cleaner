@@ -185,38 +185,8 @@ pub fn walk_dir_bulk(
                 break;
             }
 
-            // --- Pre-count pass: count files vs dirs to pre-allocate ---
-            //
-            // Per-entry layout (offsets from entry start):
-            //   +0   u32  length          total bytes for this entry
-            //   +32  u32  objtype           (VREG=1, VDIR=2, …)
-            //
-            // Full layout parsed in the main pass below.
-            {
-                let mut off = 0usize;
-                let (mut nfiles, mut ndirs) = (0usize, 0usize);
-                for _ in 0..count as usize {
-                    if off + 40 > BUF_SIZE {
-                        break;
-                    }
-                    unsafe {
-                        let base = buf.as_ptr().add(off);
-                        let entry_len = *(base as *const u32) as usize;
-                        if entry_len == 0 || off + entry_len > BUF_SIZE {
-                            break;
-                        }
-                        let objtype = *(base.add(32) as *const u32);
-                        match objtype {
-                            VREG => nfiles += 1,
-                            VDIR => ndirs += 1,
-                            _ => {}
-                        }
-                        off += entry_len;
-                    }
-                }
-                file_children.reserve(nfiles + ndirs);
-                sub_dirs.reserve(ndirs);
-            }
+            file_children.reserve(count as usize);
+            sub_dirs.reserve(count as usize);
 
             // --- Parse returned entries ---
             //
@@ -244,17 +214,19 @@ pub fn walk_dir_bulk(
 
                 unsafe {
                     let base = buf.as_ptr().add(offset);
-                    let entry_len = *(base as *const u32) as usize;
+                    // read_unaligned: entries are 4-byte aligned, not 8;
+                    // typed derefs would be UB for the i64 field.
+                    let entry_len = base.cast::<u32>().read_unaligned() as usize;
                     if entry_len == 0 || offset + entry_len > BUF_SIZE {
                         break;
                     }
 
                     // Which file attrs were actually returned for this entry?
-                    let returned_file = *(base.add(16) as *const u32);
+                    let returned_file = base.add(16).cast::<u32>().read_unaligned();
 
                     // Name — attrreference_t at +24
-                    let name_dataoff = *(base.add(24) as *const i32);
-                    let name_bytelen = *(base.add(28) as *const u32) as usize;
+                    let name_dataoff = base.add(24).cast::<i32>().read_unaligned();
+                    let name_bytelen = base.add(28).cast::<u32>().read_unaligned() as usize;
 
                     let name_ptr = base.add(24).offset(name_dataoff as isize);
                     let name_end =
@@ -274,8 +246,8 @@ pub fn walk_dir_bulk(
                             .into_boxed_str(),
                     };
 
-                    let objtype = *(base.add(32) as *const u32);
-                    let flags = *(base.add(36) as *const u32);
+                    let objtype = base.add(32).cast::<u32>().read_unaligned();
+                    let flags = base.add(36).cast::<u32>().read_unaligned();
                     let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
 
                     match objtype {
@@ -284,7 +256,7 @@ pub fn walk_dir_bulk(
                         }
                         VREG => {
                             let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                                *(base.add(40) as *const i64) as u64
+                                base.add(40).cast::<i64>().read_unaligned() as u64
                             } else {
                                 0
                             };
@@ -316,35 +288,41 @@ pub fn walk_dir_bulk(
     // Recurse into subdirectories.  Each child opens itself with
     // openat(dirfd, name) — one-component kernel lookup instead of
     // resolving the full absolute path from /.
-    let dir_children: Vec<FileNode> = sub_dirs
-        .into_par_iter()
-        .filter_map(|(name, hidden)| {
-            let path = dir.join(&*name);
-            if skip.contains(&path) {
-                return None;
-            }
-            let child_fd = CString::new(name.as_bytes())
-                .ok()
-                .map(|c| unsafe {
-                    libc::openat(dirfd, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-                })
-                .unwrap_or(-1);
-            if child_fd < 0 {
-                return Some(FileNode::Dir(Box::new(DirNode {
-                    name,
-                    size: 0,
-                    children: Vec::new(),
-                    expanded: false,
-                    hidden,
-                })));
-            }
-            Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
-        })
-        .collect();
+    let walk_child = |(name, hidden): (Box<str>, bool)| -> Option<FileNode> {
+        let path = dir.join(&*name);
+        if skip.contains(&path) {
+            return None;
+        }
+        let child_fd = CString::new(name.as_bytes())
+            .ok()
+            .map(|c| unsafe { libc::openat(dirfd, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) })
+            .unwrap_or(-1);
+        if child_fd < 0 {
+            return Some(FileNode::Dir(Box::new(DirNode {
+                name,
+                size: 0,
+                children: Vec::new(),
+                expanded: false,
+                hidden,
+            })));
+        }
+        Some(walk_dir_bulk(child_fd, &path, name, hidden, progress, skip))
+    };
 
+    // Skip rayon only when there's nothing to parallelize (0 or 1 subdir);
+    // fan-out is a poor proxy for work, so a higher threshold risks
+    // serializing a handful of huge subtrees.
+    const PAR_THRESHOLD: usize = 1;
+    let dir_children: Vec<FileNode> = if sub_dirs.len() <= PAR_THRESHOLD {
+        sub_dirs.into_iter().filter_map(walk_child).collect()
+    } else {
+        sub_dirs.into_par_iter().filter_map(walk_child).collect()
+    };
+
+    // batch_total_size already covers files; only subdir sizes remain.
+    let size = batch_total_size + dir_children.iter().map(|c| c.size()).sum::<u64>();
     file_children.extend(dir_children);
     file_children.shrink_to_fit();
-    let size = file_children.iter().map(|c| c.size()).sum();
 
     FileNode::Dir(Box::new(DirNode {
         name: dir_name,

@@ -467,6 +467,60 @@ pub fn render_tree(
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
+    // Max width the metric columns are pulled in to (keeps Size beside names on
+    // wide windows instead of pinned to the far edge).
+    const MAX_CONTENT_WIDTH: f32 = 900.0;
+
+    // --- Sticky column header, aligned to the same columns as the rows ---
+    {
+        let hfull = ui.max_rect();
+        let content_right = hfull.right().min(hfull.left() + MAX_CONTENT_WIDTH);
+        let bar_width = 80.0_f32;
+        let text_margin = 8.0_f32;
+        let bar_gap = 4.0_f32;
+        let font_id = egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
+        let col = ui.visuals().weak_text_color();
+        let sample = ui
+            .painter()
+            .layout_no_wrap("0000000000".to_string(), font_id.clone(), col);
+        let text_width = sample.size().x;
+
+        let (hrect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let cy = hrect.center().y;
+        painter.text(
+            egui::pos2(hrect.left() + 4.0, cy),
+            egui::Align2::LEFT_CENTER,
+            "Name",
+            font_id.clone(),
+            col,
+        );
+        painter.text(
+            egui::pos2(content_right - text_margin, cy),
+            egui::Align2::RIGHT_CENTER,
+            "Size",
+            font_id.clone(),
+            col,
+        );
+        let text_x = content_right - text_margin - text_width;
+        let bar_center = text_x - bar_gap - bar_width / 2.0;
+        painter.text(
+            egui::pos2(bar_center, cy),
+            egui::Align2::CENTER_CENTER,
+            "Share",
+            font_id,
+            col,
+        );
+        painter.hline(
+            hrect.left()..=content_right,
+            hrect.bottom(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
     let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
     #[cfg(windows)]
     {
@@ -492,7 +546,6 @@ pub fn render_tree(
         let full_width = ui.max_rect();
         // Clamp where the size column sits so it stays beside the names on
         // wide windows instead of pinned to the far-right edge.
-        const MAX_CONTENT_WIDTH: f32 = 900.0;
         let content_right = full_width
             .right()
             .min(full_width.left() + MAX_CONTENT_WIDTH);
@@ -751,30 +804,32 @@ pub fn render_tree(
                 });
             }
 
-            // Focus/selection/hover background
+            // Row background: selection/focus/hover take priority; otherwise a
+            // subtle zebra tint on alternate rows to guide the eye across the
+            // gap between name and size (hover/selection override it).
             let is_selected = selected_paths.contains(&row.path);
-            if is_selected || is_focused || is_hovered {
-                let bg_color = if is_selected && is_focused {
-                    // Selected + focused: strongest highlight
-                    ui.visuals().selection.bg_fill.linear_multiply(0.5)
-                } else if is_selected {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.35)
-                } else if is_focused {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.2)
-                } else {
-                    // Hover only
-                    ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3)
-                };
+            let bg_color = if is_selected && is_focused {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.5))
+            } else if is_selected {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.35))
+            } else if is_focused {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.2))
+            } else if is_hovered {
+                Some(ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3))
+            } else if i % 2 == 1 {
+                Some(ui.visuals().faint_bg_color)
+            } else {
+                None
+            };
+            if let Some(bg_color) = bg_color {
                 let spacing_half = ui.spacing().item_spacing.y / 2.0;
                 let y = row_rect.y_range();
-                let highlight_rect = egui::Rect::from_x_y_ranges(
+                let bg_rect = egui::Rect::from_x_y_ranges(
                     full_width.left()..=content_right,
                     (y.min - spacing_half)..=(y.max + spacing_half),
                 );
-                ui.painter().set(
-                    bg_idx,
-                    egui::Shape::rect_filled(highlight_rect, 0.0, bg_color),
-                );
+                ui.painter()
+                    .set(bg_idx, egui::Shape::rect_filled(bg_rect, 0.0, bg_color));
             }
         }
     });

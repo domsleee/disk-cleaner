@@ -785,24 +785,19 @@ pub fn render_tree(
             // Capture hover state before on_hover_ui consumes row_interact
             let is_hovered = row_interact.hovered();
 
-            // Tooltip (lazy via closure — avoids format! allocation unless hovered)
+            // Tooltip reveals the full path (rows show only the leaf name) plus
+            // item count for dirs. Size is intentionally omitted — it's already
+            // in the Size column, so repeating it here is redundant.
             if row.is_dir {
                 let children_count = row.children_count;
-                let size = row.size;
                 let path = &row.path;
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(format!(
-                        "{}\n{} \u{2014} {} items",
-                        path.display(),
-                        ByteSize::b(size),
-                        children_count
-                    ));
+                    ui.label(format!("{}\n{} items", path.display(), children_count));
                 });
             } else {
-                let size = row.size;
                 let path = &row.path;
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(format!("{}\n{}", path.display(), ByteSize::b(size)));
+                    ui.label(path.display().to_string());
                 });
             }
 

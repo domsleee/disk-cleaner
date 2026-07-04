@@ -467,9 +467,11 @@ pub fn render_tree(
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
-    // Max width the metric columns are pulled in to (keeps Size beside names on
-    // wide windows instead of pinned to the far edge).
-    const MAX_CONTENT_WIDTH: f32 = 900.0;
+    // The table fills the window width (Size pinned to the right edge, Name
+    // flexes) — the file-manager convention, and it scales cleanly as the
+    // window widens. Set to a finite value to cap the width on ultra-wide
+    // displays; `INFINITY` means no cap.
+    const MAX_CONTENT_WIDTH: f32 = f32::INFINITY;
 
     // --- Sticky column header, aligned to the same columns as the rows ---
     {

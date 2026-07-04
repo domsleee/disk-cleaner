@@ -788,7 +788,20 @@ pub fn render_tree(
             // Tooltip reveals the full path (rows show only the leaf name) plus
             // item count for dirs. Size is intentionally omitted — it's already
             // in the Size column, so repeating it here is redundant.
-            if row.is_dir {
+            if row.is_file_group {
+                // Synthetic group row: its path ends in an internal marker, so
+                // show the containing directory instead. The name ("[N files]")
+                // already carries the count.
+                let dir = row
+                    .path
+                    .parent()
+                    .unwrap_or(row.path.as_path())
+                    .display()
+                    .to_string();
+                row_interact.on_hover_ui(|ui| {
+                    ui.label(dir.as_str());
+                });
+            } else if row.is_dir {
                 let children_count = row.children_count;
                 let path = &row.path;
                 row_interact.on_hover_ui(|ui| {

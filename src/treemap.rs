@@ -214,7 +214,11 @@ fn find_node_inner<'a>(
     }
     for child in node.children() {
         buf.push(child.name());
-        if let Some(found) = find_node_inner(child, target, buf) {
+        // Only the subtree whose path prefixes `target` can contain it — prune
+        // the rest so this is O(depth × siblings) instead of a full-tree walk.
+        if target.starts_with(&*buf)
+            && let Some(found) = find_node_inner(child, target, buf)
+        {
             buf.pop();
             return Some(found);
         }
@@ -246,19 +250,23 @@ fn breadcrumbs_walk(
 ) -> bool {
     for child in node.children() {
         buf.push(child.name());
-        let child_path = buf.clone();
-        if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
-            buf.pop();
-            return true;
-        }
-        if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
+        // Prune to the single matching path — and only clone the path buffer
+        // for children actually on that path, not every node in the tree.
+        if target.starts_with(&*buf) {
+            let child_path = buf.clone();
+            if child_path.as_path() == target {
+                trail.push((child.name().to_string(), child_path));
                 buf.pop();
                 return true;
             }
-            trail.pop();
+            if child.is_dir() {
+                trail.push((child.name().to_string(), child_path));
+                if breadcrumbs_walk(child, target, buf, trail) {
+                    buf.pop();
+                    return true;
+                }
+                trail.pop();
+            }
         }
         buf.pop();
     }

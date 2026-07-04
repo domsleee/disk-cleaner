@@ -302,7 +302,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size([980.0, 700.0])
+            .with_min_inner_size([720.0, 480.0])
             .with_icon(app_icon::generate())
             .with_visible(false), // hidden until first frame renders (avoids white flash)
         ..Default::default()
@@ -1263,7 +1264,7 @@ impl eframe::App for App {
                         }
 
                         if self.tree.is_some()
-                            && ui.button("Re-scan").clicked()
+                            && ui.button("Rescan").clicked()
                             && let Some(path) = self.scan_path.clone()
                         {
                             self.start_scan(path);

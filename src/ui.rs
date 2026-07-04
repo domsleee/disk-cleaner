@@ -467,6 +467,62 @@ pub fn render_tree(
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
+    // The table fills the window width (Size pinned to the right edge, Name
+    // flexes) — the file-manager convention, and it scales cleanly as the
+    // window widens. Set to a finite value to cap the width on ultra-wide
+    // displays; `INFINITY` means no cap.
+    const MAX_CONTENT_WIDTH: f32 = f32::INFINITY;
+
+    // --- Sticky column header, aligned to the same columns as the rows ---
+    {
+        let hfull = ui.max_rect();
+        let content_right = hfull.right().min(hfull.left() + MAX_CONTENT_WIDTH);
+        let bar_width = 80.0_f32;
+        let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
+        let bar_gap = 4.0_f32;
+        let font_id = egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
+        let col = ui.visuals().weak_text_color();
+        let sample = ui
+            .painter()
+            .layout_no_wrap("0000000000".to_string(), font_id.clone(), col);
+        let text_width = sample.size().x;
+
+        let (hrect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let cy = hrect.center().y;
+        painter.text(
+            egui::pos2(hrect.left() + 4.0, cy),
+            egui::Align2::LEFT_CENTER,
+            "Name",
+            font_id.clone(),
+            col,
+        );
+        painter.text(
+            egui::pos2(content_right - text_margin, cy),
+            egui::Align2::RIGHT_CENTER,
+            "Size",
+            font_id.clone(),
+            col,
+        );
+        let text_x = content_right - text_margin - text_width;
+        let bar_center = text_x - bar_gap - bar_width / 2.0;
+        painter.text(
+            egui::pos2(bar_center, cy),
+            egui::Align2::CENTER_CENTER,
+            "Share",
+            font_id,
+            col,
+        );
+        painter.hline(
+            hrect.left()..=content_right,
+            hrect.bottom(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
     let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false, false]);
     #[cfg(windows)]
     {
@@ -490,6 +546,12 @@ pub fn render_tree(
         // Prevent shift+click from selecting label text (OS text highlight).
         ui.style_mut().interaction.selectable_labels = false;
         let full_width = ui.max_rect();
+        // Clamp where the size column sits so it stays beside the names on
+        // wide windows instead of pinned to the far-right edge.
+        let content_right = full_width
+            .right()
+            .min(full_width.left() + MAX_CONTENT_WIDTH);
+        let right_inset = full_width.right() - content_right;
         for i in range {
             let row = &rows[i];
             let indent = row.depth as f32 * 20.0;
@@ -510,6 +572,9 @@ pub fn render_tree(
 
             let row_response = ui.horizontal(|ui| {
                 ui.set_min_height(row_height);
+                // Cap indentation so the disclosure/icon can't slide under the
+                // size bar on narrow windows with deeply nested trees.
+                let indent = indent.min((ui.available_width() - 260.0).max(0.0));
                 ui.add_space(indent);
 
                 // Disclosure toggle (visual only — click handled by row interaction)
@@ -543,7 +608,7 @@ pub fn render_tree(
                 // for name truncation).
                 let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
-                let text_margin = 8.0_f32;
+                let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
                 let bar_gap = 4.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
@@ -556,7 +621,10 @@ pub fn render_tree(
                 let right_reserved = text_margin + text_width + bar_gap + bar_width;
 
                 // Name — truncate so it never overlaps the size bar area.
-                let name_max_w = (ui.available_width() - right_reserved - 4.0).max(20.0);
+                // Floor at 0 (not a fixed 20px) so a deeply-indented name clips
+                // to nothing rather than spilling over the pulled-in size bar.
+                let name_max_w =
+                    (ui.available_width() - right_inset - right_reserved - 4.0).max(0.0);
                 let name_text = if row.is_hidden || row.is_file_group {
                     egui::RichText::new(&*row.name).monospace().weak()
                 } else {
@@ -577,7 +645,7 @@ pub fn render_tree(
                 // center().y drifts with scroll position).
                 let row_center_y = ui.min_rect().center().y;
                 let painter = ui.painter();
-                let text_x = full_width.right() - text_margin - text_width;
+                let text_x = content_right - text_margin - text_width;
                 let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
@@ -600,8 +668,10 @@ pub fn render_tree(
             });
 
             let toggle_right = row_response.inner;
+            // Match the interaction area to the visible content width so clicks
+            // and hover in the blank right-hand gutter don't target the row.
             let row_rect = egui::Rect::from_x_y_ranges(
-                full_width.x_range(),
+                full_width.left()..=content_right,
                 row_response.response.rect.y_range(),
             );
 
@@ -718,51 +788,57 @@ pub fn render_tree(
             // Capture hover state before on_hover_ui consumes row_interact
             let is_hovered = row_interact.hovered();
 
-            // Tooltip (lazy via closure — avoids format! allocation unless hovered)
-            if row.is_dir {
-                let children_count = row.children_count;
-                let size = row.size;
+            // Tooltip reveals the full path (rows show only the leaf name) plus
+            // item count for dirs. Size is intentionally omitted — it's already
+            // in the Size column, so repeating it here is redundant.
+            if row.is_file_group {
+                // Synthetic group row: its path ends in an internal marker, so
+                // show the containing directory instead. The name ("[N files]")
+                // already carries the count. Format lazily inside the closure.
                 let path = &row.path;
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(format!(
-                        "{}\n{} \u{2014} {} items",
-                        path.display(),
-                        ByteSize::b(size),
-                        children_count
-                    ));
+                    let dir = path.parent().unwrap_or(path.as_path()).display();
+                    ui.label(dir.to_string());
+                });
+            } else if row.is_dir {
+                let children_count = row.children_count;
+                let path = &row.path;
+                row_interact.on_hover_ui(|ui| {
+                    ui.label(format!("{}\n{} items", path.display(), children_count));
                 });
             } else {
-                let size = row.size;
                 let path = &row.path;
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(format!("{}\n{}", path.display(), ByteSize::b(size)));
+                    ui.label(path.display().to_string());
                 });
             }
 
-            // Focus/selection/hover background
+            // Row background: selection/focus/hover take priority; otherwise a
+            // subtle zebra tint on alternate rows to guide the eye across the
+            // gap between name and size (hover/selection override it).
             let is_selected = selected_paths.contains(&row.path);
-            if is_selected || is_focused || is_hovered {
-                let bg_color = if is_selected && is_focused {
-                    // Selected + focused: strongest highlight
-                    ui.visuals().selection.bg_fill.linear_multiply(0.5)
-                } else if is_selected {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.35)
-                } else if is_focused {
-                    ui.visuals().selection.bg_fill.linear_multiply(0.2)
-                } else {
-                    // Hover only
-                    ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3)
-                };
+            let bg_color = if is_selected && is_focused {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.5))
+            } else if is_selected {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.35))
+            } else if is_focused {
+                Some(ui.visuals().selection.bg_fill.linear_multiply(0.2))
+            } else if is_hovered {
+                Some(ui.visuals().widgets.hovered.bg_fill.linear_multiply(0.3))
+            } else if i % 2 == 1 {
+                Some(ui.visuals().faint_bg_color)
+            } else {
+                None
+            };
+            if let Some(bg_color) = bg_color {
                 let spacing_half = ui.spacing().item_spacing.y / 2.0;
                 let y = row_rect.y_range();
-                let highlight_rect = egui::Rect::from_x_y_ranges(
-                    full_width.x_range(),
+                let bg_rect = egui::Rect::from_x_y_ranges(
+                    full_width.left()..=content_right,
                     (y.min - spacing_half)..=(y.max + spacing_half),
                 );
-                ui.painter().set(
-                    bg_idx,
-                    egui::Shape::rect_filled(highlight_rect, 0.0, bg_color),
-                );
+                ui.painter()
+                    .set(bg_idx, egui::Shape::rect_filled(bg_rect, 0.0, bg_color));
             }
         }
     });

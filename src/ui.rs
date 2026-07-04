@@ -572,6 +572,9 @@ pub fn render_tree(
 
             let row_response = ui.horizontal(|ui| {
                 ui.set_min_height(row_height);
+                // Cap indentation so the disclosure/icon can't slide under the
+                // size bar on narrow windows with deeply nested trees.
+                let indent = indent.min((ui.available_width() - 260.0).max(0.0));
                 ui.add_space(indent);
 
                 // Disclosure toggle (visual only — click handled by row interaction)
@@ -791,15 +794,11 @@ pub fn render_tree(
             if row.is_file_group {
                 // Synthetic group row: its path ends in an internal marker, so
                 // show the containing directory instead. The name ("[N files]")
-                // already carries the count.
-                let dir = row
-                    .path
-                    .parent()
-                    .unwrap_or(row.path.as_path())
-                    .display()
-                    .to_string();
+                // already carries the count. Format lazily inside the closure.
+                let path = &row.path;
                 row_interact.on_hover_ui(|ui| {
-                    ui.label(dir.as_str());
+                    let dir = path.parent().unwrap_or(path.as_path()).display();
+                    ui.label(dir.to_string());
                 });
             } else if row.is_dir {
                 let children_count = row.children_count;

@@ -478,7 +478,7 @@ pub fn render_tree(
         let hfull = ui.max_rect();
         let content_right = hfull.right().min(hfull.left() + MAX_CONTENT_WIDTH);
         let bar_width = 80.0_f32;
-        let text_margin = 8.0_f32;
+        let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
         let bar_gap = 4.0_f32;
         let font_id = egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
         let col = ui.visuals().weak_text_color();
@@ -605,7 +605,7 @@ pub fn render_tree(
                 // for name truncation).
                 let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
-                let text_margin = 8.0_f32;
+                let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
                 let bar_gap = 4.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);

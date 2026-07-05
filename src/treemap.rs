@@ -876,6 +876,13 @@ fn paint_cached_leaf(
 ) {
     let color = apply_alpha(tile.color, alpha);
     painter.rect_filled(tile.rect, 2.0, color);
+    // Subtle border so adjacent same-colored tiles stay visually distinct.
+    painter.rect_stroke(
+        tile.rect,
+        2.0,
+        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(30), alpha)),
+        egui::StrokeKind::Inside,
+    );
 
     if is_focused {
         painter.rect_stroke(
@@ -959,6 +966,13 @@ fn paint_cached_directory(
 
     // Background
     painter.rect_filled(rect, 2.0, bg);
+    // Subtle border so adjacent same-colored directories stay distinct.
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(30), alpha)),
+        egui::StrokeKind::Inside,
+    );
 
     if is_focused {
         painter.rect_stroke(
@@ -996,6 +1010,12 @@ fn paint_cached_directory(
         let cr = nested.rect;
         let color = apply_alpha(nested.color, alpha);
         tile_painter.rect_filled(cr, 1.0, color);
+        tile_painter.rect_stroke(
+            cr,
+            1.0,
+            egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(24), alpha)),
+            egui::StrokeKind::Inside,
+        );
 
         if has_focus {
             let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);

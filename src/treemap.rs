@@ -880,7 +880,12 @@ fn paint_cached_leaf(
     painter.rect_stroke(
         tile.rect,
         2.0,
-        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(30), alpha)),
+        // Fade the border with alpha² so it doesn't pop as a bright grid
+        // ahead of the fills during the zoom transition.
+        egui::Stroke::new(
+            1.0,
+            apply_alpha(egui::Color32::from_white_alpha(30), alpha * alpha),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -970,7 +975,12 @@ fn paint_cached_directory(
     painter.rect_stroke(
         rect,
         2.0,
-        egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(30), alpha)),
+        // Fade the border with alpha² so it doesn't pop as a bright grid
+        // ahead of the fills during the zoom transition.
+        egui::Stroke::new(
+            1.0,
+            apply_alpha(egui::Color32::from_white_alpha(30), alpha * alpha),
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -1013,7 +1023,10 @@ fn paint_cached_directory(
         tile_painter.rect_stroke(
             cr,
             1.0,
-            egui::Stroke::new(1.0, apply_alpha(egui::Color32::from_white_alpha(24), alpha)),
+            egui::Stroke::new(
+                1.0,
+                apply_alpha(egui::Color32::from_white_alpha(24), alpha * alpha),
+            ),
             egui::StrokeKind::Inside,
         );
 

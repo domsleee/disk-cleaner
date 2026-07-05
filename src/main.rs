@@ -1883,10 +1883,13 @@ impl eframe::App for App {
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| full.clone());
                                 ui.add_space(8.0);
+                                // Truncate short enough that "Rescan <name>" fits
+                                // within the shared 200px width (min_size only sets
+                                // a floor — a long name would grow past the primary).
                                 let rescan_btn = egui::Button::new(
                                     egui::RichText::new(format!(
                                         "Rescan {}",
-                                        middle_truncate(&name, 24)
+                                        middle_truncate(&name, 16)
                                     ))
                                     .size(14.0),
                                 )

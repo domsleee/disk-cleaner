@@ -778,9 +778,25 @@ pub fn render_treemap(
         }
     }
 
-    // Hover tooltip
+    // Hover tooltip. Structured: bold name, one metrics line (size · share of
+    // the current view · item count), then a dim path — rather than four
+    // equal-weight lines.
     if let Some(idx) = hovered_tile {
         let tile = &cache.tiles[idx];
+        let pct = if cache.view_size > 0 {
+            tile.size as f64 / cache.view_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        let pct_str = if pct > 0.0 && pct < 1.0 {
+            "<1%".to_string()
+        } else {
+            format!("{pct:.0}%")
+        };
+        let mut meta = format!("{} · {} of view", ByteSize::b(tile.size), pct_str);
+        if let Some(count) = tile.child_count {
+            meta.push_str(&format!(" · {count} items"));
+        }
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -789,12 +805,14 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(tile.name.as_ref()).strong());
-            ui.label(ByteSize::b(tile.size).to_string());
-            if let Some(count) = tile.child_count {
-                ui.label(format!("{} items", count));
-            }
-            ui.label(tile.path.display().to_string());
+            ui.label(meta.as_str());
+            ui.label(
+                egui::RichText::new(tile.path.display().to_string())
+                    .weak()
+                    .small(),
+            );
         });
     } else if hovered_other && let Some(ref other) = cache.other {
         egui::Tooltip::always_open(
@@ -805,9 +823,24 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
+            let pct = if cache.view_size > 0 {
+                other.size as f64 / cache.view_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            let pct_str = if pct > 0.0 && pct < 1.0 {
+                "<1%".to_string()
+            } else {
+                format!("{pct:.0}%")
+            };
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
-            ui.label(ByteSize::b(other.size).to_string());
-            ui.label("Small files collapsed into one block");
+            ui.label(format!("{} · {} of view", ByteSize::b(other.size), pct_str));
+            ui.label(
+                egui::RichText::new("Small files collapsed into one block")
+                    .weak()
+                    .small(),
+            );
         });
     }
 

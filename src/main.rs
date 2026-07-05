@@ -1852,6 +1852,11 @@ impl eframe::App for App {
                             ui.add_space(12.0);
                         }
 
+                        // Primary and secondary actions share a footprint so they
+                        // stack as an even column — hierarchy comes from the fill,
+                        // not from shrinking the secondary.
+                        let btn_size = egui::vec2(200.0, 34.0);
+
                         // Primary action — pick any folder to scan.
                         let scan_btn = egui::Button::new(
                             egui::RichText::new("Scan a Folder...")
@@ -1859,16 +1864,16 @@ impl eframe::App for App {
                                 .color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(37, 99, 235))
-                        .min_size(egui::vec2(0.0, 34.0));
+                        .min_size(btn_size);
                         if ui.add(scan_btn).clicked()
                             && let Some(path) = rfd::FileDialog::new().pick_folder()
                         {
                             self.start_scan(path);
                         }
 
-                        // Rescan the last location — secondary, and only when that
-                        // path isn't already a volume card above (a whole-volume
-                        // rescan would just duplicate the card).
+                        // Rescan the last location — same size as the primary but a
+                        // muted secondary style; only when that path isn't already a
+                        // volume card above (that would just duplicate the card).
                         if let Some(ref last) = self.last_scan_path.clone() {
                             let is_listed_volume = self.volumes.iter().any(|v| v.path == *last);
                             if !is_listed_volume {
@@ -1878,8 +1883,16 @@ impl eframe::App for App {
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| full.clone());
                                 ui.add_space(8.0);
+                                let rescan_btn = egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "Rescan {}",
+                                        middle_truncate(&name, 24)
+                                    ))
+                                    .size(14.0),
+                                )
+                                .min_size(btn_size);
                                 if ui
-                                    .button(format!("Rescan {}", middle_truncate(&name, 40)))
+                                    .add(rescan_btn)
                                     .on_hover_text(format!("{full}\nStarts a fresh scan"))
                                     .clicked()
                                 {

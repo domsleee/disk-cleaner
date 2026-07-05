@@ -64,6 +64,14 @@ fn darken(c: egui::Color32, amount: u8) -> egui::Color32 {
     )
 }
 
+/// A faded white tile border. `from_white_alpha` is already premultiplied, so
+/// it must not be passed through `apply_alpha` (that would premultiply again
+/// and darken it, then snap back at alpha=1). Fades with alpha² so the border
+/// trails the fill during the zoom transition instead of popping ahead of it.
+fn border_color(base: u8, alpha: f32) -> egui::Color32 {
+    egui::Color32::from_white_alpha((base as f32 * alpha * alpha) as u8)
+}
+
 fn text_color_for_bg(bg: egui::Color32) -> egui::Color32 {
     let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
     if lum > 140.0 {
@@ -882,10 +890,7 @@ fn paint_cached_leaf(
         2.0,
         // Fade the border with alpha² so it doesn't pop as a bright grid
         // ahead of the fills during the zoom transition.
-        egui::Stroke::new(
-            1.0,
-            apply_alpha(egui::Color32::from_white_alpha(30), alpha * alpha),
-        ),
+        egui::Stroke::new(1.0, border_color(30, alpha)),
         egui::StrokeKind::Inside,
     );
 
@@ -971,27 +976,6 @@ fn paint_cached_directory(
 
     // Background
     painter.rect_filled(rect, 2.0, bg);
-    // Subtle border so adjacent same-colored directories stay distinct.
-    painter.rect_stroke(
-        rect,
-        2.0,
-        // Fade the border with alpha² so it doesn't pop as a bright grid
-        // ahead of the fills during the zoom transition.
-        egui::Stroke::new(
-            1.0,
-            apply_alpha(egui::Color32::from_white_alpha(30), alpha * alpha),
-        ),
-        egui::StrokeKind::Inside,
-    );
-
-    if is_focused {
-        painter.rect_stroke(
-            rect,
-            2.0,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
-            egui::StrokeKind::Inside,
-        );
-    }
 
     // Header
     let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), DIR_HEADER_H));
@@ -1011,48 +995,61 @@ fn paint_cached_directory(
     }
 
     // Nested children (pre-computed in cache) — single clip group for entire tile
-    if tile.nested.is_empty() {
-        return;
-    }
-    let tile_painter = painter.with_clip_rect(rect);
-    let has_focus = focused_path.is_some();
-    for nested in &tile.nested {
-        let cr = nested.rect;
-        let color = apply_alpha(nested.color, alpha);
-        tile_painter.rect_filled(cr, 1.0, color);
-        tile_painter.rect_stroke(
-            cr,
-            1.0,
-            egui::Stroke::new(
+    if !tile.nested.is_empty() {
+        let tile_painter = painter.with_clip_rect(rect);
+        let has_focus = focused_path.is_some();
+        for nested in &tile.nested {
+            let cr = nested.rect;
+            let color = apply_alpha(nested.color, alpha);
+            tile_painter.rect_filled(cr, 1.0, color);
+            tile_painter.rect_stroke(
+                cr,
                 1.0,
-                apply_alpha(egui::Color32::from_white_alpha(24), alpha * alpha),
-            ),
-            egui::StrokeKind::Inside,
-        );
+                egui::Stroke::new(1.0, border_color(24, alpha)),
+                egui::StrokeKind::Inside,
+            );
 
-        if has_focus {
-            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
-            if child_focused {
-                tile_painter.rect_stroke(
-                    cr,
-                    1.0,
-                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    egui::StrokeKind::Inside,
+            if has_focus {
+                let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
+                if child_focused {
+                    tile_painter.rect_stroke(
+                        cr,
+                        1.0,
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+
+            // Label only for tiles large enough to be readable.
+            if cr.width() > 60.0 && cr.height() > 16.0 {
+                let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
+                tile_painter.text(
+                    cr.center(),
+                    egui::Align2::CENTER_CENTER,
+                    nested.name.as_ref(),
+                    font_nested.clone(),
+                    tc,
                 );
             }
         }
+    }
 
-        // Label only for tiles large enough to be readable.
-        if cr.width() > 60.0 && cr.height() > 16.0 {
-            let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
-            tile_painter.text(
-                cr.center(),
-                egui::Align2::CENTER_CENTER,
-                nested.name.as_ref(),
-                font_nested.clone(),
-                tc,
-            );
-        }
+    // Outer border LAST so the header and nested tiles don't cover its edges;
+    // this keeps adjacent same-colored directories visually distinct.
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, border_color(30, alpha)),
+        egui::StrokeKind::Inside,
+    );
+    if is_focused {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
     }
 }
 

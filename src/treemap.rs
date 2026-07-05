@@ -64,6 +64,14 @@ fn darken(c: egui::Color32, amount: u8) -> egui::Color32 {
     )
 }
 
+/// A faded white tile border. `from_white_alpha` is already premultiplied, so
+/// it must not be passed through `apply_alpha` (that would premultiply again
+/// and darken it, then snap back at alpha=1). Fades with alpha² so the border
+/// trails the fill during the zoom transition instead of popping ahead of it.
+fn border_color(base: u8, alpha: f32) -> egui::Color32 {
+    egui::Color32::from_white_alpha((base as f32 * alpha * alpha) as u8)
+}
+
 fn text_color_for_bg(bg: egui::Color32) -> egui::Color32 {
     let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
     if lum > 140.0 {
@@ -214,7 +222,11 @@ fn find_node_inner<'a>(
     }
     for child in node.children() {
         buf.push(child.name());
-        if let Some(found) = find_node_inner(child, target, buf) {
+        // Only the subtree whose path prefixes `target` can contain it — prune
+        // the rest so this is O(depth × siblings) instead of a full-tree walk.
+        if target.starts_with(&*buf)
+            && let Some(found) = find_node_inner(child, target, buf)
+        {
             buf.pop();
             return Some(found);
         }
@@ -246,19 +258,23 @@ fn breadcrumbs_walk(
 ) -> bool {
     for child in node.children() {
         buf.push(child.name());
-        let child_path = buf.clone();
-        if child_path.as_path() == target {
-            trail.push((child.name().to_string(), child_path));
-            buf.pop();
-            return true;
-        }
-        if child.is_dir() {
-            trail.push((child.name().to_string(), child_path));
-            if breadcrumbs_walk(child, target, buf, trail) {
+        // Prune to the single matching path — and only clone the path buffer
+        // for children actually on that path, not every node in the tree.
+        if target.starts_with(&*buf) {
+            let child_path = buf.clone();
+            if child_path.as_path() == target {
+                trail.push((child.name().to_string(), child_path));
                 buf.pop();
                 return true;
             }
-            trail.pop();
+            if child.is_dir() {
+                trail.push((child.name().to_string(), child_path));
+                if breadcrumbs_walk(child, target, buf, trail) {
+                    buf.pop();
+                    return true;
+                }
+                trail.pop();
+            }
         }
         buf.pop();
     }
@@ -770,9 +786,25 @@ pub fn render_treemap(
         }
     }
 
-    // Hover tooltip
+    // Hover tooltip. Structured: bold name, one metrics line (size · share of
+    // the current view · item count), then a dim path — rather than four
+    // equal-weight lines.
     if let Some(idx) = hovered_tile {
         let tile = &cache.tiles[idx];
+        let pct = if cache.view_size > 0 {
+            tile.size as f64 / cache.view_size as f64 * 100.0
+        } else {
+            0.0
+        };
+        let pct_str = if pct > 0.0 && pct < 1.0 {
+            "<1%".to_string()
+        } else {
+            format!("{pct:.0}%")
+        };
+        let mut meta = format!("{} · {} of view", ByteSize::b(tile.size), pct_str);
+        if let Some(count) = tile.child_count {
+            meta.push_str(&format!(" · {count} items"));
+        }
         egui::Tooltip::always_open(
             ui.ctx().clone(),
             ui.layer_id(),
@@ -781,12 +813,14 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(tile.name.as_ref()).strong());
-            ui.label(ByteSize::b(tile.size).to_string());
-            if let Some(count) = tile.child_count {
-                ui.label(format!("{} items", count));
-            }
-            ui.label(tile.path.display().to_string());
+            ui.label(meta.as_str());
+            ui.label(
+                egui::RichText::new(tile.path.display().to_string())
+                    .weak()
+                    .small(),
+            );
         });
     } else if hovered_other && let Some(ref other) = cache.other {
         egui::Tooltip::always_open(
@@ -797,9 +831,24 @@ pub fn render_treemap(
         )
         .gap(12.0)
         .show(|ui| {
+            let pct = if cache.view_size > 0 {
+                other.size as f64 / cache.view_size as f64 * 100.0
+            } else {
+                0.0
+            };
+            let pct_str = if pct > 0.0 && pct < 1.0 {
+                "<1%".to_string()
+            } else {
+                format!("{pct:.0}%")
+            };
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
-            ui.label(ByteSize::b(other.size).to_string());
-            ui.label("Small files collapsed into one block");
+            ui.label(format!("{} · {} of view", ByteSize::b(other.size), pct_str));
+            ui.label(
+                egui::RichText::new("Small files collapsed into one block")
+                    .weak()
+                    .small(),
+            );
         });
     }
 
@@ -835,6 +884,15 @@ fn paint_cached_leaf(
 ) {
     let color = apply_alpha(tile.color, alpha);
     painter.rect_filled(tile.rect, 2.0, color);
+    // Subtle border so adjacent same-colored tiles stay visually distinct.
+    painter.rect_stroke(
+        tile.rect,
+        2.0,
+        // Fade the border with alpha² so it doesn't pop as a bright grid
+        // ahead of the fills during the zoom transition.
+        egui::Stroke::new(1.0, border_color(30, alpha)),
+        egui::StrokeKind::Inside,
+    );
 
     if is_focused {
         painter.rect_stroke(
@@ -919,15 +977,6 @@ fn paint_cached_directory(
     // Background
     painter.rect_filled(rect, 2.0, bg);
 
-    if is_focused {
-        painter.rect_stroke(
-            rect,
-            2.0,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
-            egui::StrokeKind::Inside,
-        );
-    }
-
     // Header
     let header_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), DIR_HEADER_H));
     painter.rect_filled(header_rect, 2.0, header_bg);
@@ -946,39 +995,61 @@ fn paint_cached_directory(
     }
 
     // Nested children (pre-computed in cache) — single clip group for entire tile
-    if tile.nested.is_empty() {
-        return;
-    }
-    let tile_painter = painter.with_clip_rect(rect);
-    let has_focus = focused_path.is_some();
-    for nested in &tile.nested {
-        let cr = nested.rect;
-        let color = apply_alpha(nested.color, alpha);
-        tile_painter.rect_filled(cr, 1.0, color);
+    if !tile.nested.is_empty() {
+        let tile_painter = painter.with_clip_rect(rect);
+        let has_focus = focused_path.is_some();
+        for nested in &tile.nested {
+            let cr = nested.rect;
+            let color = apply_alpha(nested.color, alpha);
+            tile_painter.rect_filled(cr, 1.0, color);
+            tile_painter.rect_stroke(
+                cr,
+                1.0,
+                egui::Stroke::new(1.0, border_color(24, alpha)),
+                egui::StrokeKind::Inside,
+            );
 
-        if has_focus {
-            let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
-            if child_focused {
-                tile_painter.rect_stroke(
-                    cr,
-                    1.0,
-                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    egui::StrokeKind::Inside,
+            if has_focus {
+                let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
+                if child_focused {
+                    tile_painter.rect_stroke(
+                        cr,
+                        1.0,
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+
+            // Label only for tiles large enough to be readable.
+            if cr.width() > 60.0 && cr.height() > 16.0 {
+                let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
+                tile_painter.text(
+                    cr.center(),
+                    egui::Align2::CENTER_CENTER,
+                    nested.name.as_ref(),
+                    font_nested.clone(),
+                    tc,
                 );
             }
         }
+    }
 
-        // Label only for tiles large enough to be readable.
-        if cr.width() > 60.0 && cr.height() > 16.0 {
-            let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
-            tile_painter.text(
-                cr.center(),
-                egui::Align2::CENTER_CENTER,
-                nested.name.as_ref(),
-                font_nested.clone(),
-                tc,
-            );
-        }
+    // Outer border LAST so the header and nested tiles don't cover its edges;
+    // this keeps adjacent same-colored directories visually distinct.
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, border_color(30, alpha)),
+        egui::StrokeKind::Inside,
+    );
+    if is_focused {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
     }
 }
 

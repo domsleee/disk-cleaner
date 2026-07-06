@@ -97,6 +97,7 @@ fn new_progress() -> Arc<ScanProgress> {
         bulk_scan_fallback_count: AtomicU64::new(0),
         fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
+        seen_inodes: Default::default(),
     })
 }
 

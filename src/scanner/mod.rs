@@ -190,6 +190,39 @@ fn scan_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Sharded set of file ids seen during a scan, used to count hardlinked
+/// files (same inode, multiple directory entries) only once. Sharded across
+/// several mutexes so the parallel walker's threads rarely contend — and only
+/// files with link count > 1 ever touch it.
+pub struct InodeSet {
+    shards: Box<[Mutex<HashSet<u64>>]>,
+}
+
+impl InodeSet {
+    const SHARDS: usize = 64;
+
+    pub fn new() -> Self {
+        let shards = (0..Self::SHARDS)
+            .map(|_| Mutex::new(HashSet::new()))
+            .collect();
+        Self { shards }
+    }
+
+    /// Record `id`; returns `true` the first time it is seen (so the caller
+    /// counts its size) and `false` for every later hardlink to the same inode.
+    #[cfg(target_os = "macos")]
+    pub fn insert_new(&self, id: u64) -> bool {
+        let shard = &self.shards[(id as usize) & (Self::SHARDS - 1)];
+        shard.lock().unwrap().insert(id)
+    }
+}
+
+impl Default for InodeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ScanProgress {
     pub file_count: AtomicU64,
     pub total_size: AtomicU64,
@@ -198,6 +231,8 @@ pub struct ScanProgress {
     pub bulk_scan_fallback_count: AtomicU64,
     pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
+    /// Hardlinked inodes already counted (dedup). See [`InodeSet`].
+    pub seen_inodes: InodeSet,
 }
 
 #[cfg(target_os = "windows")]
@@ -641,6 +676,7 @@ mod tests {
             bulk_scan_fallback_count: AtomicU64::new(0),
             fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
+            seen_inodes: Default::default(),
         })
     }
 
@@ -679,6 +715,30 @@ mod tests {
         {
             assert_eq!(root.size(), 7);
         }
+    }
+
+    // Hardlink dedup is implemented in the macOS bulk walker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_dedups_hardlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("orig.bin"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tmp.path().join("orig.bin"), tmp.path().join("link1.bin")).unwrap();
+        fs::hard_link(tmp.path().join("orig.bin"), tmp.path().join("link2.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        // Three directory entries, but the shared inode's size counts once.
+        assert_eq!(root.children().len(), 3);
+        assert_eq!(progress.file_count.load(Ordering::Relaxed), 3);
+        let one_alloc = fs::metadata(tmp.path().join("orig.bin")).unwrap().blocks() * 512;
+        assert_eq!(
+            root.size(),
+            one_alloc,
+            "hardlinked inode should count once, not 3x"
+        );
+        assert_eq!(progress.total_size.load(Ordering::Relaxed), one_alloc);
     }
 
     #[test]

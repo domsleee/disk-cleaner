@@ -456,6 +456,7 @@ impl Default for App {
                 bulk_scan_fallback_count: 0.into(),
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
+                seen_inodes: Default::default(),
             }),
             receiver: None,
             error: None,
@@ -581,6 +582,7 @@ impl App {
             bulk_scan_fallback_count: 0.into(),
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
+            seen_inodes: Default::default(),
         });
         self.scan_progress = progress.clone();
 

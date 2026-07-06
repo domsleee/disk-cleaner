@@ -290,8 +290,9 @@ pub fn walk_dir_bulk(
                             };
                             batch_file_count += 1;
                             batch_total_size += counted;
-                            file_children
-                                .push(FileNode::File(FileLeaf::new(name, counted, hidden)));
+                            let mut leaf = FileLeaf::new(name, counted, hidden);
+                            leaf.set_hard_link(linkcount > 1);
+                            file_children.push(FileNode::File(leaf));
                         }
                         _ => {} // skip symlinks, sockets, etc.
                     }

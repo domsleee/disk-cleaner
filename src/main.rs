@@ -821,6 +821,19 @@ fn save_screenshot_png(
     Ok(())
 }
 
+/// Screenshot helper: collect every directory path in the tree so their file
+/// groups can be force-expanded for capture.
+fn collect_group_dirs(node: &FileNode, buf: &mut PathBuf, out: &mut HashSet<PathBuf>) {
+    if node.is_dir() {
+        out.insert(buf.clone());
+        for c in node.children() {
+            buf.push(c.name());
+            collect_group_dirs(c, buf, out);
+            buf.pop();
+        }
+    }
+}
+
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Match the panel fill so sub-pixel gaps between panels don't
@@ -973,6 +986,12 @@ impl eframe::App for App {
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
                     if !self.scanning {
+                        // Expand all file groups so individual files (e.g. hard
+                        // links) are visible instead of a collapsed "[N files]".
+                        if let Some(tree) = &self.tree {
+                            let mut buf = PathBuf::from(tree.name());
+                            collect_group_dirs(tree, &mut buf, &mut self.expanded_file_groups);
+                        }
                         self.screenshot_state = ScreenshotState::WaitFrames(5);
                     }
                 }

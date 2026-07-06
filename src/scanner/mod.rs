@@ -194,8 +194,11 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 /// files (same inode, multiple directory entries) only once. Sharded across
 /// several mutexes so the parallel walker's threads rarely contend — and only
 /// files with link count > 1 ever touch it.
+/// One shard of the inode set: seen `(device, file id)` pairs.
+type InodeShard = Mutex<HashSet<(u32, u64)>>;
+
 pub struct InodeSet {
-    shards: Box<[Mutex<HashSet<u64>>]>,
+    shards: Box<[InodeShard]>,
 }
 
 impl InodeSet {
@@ -208,12 +211,15 @@ impl InodeSet {
         Self { shards }
     }
 
-    /// Record `id`; returns `true` the first time it is seen (so the caller
-    /// counts its size) and `false` for every later hardlink to the same inode.
+    /// Record `(dev, id)`; returns `true` the first time it is seen (so the
+    /// caller counts its size) and `false` for every later hardlink to the same
+    /// inode. Keyed on device too, since a file id is only unique within a
+    /// volume and a scan can cross mount points.
     #[cfg(target_os = "macos")]
-    pub fn insert_new(&self, id: u64) -> bool {
-        let shard = &self.shards[(id as usize) & (Self::SHARDS - 1)];
-        shard.lock().unwrap().insert(id)
+    pub fn insert_new(&self, dev: u32, id: u64) -> bool {
+        let hash = id ^ ((dev as u64) << 1);
+        let shard = &self.shards[(hash as usize) & (Self::SHARDS - 1)];
+        shard.lock().unwrap().insert((dev, id))
     }
 }
 
@@ -739,6 +745,84 @@ mod tests {
             "hardlinked inode should count once, not 3x"
         );
         assert_eq!(progress.total_size.load(Ordering::Relaxed), one_alloc);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn find_file<'a>(node: &'a FileNode, name: &str) -> Option<&'a FileNode> {
+        for c in node.children() {
+            if !c.is_dir() && c.name() == name {
+                return Some(c);
+            }
+            if c.is_dir()
+                && let Some(f) = find_file(c, name)
+            {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    // Hard links in *different* directories are walked by separate threads;
+    // the shared inode set must still count the inode's size only once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_dedups_hardlinks_across_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        fs::create_dir(tmp.path().join("b")).unwrap();
+        fs::write(tmp.path().join("a/orig.bin"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tmp.path().join("a/orig.bin"), tmp.path().join("b/link.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        let one = fs::metadata(tmp.path().join("a/orig.bin"))
+            .unwrap()
+            .blocks()
+            * 512;
+        assert_eq!(root.size(), one, "cross-dir hardlink counted once");
+        assert_eq!(progress.total_size.load(Ordering::Relaxed), one);
+        assert!(find_file(&root, "orig.bin").unwrap().is_hard_link());
+        assert!(find_file(&root, "link.bin").unwrap().is_hard_link());
+    }
+
+    // The hard-link flag is set for every link and never for a normal file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_hardlink_flag_only_on_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("normal.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(tmp.path().join("shared.bin"), vec![0u8; 4096]).unwrap();
+        fs::hard_link(
+            tmp.path().join("shared.bin"),
+            tmp.path().join("shared2.bin"),
+        )
+        .unwrap();
+
+        let root = scan_directory(tmp.path(), new_progress());
+        assert!(!find_file(&root, "normal.bin").unwrap().is_hard_link());
+        assert!(find_file(&root, "shared.bin").unwrap().is_hard_link());
+        assert!(find_file(&root, "shared2.bin").unwrap().is_hard_link());
+    }
+
+    // A file with nlink>1 whose other links are outside the scan is counted
+    // once at full size (it genuinely occupies that space here).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scan_hardlink_single_link_in_scope_full_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        // orig lives outside `sub`; only its link is scanned.
+        fs::write(tmp.path().join("orig.bin"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tmp.path().join("orig.bin"), sub.join("only-link.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(&sub, progress.clone());
+
+        let one = fs::metadata(sub.join("only-link.bin")).unwrap().blocks() * 512;
+        assert_eq!(root.size(), one, "single in-scope link keeps full size");
+        assert!(find_file(&root, "only-link.bin").unwrap().is_hard_link());
     }
 
     #[test]

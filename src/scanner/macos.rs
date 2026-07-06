@@ -53,6 +53,7 @@ mod bulk_attrs {
     pub const ATTR_BIT_MAP_COUNT: u16 = 5;
     pub const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
     pub const ATTR_CMN_NAME: u32 = 0x0000_0001;
+    pub const ATTR_CMN_DEVID: u32 = 0x0000_0002;
     pub const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
     pub const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
     pub const ATTR_CMN_FILEID: u32 = 0x0200_0000;
@@ -131,6 +132,7 @@ pub fn walk_dir_bulk(
         reserved: 0,
         commonattr: ATTR_CMN_RETURNED_ATTRS
             | ATTR_CMN_NAME
+            | ATTR_CMN_DEVID
             | ATTR_CMN_OBJTYPE
             | ATTR_CMN_FLAGS
             | ATTR_CMN_FILEID,
@@ -205,18 +207,19 @@ pub fn walk_dir_bulk(
             //  +20   u32  returned fork attrs
             //  +24   i32  name attr_dataoff (relative to +24)
             //  +28   u32  name attr_length  (includes NUL)
-            //  +32   u32  objtype           (VREG=1, VDIR=2, …)
-            //  +36   u32  flags             (UF_HIDDEN = 0x8000)
-            //  +40   u64  fileid            (common — present for all entries)
-            //  +48   u32  linkcount         (file attr; only if returned)
-            //  +52   i64  allocsize         (file attr; only if returned)
+            //  +32   u32  devid             (dev_t; common — all entries)
+            //  +36   u32  objtype           (VREG=1, VDIR=2, …)
+            //  +40   u32  flags             (UF_HIDDEN = 0x8000)
+            //  +44   u64  fileid            (common; 4-byte aligned → unaligned)
+            //  +52   u32  linkcount         (file attr; only if returned)
+            //  +56   i64  allocsize         (file attr; only if returned)
             //
             // Variable-length name data lives at +24 + attr_dataoff.
             let mut offset = 0usize;
             for _ in 0..count as usize {
                 // Safety: getattrlistbulk guarantees entries are 4-byte
                 // aligned and fit within `count` entries in the buffer.
-                if offset + 40 > BUF_SIZE {
+                if offset + 44 > BUF_SIZE {
                     break;
                 }
 
@@ -254,8 +257,8 @@ pub fn walk_dir_bulk(
                             .into_boxed_str(),
                     };
 
-                    let objtype = base.add(32).cast::<u32>().read_unaligned();
-                    let flags = base.add(36).cast::<u32>().read_unaligned();
+                    let objtype = base.add(36).cast::<u32>().read_unaligned();
+                    let flags = base.add(40).cast::<u32>().read_unaligned();
                     let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
 
                     match objtype {
@@ -264,23 +267,27 @@ pub fn walk_dir_bulk(
                         }
                         VREG => {
                             let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
-                                *(base.add(48) as *const u32)
+                                *(base.add(52) as *const u32)
                             } else {
                                 1
                             };
                             let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                                // +52 is only 4-byte aligned → unaligned read.
-                                base.add(52).cast::<i64>().read_unaligned() as u64
+                                // +56 is 8-byte aligned but keep unaligned read.
+                                base.add(56).cast::<i64>().read_unaligned() as u64
                             } else {
                                 0
                             };
                             // Hardlink dedup: a file with >1 link appears under
                             // multiple directory entries; count its size once so
                             // totals aren't inflated. nlink==1 (the common case)
-                            // never touches the shared set.
+                            // never touches the shared set. Key on (devid, fileid)
+                            // since fileid is only unique within a volume and a
+                            // scan can cross mount points.
                             let counted = if linkcount > 1 {
-                                let fileid = *(base.add(40) as *const u64);
-                                if progress.seen_inodes.insert_new(fileid) {
+                                let devid = *(base.add(32) as *const u32);
+                                // +44 is only 4-byte aligned → unaligned read.
+                                let fileid = (base.add(44) as *const u64).read_unaligned();
+                                if progress.seen_inodes.insert_new(devid, fileid) {
                                     allocsize
                                 } else {
                                     0

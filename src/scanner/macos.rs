@@ -60,6 +60,9 @@ mod bulk_attrs {
     pub const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
     pub const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
     pub const FSOPT_NOFOLLOW: u64 = 0x0000_0001;
+    /// Pack a fixed-size (zeroed) slot for any requested attribute the volume
+    /// doesn't support, so entry offsets stay constant across filesystems.
+    pub const FSOPT_PACK_INVAL_ATTRS: u64 = 0x0000_0008;
     /// `VREG` — regular file.
     pub const VREG: u32 = 1;
     /// `VDIR` — directory.
@@ -185,7 +188,7 @@ pub fn walk_dir_bulk(
                     &ATTRLIST,
                     buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
                     BUF_SIZE,
-                    FSOPT_NOFOLLOW,
+                    FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS,
                 )
             };
 
@@ -232,7 +235,10 @@ pub fn walk_dir_bulk(
                         break;
                     }
 
-                    // Which file attrs were actually returned for this entry?
+                    // Which attrs were actually returned for this entry?
+                    // (With FSOPT_PACK_INVAL_ATTRS a slot is always present, but
+                    // zero-filled and flagged absent when unsupported.)
+                    let returned_common = base.add(4).cast::<u32>().read_unaligned();
                     let returned_file = base.add(16).cast::<u32>().read_unaligned();
 
                     // Name — attrreference_t at +24
@@ -282,8 +288,12 @@ pub fn walk_dir_bulk(
                             // totals aren't inflated. nlink==1 (the common case)
                             // never touches the shared set. Key on (devid, fileid)
                             // since fileid is only unique within a volume and a
-                            // scan can cross mount points.
-                            let counted = if linkcount > 1 {
+                            // scan can cross mount points. Only dedup when both
+                            // ids were actually returned (else they're invalid
+                            // zero-filled slots under FSOPT_PACK_INVAL_ATTRS).
+                            let ids_valid = returned_common & ATTR_CMN_FILEID != 0
+                                && returned_common & ATTR_CMN_DEVID != 0;
+                            let counted = if linkcount > 1 && ids_valid {
                                 let devid = *(base.add(32) as *const u32);
                                 // +44 is only 4-byte aligned → unaligned read.
                                 let fileid = (base.add(44) as *const u64).read_unaligned();

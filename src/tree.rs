@@ -16,7 +16,7 @@ const PAR_SORT_THRESHOLD: usize = 128;
 #[derive(Clone)]
 pub struct FileLeaf {
     pub name: Box<str>,
-    /// Lower 63 bits: file size in bytes. Bit 63: hidden flag.
+    /// Lower 62 bits: file size in bytes. Bit 63: hidden. Bit 62: hard link.
     size_hidden: u64,
 }
 

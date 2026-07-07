@@ -300,9 +300,17 @@ fn main() -> eframe::Result {
         i += 1;
     }
 
+    // `--screenshot` mode uses a narrower window so the right-anchored size
+    // bars sit next to the names (no wide empty gap) — tighter docs images.
+    // Inert for normal runs (only set when capturing screenshots).
+    let win_size = if screenshot_prefix.is_some() {
+        [760.0, 620.0]
+    } else {
+        [980.0, 700.0]
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 700.0])
+            .with_inner_size(win_size)
             .with_min_inner_size([720.0, 480.0])
             .with_icon(app_icon::generate())
             .with_visible(false), // hidden until first frame renders (avoids white flash)

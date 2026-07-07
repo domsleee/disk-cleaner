@@ -198,6 +198,9 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 type InodeShard = Mutex<HashSet<(u32, u64)>>;
 
 pub struct InodeSet {
+    // Only read via insert_new(), which is macOS-only (dedup lives in the
+    // getattrlistbulk walker); unused on other platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     shards: Box<[InodeShard]>,
 }
 
@@ -238,6 +241,8 @@ pub struct ScanProgress {
     pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
     /// Hardlinked inodes already counted (dedup). See [`InodeSet`].
+    /// Only read by the macOS walker; inert on other platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub seen_inodes: InodeSet,
 }
 

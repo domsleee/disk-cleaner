@@ -41,6 +41,8 @@ impl FileLeaf {
 
     /// Mark this leaf as a hard link (its inode is referenced by more than one
     /// directory entry, so its space is shared and counted once elsewhere).
+    /// Only set by the macOS walker; unused on other platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     #[inline]
     pub fn set_hard_link(&mut self, v: bool) {
         if v {

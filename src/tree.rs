@@ -5,15 +5,18 @@
 
 use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
 
-/// Bit 63 of the size field stores the hidden flag.
-/// Max representable size: 2^63 − 1 ≈ 9.2 EB (more than enough).
+/// Bit 63 of the size field stores the hidden flag; bit 62 marks a hard link
+/// (a file sharing its inode with other directory entries). Max representable
+/// size: 2^62 − 1 ≈ 4.6 EB (more than enough).
 const HIDDEN_BIT: u64 = 1 << 63;
+const HARD_LINK_BIT: u64 = 1 << 62;
+const SIZE_MASK: u64 = !(HIDDEN_BIT | HARD_LINK_BIT);
 const PAR_SORT_THRESHOLD: usize = 128;
 
 #[derive(Clone)]
 pub struct FileLeaf {
     pub name: Box<str>,
-    /// Lower 63 bits: file size in bytes. Bit 63: hidden flag.
+    /// Lower 62 bits: file size in bytes. Bit 63: hidden. Bit 62: hard link.
     size_hidden: u64,
 }
 
@@ -28,12 +31,30 @@ impl FileLeaf {
 
     #[inline]
     pub fn size(&self) -> u64 {
-        self.size_hidden & !HIDDEN_BIT
+        self.size_hidden & SIZE_MASK
     }
 
     #[inline]
     pub fn is_hidden(&self) -> bool {
         self.size_hidden & HIDDEN_BIT != 0
+    }
+
+    /// Mark this leaf as a hard link (its inode is referenced by more than one
+    /// directory entry, so its space is shared and counted once elsewhere).
+    /// Only set by the macOS walker; unused on other platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[inline]
+    pub fn set_hard_link(&mut self, v: bool) {
+        if v {
+            self.size_hidden |= HARD_LINK_BIT;
+        } else {
+            self.size_hidden &= !HARD_LINK_BIT;
+        }
+    }
+
+    #[inline]
+    pub fn is_hard_link(&self) -> bool {
+        self.size_hidden & HARD_LINK_BIT != 0
     }
 }
 
@@ -74,6 +95,13 @@ impl FileNode {
         match self {
             FileNode::File(f) => f.is_hidden(),
             FileNode::Dir(d) => d.hidden,
+        }
+    }
+
+    pub fn is_hard_link(&self) -> bool {
+        match self {
+            FileNode::File(f) => f.is_hard_link(),
+            FileNode::Dir(_) => false,
         }
     }
 

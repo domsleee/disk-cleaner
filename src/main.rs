@@ -300,9 +300,17 @@ fn main() -> eframe::Result {
         i += 1;
     }
 
+    // `--screenshot` mode uses a narrower window so the right-anchored size
+    // bars sit next to the names (no wide empty gap) — tighter docs images.
+    // Inert for normal runs (only set when capturing screenshots).
+    let win_size = if screenshot_prefix.is_some() {
+        [760.0, 620.0]
+    } else {
+        [980.0, 700.0]
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 700.0])
+            .with_inner_size(win_size)
             .with_min_inner_size([720.0, 480.0])
             .with_icon(app_icon::generate())
             .with_visible(false), // hidden until first frame renders (avoids white flash)
@@ -456,6 +464,7 @@ impl Default for App {
                 bulk_scan_fallback_count: 0.into(),
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
+                seen_inodes: Default::default(),
             }),
             receiver: None,
             error: None,
@@ -581,6 +590,7 @@ impl App {
             bulk_scan_fallback_count: 0.into(),
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
+            seen_inodes: Default::default(),
         });
         self.scan_progress = progress.clone();
 
@@ -819,6 +829,19 @@ fn save_screenshot_png(
     Ok(())
 }
 
+/// Screenshot helper: collect every directory path in the tree so their file
+/// groups can be force-expanded for capture.
+fn collect_group_dirs(node: &FileNode, buf: &mut PathBuf, out: &mut HashSet<PathBuf>) {
+    if node.is_dir() {
+        out.insert(buf.clone());
+        for c in node.children() {
+            buf.push(c.name());
+            collect_group_dirs(c, buf, out);
+            buf.pop();
+        }
+    }
+}
+
 impl eframe::App for App {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Match the panel fill so sub-pixel gaps between panels don't
@@ -971,6 +994,12 @@ impl eframe::App for App {
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
                     if !self.scanning {
+                        // Expand all file groups so individual files (e.g. hard
+                        // links) are visible instead of a collapsed "[N files]".
+                        if let Some(tree) = &self.tree {
+                            let mut buf = PathBuf::from(tree.name());
+                            collect_group_dirs(tree, &mut buf, &mut self.expanded_file_groups);
+                        }
                         self.screenshot_state = ScreenshotState::WaitFrames(5);
                     }
                 }

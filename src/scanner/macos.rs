@@ -53,10 +53,16 @@ mod bulk_attrs {
     pub const ATTR_BIT_MAP_COUNT: u16 = 5;
     pub const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
     pub const ATTR_CMN_NAME: u32 = 0x0000_0001;
+    pub const ATTR_CMN_DEVID: u32 = 0x0000_0002;
     pub const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
     pub const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+    pub const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+    pub const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
     pub const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
     pub const FSOPT_NOFOLLOW: u64 = 0x0000_0001;
+    /// Pack a fixed-size (zeroed) slot for any requested attribute the volume
+    /// doesn't support, so entry offsets stay constant across filesystems.
+    pub const FSOPT_PACK_INVAL_ATTRS: u64 = 0x0000_0008;
     /// `VREG` — regular file.
     pub const VREG: u32 = 1;
     /// `VDIR` — directory.
@@ -127,10 +133,15 @@ pub fn walk_dir_bulk(
     static ATTRLIST: AttrList = AttrList {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_FLAGS,
+        commonattr: ATTR_CMN_RETURNED_ATTRS
+            | ATTR_CMN_NAME
+            | ATTR_CMN_DEVID
+            | ATTR_CMN_OBJTYPE
+            | ATTR_CMN_FLAGS
+            | ATTR_CMN_FILEID,
         volattr: 0,
         dirattr: 0,
-        fileattr: ATTR_FILE_ALLOCSIZE,
+        fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE,
         forkattr: 0,
     };
 
@@ -177,7 +188,7 @@ pub fn walk_dir_bulk(
                     &ATTRLIST,
                     buf.as_mut_ptr().cast::<std::os::raw::c_void>(),
                     BUF_SIZE,
-                    FSOPT_NOFOLLOW,
+                    FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS,
                 )
             };
 
@@ -199,16 +210,19 @@ pub fn walk_dir_bulk(
             //  +20   u32  returned fork attrs
             //  +24   i32  name attr_dataoff (relative to +24)
             //  +28   u32  name attr_length  (includes NUL)
-            //  +32   u32  objtype           (VREG=1, VDIR=2, …)
-            //  +36   u32  flags             (UF_HIDDEN = 0x8000)
-            //  +40   i64  allocsize         (only if returned_file & ALLOCSIZE)
+            //  +32   u32  devid             (dev_t; common — all entries)
+            //  +36   u32  objtype           (VREG=1, VDIR=2, …)
+            //  +40   u32  flags             (UF_HIDDEN = 0x8000)
+            //  +44   u64  fileid            (common; 4-byte aligned → unaligned)
+            //  +52   u32  linkcount         (file attr; only if returned)
+            //  +56   i64  allocsize         (file attr; only if returned)
             //
             // Variable-length name data lives at +24 + attr_dataoff.
             let mut offset = 0usize;
             for _ in 0..count as usize {
                 // Safety: getattrlistbulk guarantees entries are 4-byte
                 // aligned and fit within `count` entries in the buffer.
-                if offset + 40 > BUF_SIZE {
+                if offset + 44 > BUF_SIZE {
                     break;
                 }
 
@@ -221,7 +235,10 @@ pub fn walk_dir_bulk(
                         break;
                     }
 
-                    // Which file attrs were actually returned for this entry?
+                    // Which attrs were actually returned for this entry?
+                    // (With FSOPT_PACK_INVAL_ATTRS a slot is always present, but
+                    // zero-filled and flagged absent when unsupported.)
+                    let returned_common = base.add(4).cast::<u32>().read_unaligned();
                     let returned_file = base.add(16).cast::<u32>().read_unaligned();
 
                     // Name — attrreference_t at +24
@@ -246,8 +263,8 @@ pub fn walk_dir_bulk(
                             .into_boxed_str(),
                     };
 
-                    let objtype = base.add(32).cast::<u32>().read_unaligned();
-                    let flags = base.add(36).cast::<u32>().read_unaligned();
+                    let objtype = base.add(36).cast::<u32>().read_unaligned();
+                    let flags = base.add(40).cast::<u32>().read_unaligned();
                     let hidden = name.starts_with('.') || (flags & UF_HIDDEN != 0);
 
                     match objtype {
@@ -255,15 +272,44 @@ pub fn walk_dir_bulk(
                             sub_dirs.push((name, hidden));
                         }
                         VREG => {
+                            let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
+                                *(base.add(52) as *const u32)
+                            } else {
+                                1
+                            };
                             let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                                base.add(40).cast::<i64>().read_unaligned() as u64
+                                // +56 is 8-byte aligned but keep unaligned read.
+                                base.add(56).cast::<i64>().read_unaligned() as u64
                             } else {
                                 0
                             };
+                            // Hardlink dedup: a file with >1 link appears under
+                            // multiple directory entries; count its size once so
+                            // totals aren't inflated. nlink==1 (the common case)
+                            // never touches the shared set. Key on (devid, fileid)
+                            // since fileid is only unique within a volume and a
+                            // scan can cross mount points. Only dedup when both
+                            // ids were actually returned (else they're invalid
+                            // zero-filled slots under FSOPT_PACK_INVAL_ATTRS).
+                            let ids_valid = returned_common & ATTR_CMN_FILEID != 0
+                                && returned_common & ATTR_CMN_DEVID != 0;
+                            let counted = if linkcount > 1 && ids_valid {
+                                let devid = *(base.add(32) as *const u32);
+                                // +44 is only 4-byte aligned → unaligned read.
+                                let fileid = (base.add(44) as *const u64).read_unaligned();
+                                if progress.seen_inodes.insert_new(devid, fileid) {
+                                    allocsize
+                                } else {
+                                    0
+                                }
+                            } else {
+                                allocsize
+                            };
                             batch_file_count += 1;
-                            batch_total_size += allocsize;
-                            file_children
-                                .push(FileNode::File(FileLeaf::new(name, allocsize, hidden)));
+                            batch_total_size += counted;
+                            let mut leaf = FileLeaf::new(name, counted, hidden);
+                            leaf.set_hard_link(linkcount > 1);
+                            file_children.push(FileNode::File(leaf));
                         }
                         _ => {} // skip symlinks, sockets, etc.
                     }

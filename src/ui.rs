@@ -194,6 +194,9 @@ pub struct CachedRow {
     pub is_hidden: bool,
     /// True for synthetic "N files" summary rows that group loose files.
     pub is_file_group: bool,
+    /// True when this file is a hard link (shares its inode / storage with
+    /// other directory entries; counted once toward totals).
+    pub is_hard_link: bool,
 }
 
 /// Collect all visible rows into owned `CachedRow` structs. This replaces both
@@ -258,6 +261,7 @@ fn emit_file_group(
         category: crate::categories::FileCategory::Other,
         is_hidden: false,
         is_file_group: true,
+        is_hard_link: false,
     });
 
     if group_expanded {
@@ -333,6 +337,7 @@ fn collect_cached_rows_inner(
         },
         is_hidden: node.is_hidden(),
         is_file_group: false,
+        is_hard_link: node.is_hard_link(),
     });
 
     let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
@@ -625,7 +630,13 @@ pub fn render_tree(
                 // to nothing rather than spilling over the pulled-in size bar.
                 let name_max_w =
                     (ui.available_width() - right_inset - right_reserved - 4.0).max(0.0);
-                let name_text = if row.is_hidden || row.is_file_group {
+                // Hard links get a 🔗 prefix (survives right-truncation) and are
+                // dimmed, since their storage is shared and counted once.
+                let name_text = if row.is_hard_link {
+                    egui::RichText::new(format!("\u{1F517} {}", row.name))
+                        .monospace()
+                        .weak()
+                } else if row.is_hidden || row.is_file_group {
                     egui::RichText::new(&*row.name).monospace().weak()
                 } else {
                     egui::RichText::new(&*row.name).monospace()
@@ -808,8 +819,19 @@ pub fn render_tree(
                 });
             } else {
                 let path = &row.path;
+                let hard_link = row.is_hard_link;
                 row_interact.on_hover_ui(|ui| {
                     ui.label(path.display().to_string());
+                    if hard_link {
+                        ui.label(
+                            egui::RichText::new(
+                                "\u{1F517} Hard link — shares storage with other files. \
+                                 Counted once; deleting frees space only once every copy is gone.",
+                            )
+                            .weak()
+                            .size(12.0),
+                        );
+                    }
                 });
             }
 

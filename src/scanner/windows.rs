@@ -309,6 +309,9 @@ pub fn walk_dir_bulk(
                     let attrs = (&raw const (*info).FileAttributes).read_unaligned();
                     let reparse_tag = (&raw const (*info).ReparsePointTag).read_unaligned();
                     let logical_size = (&raw const (*info).EndOfFile).read_unaligned() as u64;
+                    // FILE_ID_128 is a [u8; 16]; on little-endian reading it as
+                    // a u128 is just its bytes — only used as an opaque key.
+                    let file_id = (&raw const (*info).FileId).cast::<u128>().read_unaligned();
                     let entry_len = if next_entry == 0 {
                         buf.len() - offset
                     } else {
@@ -330,13 +333,21 @@ pub fn walk_dir_bulk(
                             name_wide,
                             attrs,
                             logical_size,
+                            file_id,
                             is_directory,
                             is_symlink,
                         ))
                     }
                 };
-                let Some((next_entry, name, attrs, logical_size, is_directory, is_symlink)) =
-                    parsed
+                let Some((
+                    next_entry,
+                    name,
+                    attrs,
+                    logical_size,
+                    file_id,
+                    is_directory,
+                    is_symlink,
+                )) = parsed
                 else {
                     break;
                 };
@@ -358,9 +369,24 @@ pub fn walk_dir_bulk(
                 } else if is_directory {
                     sub_dirs.push((name, hidden));
                 } else {
+                    // Hardlink dedup: an inode with several links appears under
+                    // multiple directory entries; count its size once so totals
+                    // aren't inflated. Directory enumeration can't see the link
+                    // count, but the 128-bit file id comes free with
+                    // FILE_ID_EXTD_DIR_INFO, so every nonzero-size file records
+                    // its id and a repeat sighting counts 0. The id alone is a
+                    // sufficient key: name-surrogate reparse points (junctions,
+                    // volume mount points) are skipped above, so a scan never
+                    // crosses volumes. Unlike macOS (which sees nlink for every
+                    // entry), only the second and later links get the hard-link
+                    // mark — the first-seen entry keeps the full size unmarked.
+                    let duplicate = logical_size > 0 && !progress.seen_inodes.insert_new(file_id);
+                    let counted = if duplicate { 0 } else { logical_size };
                     batch_file_count += 1;
-                    batch_total_size += logical_size;
-                    file_children.push(FileNode::File(FileLeaf::new(name, logical_size, hidden)));
+                    batch_total_size += counted;
+                    let mut leaf = FileLeaf::new(name, counted, hidden);
+                    leaf.set_hard_link(duplicate);
+                    file_children.push(FileNode::File(leaf));
                 }
 
                 if next_entry == 0 {

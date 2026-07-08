@@ -380,9 +380,14 @@ pub fn walk_dir_bulk(
                     // crosses volumes. Unlike macOS (which sees nlink for every
                     // entry), only the second and later links get the hard-link
                     // mark — the first-seen entry keeps the full size unmarked.
-                    // Filesystems/redirectors without stable file ids report a
-                    // sentinel (all zeros, or all ones = FILE_INVALID_FILE_ID);
+                    // Filesystems/redirectors without stable 128-bit file ids
+                    // report a sentinel (zero when unsupported, all ones when a
+                    // unique id can't be established — see MS-FSCC 2.4.22);
                     // deduping on those would collapse unrelated files, so skip.
+                    // The single-volume invariant also isn't ironclad over UNC
+                    // (e.g. DFS links aren't name-surrogate reparse points), so
+                    // a network scan crossing providers relies on these ids
+                    // being distinct — acceptable for a local-disk cleaner.
                     let id_valid = file_id != 0 && file_id != u128::MAX;
                     let duplicate =
                         logical_size > 0 && id_valid && !progress.seen_inodes.insert_new(file_id);

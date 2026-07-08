@@ -192,15 +192,21 @@ fn scan_pool() -> &'static rayon::ThreadPool {
 
 /// Sharded set of file ids seen during a scan, used to count hardlinked
 /// files (same inode, multiple directory entries) only once. Sharded across
-/// several mutexes so the parallel walker's threads rarely contend — and only
-/// files with link count > 1 ever touch it.
-/// One shard of the inode set: seen `(device, file id)` pairs.
-type InodeShard = Mutex<HashSet<(u32, u64)>>;
+/// several mutexes so the parallel walker's threads rarely contend.
+///
+/// Keys are 128-bit: macOS packs `(device, file id)` (a file id is only
+/// unique within a volume and a scan can cross mount points); Windows uses
+/// the native 128-bit `FileId` alone (its bulk walker never crosses volumes —
+/// mount points are name-surrogate reparse points, which it skips).
+///
+/// On macOS only files with link count > 1 ever touch the set. Windows bulk
+/// enumeration has no link count, so every nonzero-size file is recorded —
+/// the set is cleared once the scan finishes to release that memory.
+type InodeShard = Mutex<HashSet<u128>>;
 
 pub struct InodeSet {
-    // Only read via insert_new(), which is macOS-only (dedup lives in the
-    // getattrlistbulk walker); unused on other platforms.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    // insert_new() exists only for the macOS/Windows bulk walkers; the
+    // generic walker doesn't dedup.
     shards: Box<[InodeShard]>,
 }
 
@@ -214,15 +220,25 @@ impl InodeSet {
         Self { shards }
     }
 
-    /// Record `(dev, id)`; returns `true` the first time it is seen (so the
-    /// caller counts its size) and `false` for every later hardlink to the same
-    /// inode. Keyed on device too, since a file id is only unique within a
-    /// volume and a scan can cross mount points.
-    #[cfg(target_os = "macos")]
-    pub fn insert_new(&self, dev: u32, id: u64) -> bool {
-        let hash = id ^ ((dev as u64) << 1);
+    /// Record a file id; returns `true` the first time it is seen (so the
+    /// caller counts its size) and `false` for every later hardlink to the
+    /// same inode.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn insert_new(&self, key: u128) -> bool {
+        let hash = (key as u64) ^ ((key >> 64) as u64).rotate_left(1);
         let shard = &self.shards[(hash as usize) & (Self::SHARDS - 1)];
-        shard.lock().unwrap().insert((dev, id))
+        shard.lock().unwrap().insert(key)
+    }
+
+    /// Drop all recorded ids and release their memory. The set is only
+    /// meaningful while a scan is running; on Windows it holds an entry per
+    /// scanned file, which is worth freeing once the tree is built.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut set = shard.lock().unwrap();
+            set.clear();
+            set.shrink_to_fit();
+        }
     }
 }
 
@@ -241,8 +257,7 @@ pub struct ScanProgress {
     pub fallback_details: Mutex<Vec<ScanFallbackDetail>>,
     pub cancelled: AtomicBool,
     /// Hardlinked inodes already counted (dedup). See [`InodeSet`].
-    /// Only read by the macOS walker; inert on other platforms.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Only read by the macOS/Windows bulk walkers; inert elsewhere.
     pub seen_inodes: InodeSet,
 }
 
@@ -524,6 +539,10 @@ fn scan_directory_inner(
     #[cfg(not(target_os = "macos"))]
     #[cfg(not(target_os = "windows"))]
     let mut root_node = walk_dir(root, &progress, &skip);
+    // The dedup set is only needed while walking; on Windows it holds an id
+    // per scanned file (can be ~100 MB on a full-drive scan) and the progress
+    // struct outlives the scan, so release it now.
+    progress.seen_inodes.clear();
     crate::tree::sort_children_recursive(&mut root_node);
     root_node.set_expanded(true);
     // Override name to be the full path (walk_dir used file_name only).
@@ -752,7 +771,7 @@ mod tests {
         assert_eq!(progress.total_size.load(Ordering::Relaxed), one_alloc);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn find_file<'a>(node: &'a FileNode, name: &str) -> Option<&'a FileNode> {
         for c in node.children() {
             if !c.is_dir() && c.name() == name {
@@ -828,6 +847,103 @@ mod tests {
         let one = fs::metadata(sub.join("only-link.bin")).unwrap().blocks() * 512;
         assert_eq!(root.size(), one, "single in-scope link keeps full size");
         assert!(find_file(&root, "only-link.bin").unwrap().is_hard_link());
+    }
+
+    /// Count leaves carrying the hard-link mark anywhere in the tree.
+    #[cfg(target_os = "windows")]
+    fn count_hard_link_marks(node: &FileNode) -> usize {
+        let own = usize::from(node.is_hard_link());
+        own + node
+            .children()
+            .iter()
+            .map(count_hard_link_marks)
+            .sum::<usize>()
+    }
+
+    // Windows dedups by file id alone (no link count in bulk enumeration), so
+    // exactly one entry per inode keeps the size; the rest count 0 and are
+    // marked as hard links. Which entry wins depends on walk order.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn scan_dedups_hardlinks_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("orig.bin"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tmp.path().join("orig.bin"), tmp.path().join("link1.bin")).unwrap();
+        fs::hard_link(tmp.path().join("orig.bin"), tmp.path().join("link2.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        // Three directory entries, but the shared inode's size counts once.
+        assert_eq!(root.children().len(), 3);
+        assert_eq!(progress.file_count.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            root.size(),
+            8192,
+            "hardlinked inode should count once, not 3x"
+        );
+        assert_eq!(progress.total_size.load(Ordering::Relaxed), 8192);
+        // First-seen entry is unmarked (link count is unknowable in bulk
+        // enumeration); the two later sightings are marked.
+        assert_eq!(count_hard_link_marks(&root), 2);
+    }
+
+    // Hard links in *different* directories can be walked by separate
+    // threads; the shared inode set must still count the size only once.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn scan_dedups_hardlinks_across_dirs_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("a")).unwrap();
+        fs::create_dir(tmp.path().join("b")).unwrap();
+        fs::write(tmp.path().join("a/orig.bin"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(tmp.path().join("a/orig.bin"), tmp.path().join("b/link.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        assert_eq!(root.size(), 8192, "cross-dir hardlink counted once");
+        assert_eq!(progress.total_size.load(Ordering::Relaxed), 8192);
+        assert_eq!(count_hard_link_marks(&root), 1);
+    }
+
+    // Independent files must never be deduped or marked, even with equal
+    // sizes and contents.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn scan_windows_distinct_files_not_deduped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("normal.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(tmp.path().join("shared.bin"), vec![0u8; 4096]).unwrap();
+        fs::hard_link(
+            tmp.path().join("shared.bin"),
+            tmp.path().join("shared2.bin"),
+        )
+        .unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        assert_eq!(root.size(), 8192, "two distinct inodes count in full");
+        assert!(!find_file(&root, "normal.bin").unwrap().is_hard_link());
+        assert_eq!(count_hard_link_marks(&root), 1);
+    }
+
+    // Zero-size files never enter the dedup set: nothing to over-count, and
+    // skipping them keeps the set (an entry per scanned file) smaller.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn scan_windows_zero_size_hardlinks_unmarked() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("empty.bin"), b"").unwrap();
+        fs::hard_link(tmp.path().join("empty.bin"), tmp.path().join("empty2.bin")).unwrap();
+
+        let progress = new_progress();
+        let root = scan_directory(tmp.path(), progress.clone());
+
+        assert_eq!(root.children().len(), 2);
+        assert_eq!(root.size(), 0);
+        assert_eq!(count_hard_link_marks(&root), 0);
     }
 
     #[test]

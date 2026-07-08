@@ -297,7 +297,8 @@ pub fn walk_dir_bulk(
                                 let devid = *(base.add(32) as *const u32);
                                 // +44 is only 4-byte aligned → unaligned read.
                                 let fileid = (base.add(44) as *const u64).read_unaligned();
-                                if progress.seen_inodes.insert_new(devid, fileid) {
+                                let key = ((devid as u128) << 64) | fileid as u128;
+                                if progress.seen_inodes.insert_new(key) {
                                     allocsize
                                 } else {
                                     0

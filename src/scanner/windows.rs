@@ -380,7 +380,12 @@ pub fn walk_dir_bulk(
                     // crosses volumes. Unlike macOS (which sees nlink for every
                     // entry), only the second and later links get the hard-link
                     // mark — the first-seen entry keeps the full size unmarked.
-                    let duplicate = logical_size > 0 && !progress.seen_inodes.insert_new(file_id);
+                    // Filesystems/redirectors without stable file ids report a
+                    // sentinel (all zeros, or all ones = FILE_INVALID_FILE_ID);
+                    // deduping on those would collapse unrelated files, so skip.
+                    let id_valid = file_id != 0 && file_id != u128::MAX;
+                    let duplicate =
+                        logical_size > 0 && id_valid && !progress.seen_inodes.insert_new(file_id);
                     let counted = if duplicate { 0 } else { logical_size };
                     batch_file_count += 1;
                     batch_total_size += counted;

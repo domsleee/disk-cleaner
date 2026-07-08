@@ -10,8 +10,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use disk_cleaner::categories;
 use disk_cleaner::scanner::{self, ScanProgress};
-use disk_cleaner::treemap;
 use disk_cleaner::tree::FileNode;
+use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use eframe::egui;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -44,14 +44,34 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) };
     }
+
+    // Without this override the default realloc is alloc+copy+dealloc, which
+    // both changes the program's allocation behavior vs. the real app and
+    // double-counts every Vec/HashSet growth in the peak numbers.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            if new_size >= layout.size() {
+                let grow = new_size - layout.size();
+                let current = ALLOCATED.fetch_add(grow, Ordering::Relaxed) + grow;
+                PEAK.fetch_max(current, Ordering::Relaxed);
+            } else {
+                ALLOCATED.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+        }
+        new_ptr
+    }
 }
 
 #[global_allocator]
 static ALLOC: TrackingAllocator = TrackingAllocator;
 
+/// Reset the peak to the current live level. `ALLOCATED` is never zeroed:
+/// it tracks live bytes process-wide, and zeroing it while allocations made
+/// before the reset are still live would underflow (wrap) when they free.
+/// Callers measure deltas against a `before` snapshot instead.
 fn reset_tracking() {
-    ALLOCATED.store(0, Ordering::SeqCst);
-    PEAK.store(0, Ordering::SeqCst);
+    PEAK.store(ALLOCATED.load(Ordering::SeqCst), Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +98,11 @@ fn count_nodes(node: &FileNode) -> usize {
 fn count_treemap_tiles(cache: &treemap::TreemapCache) -> usize {
     cache.tiles.len()
         + cache.other.iter().count()
-        + cache.tiles.iter().map(|tile| tile.nested.len()).sum::<usize>()
+        + cache
+            .tiles
+            .iter()
+            .map(|tile| tile.nested.len())
+            .sum::<usize>()
 }
 
 fn measure_retained<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
@@ -109,7 +133,24 @@ fn print_memory_line(
     );
 }
 
+/// Bytes-per-unit figure for a structure's own unit (row, path, tile),
+/// alongside the cross-structure b/node column.
+fn per_unit(delta: usize, units: usize) -> f64 {
+    delta as f64 / units.max(1) as f64
+}
+
 fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
+    // Warm the rayon pool and per-thread scanner buffers on a throwaway scan
+    // so their one-time allocations don't land in the first measured row.
+    {
+        let warmup = tempfile::tempdir().unwrap();
+        for i in 0..64 {
+            let dir = warmup.path().join(format!("w{i}"));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("f.bin"), [0u8; 64]).unwrap();
+        }
+        std::hint::black_box(scanner::scan_directory(warmup.path(), new_progress()));
+    }
     reset_tracking();
 
     let progress = new_progress();
@@ -118,35 +159,75 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
     let node_count = count_nodes(&tree);
     let file_count = progress.file_count.load(Ordering::Relaxed);
     let scan_size = progress.total_size.load(Ordering::Relaxed);
+    let fallbacks = progress.fallback_count.load(Ordering::Relaxed);
 
     disk_cleaner::tree::auto_expand(&mut tree, 0, 2);
 
     eprintln!(
-        "  {label:8} | {file_count:>9} files | {node_count:>9} nodes | scanned {}",
+        "  {label:8} | {file_count:>9} files | {node_count:>9} nodes | scanned {}{}",
         bytesize::ByteSize::b(scan_size),
+        if fallbacks > 0 {
+            format!(" | {fallbacks} fallback dirs")
+        } else {
+            String::new()
+        },
+    );
+    eprintln!(
+        "    (requested bytes, not RSS; delta = retained after build; peak = extra live during \
+         build, process-wide)"
     );
     print_memory_line(
         "scanner tree",
         tree_delta,
         tree_peak,
         node_count,
-        format_args!("{file_count} files"),
+        format_args!(
+            "{file_count} files{}",
+            if cfg!(windows) {
+                " (peak includes transient hardlink-dedup set)"
+            } else {
+                ""
+            }
+        ),
     );
 
     let expanded_file_groups: HashSet<PathBuf> = HashSet::new();
     let (rows, rows_delta, rows_peak) = measure_retained(|| {
-        ui::collect_cached_rows(&tree, "", None, true, None, None, Some(&expanded_file_groups))
+        ui::collect_cached_rows(
+            &tree,
+            "",
+            None,
+            true,
+            None,
+            None,
+            Some(&expanded_file_groups),
+        )
     });
     print_memory_line(
         "row cache (unfiltered)",
         rows_delta,
         rows_peak,
         node_count,
-        format_args!("{} rows", rows.len()),
+        format_args!(
+            "{} rows, {:.0} b/row",
+            rows.len(),
+            per_unit(rows_delta, rows.len())
+        ),
     );
     drop(rows);
 
-    if let Some((cat, _, _)) = categories::compute_stats(&tree).entries.first().copied() {
+    // The app retains category stats after every scan, so measure it as part
+    // of the retained set (and reuse it to pick the largest category below).
+    let (stats, stats_delta, stats_peak) = measure_retained(|| categories::compute_stats(&tree));
+    print_memory_line(
+        "category stats",
+        stats_delta,
+        stats_peak,
+        node_count,
+        format_args!("{} categories", stats.entries.len()),
+    );
+
+    if let Some((cat, _, _)) = stats.entries.first().copied() {
         let (cat_cache, cache_delta, cache_peak) =
             measure_retained(|| ui::build_category_match_cache(&tree, cat));
         print_memory_line(
@@ -154,7 +235,11 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
             cache_delta,
             cache_peak,
             node_count,
-            format_args!("{} cached paths", cat_cache.len()),
+            format_args!(
+                "{} cached paths, {:.0} b/path",
+                cat_cache.len(),
+                per_unit(cache_delta, cat_cache.len())
+            ),
         );
 
         let (filtered_rows, filtered_rows_delta, filtered_rows_peak) = measure_retained(|| {
@@ -173,7 +258,11 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
             filtered_rows_delta,
             filtered_rows_peak,
             node_count,
-            format_args!("{} rows", filtered_rows.len()),
+            format_args!(
+                "{} rows, {:.0} b/row",
+                filtered_rows.len(),
+                per_unit(filtered_rows_delta, filtered_rows.len())
+            ),
         );
         drop(filtered_rows);
         drop(cat_cache);
@@ -182,21 +271,23 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
     let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
     let (treemap_cache, treemap_delta, treemap_peak) =
         measure_retained(|| treemap::build_treemap_cache(&tree, &None, None, true, full_rect));
+    let tile_count = count_treemap_tiles(&treemap_cache);
     print_memory_line(
         "treemap cache",
         treemap_delta,
         treemap_peak,
         node_count,
         format_args!(
-            "{} tiles / {} crumbs",
-            count_treemap_tiles(&treemap_cache),
-            treemap_cache.breadcrumbs.len()
+            "{} tiles / {} crumbs, {:.0} b/tile",
+            tile_count,
+            treemap_cache.breadcrumbs.len(),
+            per_unit(treemap_delta, tile_count)
         ),
     );
     drop(treemap_cache);
 
     eprintln!("    text cache                | skipped by default (search UI currently hidden)");
-    std::hint::black_box(tree);
+    std::hint::black_box((tree, stats));
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -490,10 +581,11 @@ fn bench_memory_synthetic(c: &mut Criterion) {
             "Bytes per node: {:.0}",
             after.saturating_sub(before) as f64 / nodes as f64
         );
+        let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
         eprintln!(
             "Peak allocation: {} bytes ({:.1} KB)",
-            PEAK.load(Ordering::SeqCst),
-            PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+            peak,
+            peak as f64 / 1024.0
         );
         eprintln!("=============================================\n");
         std::hint::black_box(tree);
@@ -539,10 +631,11 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
             "Bytes per node: {:.0}",
             after.saturating_sub(before) as f64 / nodes as f64
         );
+        let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
         eprintln!(
             "Peak allocation: {} bytes ({:.1} KB)",
-            PEAK.load(Ordering::SeqCst),
-            PEAK.load(Ordering::SeqCst) as f64 / 1024.0
+            peak,
+            peak as f64 / 1024.0
         );
         eprintln!("================================================\n");
         std::hint::black_box(tree);

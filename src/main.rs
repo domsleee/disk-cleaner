@@ -1861,7 +1861,7 @@ impl eframe::App for App {
                                         card_rect,
                                         6.0,
                                         egui::Stroke::new(
-                                            1.5,
+                                            1.5_f32,
                                             egui::Color32::from_rgb(52, 152, 219),
                                         ),
                                         egui::StrokeKind::Inside,

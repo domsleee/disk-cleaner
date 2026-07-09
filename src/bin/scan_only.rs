@@ -33,6 +33,8 @@ fn main() {
         fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
         seen_inodes: Default::default(),
+        mft_used: AtomicBool::new(false),
+        mft_elevation_hint: AtomicBool::new(false),
     });
 
     let scan_start = Instant::now();

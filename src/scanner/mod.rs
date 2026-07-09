@@ -2,10 +2,15 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-/// Raw NTFS `$MFT` reader and index (prototype fast path, #89). Not wired
-/// into `scan_directory` yet — consumed by the `ntfs_*` probe binaries, so
-/// it is gated with them behind `internal-tools` until integration.
-#[cfg(all(target_os = "windows", feature = "internal-tools"))]
+/// Raw NTFS `$MFT` reader and index — the fast path for whole-volume scans
+/// when the process is elevated. Falls back to the bulk directory walker for
+/// everything else. Also consumed by the `ntfs_*` probe binaries.
+///
+/// `allow(dead_code)`: the app binary re-declares modules directly (`mod`
+/// in main.rs), and the probe-only APIs are unused there; they're consumed
+/// by the `ntfs_*` bins through the library target.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
 pub mod windows_ntfs;
 
 use std::collections::HashSet;
@@ -264,6 +269,13 @@ pub struct ScanProgress {
     /// Hardlinked inodes already counted (dedup). See [`InodeSet`].
     /// Only read by the macOS/Windows bulk walkers; inert elsewhere.
     pub seen_inodes: InodeSet,
+    /// True when the scan used the raw NTFS MFT fast path (Windows,
+    /// whole-volume, elevated). Drives the post-scan status line.
+    pub mft_used: AtomicBool,
+    /// True when the scan root was a local NTFS volume root that the MFT
+    /// fast path could have handled, but the process lacked admin rights —
+    /// the UI shows a "run as administrator" hint.
+    pub mft_elevation_hint: AtomicBool,
 }
 
 #[cfg(target_os = "windows")]
@@ -524,20 +536,53 @@ fn scan_directory_inner(
             .map(|m| is_hidden_from_metadata(&root_name, &m))
             .unwrap_or_else(|_| root_name.starts_with('.'));
 
-        match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
-            windows::walk_dir_bulk(
-                root_dir,
-                root,
-                root_name.clone(),
-                root_hidden,
-                &progress,
-                &skip,
-            )
-        }) {
-            Ok(node) => node,
-            Err(err) => {
-                progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
-                walk_dir(root, &progress, &skip)
+        // Whole-volume scans on an elevated process go through the raw MFT
+        // (reads $MFT sequentially instead of per-directory syscalls; ~2.5-3x
+        // on a cold cache). Any failure falls back to the bulk walker; a
+        // cancelled MFT read returns an empty tree like the walkers do.
+        let mft_node = if windows_ntfs::should_use_mft_scan(root, &progress) {
+            match windows_ntfs::scan_volume_tree(root, &progress) {
+                Ok(node) => {
+                    progress.mft_used.store(true, Ordering::Relaxed);
+                    Some(node)
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    progress.mft_used.store(true, Ordering::Relaxed);
+                    Some(FileNode::Dir(Box::new(DirNode {
+                        name: root_name.clone(),
+                        size: 0,
+                        children: Vec::new(),
+                        expanded: false,
+                        hidden: false,
+                    })))
+                }
+                Err(err) => {
+                    progress.record_windows_bulk_scan_fallback("raw MFT scan", root, &err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(node) = mft_node {
+            node
+        } else {
+            match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
+                windows::walk_dir_bulk(
+                    root_dir,
+                    root,
+                    root_name.clone(),
+                    root_hidden,
+                    &progress,
+                    &skip,
+                )
+            }) {
+                Ok(node) => node,
+                Err(err) => {
+                    progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
+                    walk_dir(root, &progress, &skip)
+                }
             }
         }
     };
@@ -716,6 +761,8 @@ mod tests {
             fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
             seen_inodes: Default::default(),
+            mft_used: AtomicBool::new(false),
+            mft_elevation_hint: AtomicBool::new(false),
         })
     }
 

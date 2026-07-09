@@ -36,6 +36,8 @@ fn progress() -> Arc<ScanProgress> {
         fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: std::sync::atomic::AtomicBool::new(false),
         seen_inodes: Default::default(),
+        mft_used: std::sync::atomic::AtomicBool::new(false),
+        mft_elevation_hint: std::sync::atomic::AtomicBool::new(false),
     })
 }
 

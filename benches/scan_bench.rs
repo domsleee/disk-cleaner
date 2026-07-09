@@ -139,6 +139,58 @@ fn per_unit(delta: usize, units: usize) -> f64 {
     delta as f64 / units.max(1) as f64
 }
 
+/// Peak resident memory of the process from the OS — the reality anchor for
+/// the requested-bytes numbers (which exclude allocator rounding/metadata,
+/// thread stacks, and code). Process-lifetime peak, so it also covers the
+/// criterion iterations that ran before this report.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    unsafe {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(
+                process: isize,
+                counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+            fn GetCurrentProcess() -> isize;
+        }
+        let mut counters: ProcessMemoryCounters = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        (K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) != 0)
+            .then_some(counters.peak_working_set_size as u64)
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return None;
+        }
+        // ru_maxrss is bytes on macOS, kilobytes on Linux.
+        let raw = ru.ru_maxrss as u64;
+        Some(if cfg!(target_os = "macos") {
+            raw
+        } else {
+            raw * 1024
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    None
+}
+
 fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
     // Warm the rayon pool and per-thread scanner buffers on a throwaway scan
     // so their one-time allocations don't land in the first measured row.
@@ -152,6 +204,7 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
         std::hint::black_box(scanner::scan_directory(warmup.path(), new_progress()));
     }
     reset_tracking();
+    let baseline = ALLOCATED.load(Ordering::SeqCst);
 
     let progress = new_progress();
     let (mut tree, tree_delta, tree_peak) =
@@ -287,6 +340,26 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
     drop(treemap_cache);
 
     eprintln!("    text cache                | skipped by default (search UI currently hidden)");
+
+    // Residual check (rust-analyzer style): what's still retained now vs the
+    // itemized survivors (tree + category stats; rows/caches were dropped).
+    // Nonzero residual = allocations the breakdown doesn't attribute, e.g.
+    // the progress struct or stray thread-local growth.
+    let retained_total = ALLOCATED.load(Ordering::SeqCst).saturating_sub(baseline);
+    let itemized = tree_delta + stats_delta;
+    eprintln!(
+        "    retained total {} | itemized {} | unaccounted {}",
+        bytesize::ByteSize::b(retained_total as u64),
+        bytesize::ByteSize::b(itemized as u64),
+        bytesize::ByteSize::b(retained_total.saturating_sub(itemized) as u64),
+    );
+    if let Some(rss) = peak_rss_bytes() {
+        eprintln!(
+            "    process peak RSS {} (OS-level; includes allocator overhead, stacks, code, and \
+             earlier bench iterations)",
+            bytesize::ByteSize::b(rss),
+        );
+    }
     std::hint::black_box((tree, stats));
 }
 

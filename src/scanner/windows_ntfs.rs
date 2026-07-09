@@ -9,11 +9,17 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::sync_channel;
 use std::thread;
+
+use crate::tree::{DirNode, FileLeaf, FileNode};
 use std::time::{Duration, Instant};
 
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice,
+    ParallelSliceMut,
+};
 use smallvec::SmallVec;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_JOURNAL_NOT_ACTIVE,
@@ -490,14 +496,14 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
 }
 
 pub fn build_raw_mft_index_for_path(path: &Path, limit: Option<usize>) -> io::Result<RawMftIndex> {
-    Ok(build_raw_mft_index_for_path_impl(path, limit, true)?.0)
+    Ok(build_raw_mft_index_for_path_impl(path, limit, true, None)?.0)
 }
 
 pub fn build_raw_mft_index_for_path_profiled(
     path: &Path,
     limit: Option<usize>,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
-    build_raw_mft_index_for_path_impl(path, limit, true)
+    build_raw_mft_index_for_path_impl(path, limit, true, None)
 }
 
 pub fn build_raw_mft_index_for_path_profiled_with_preference(
@@ -505,13 +511,23 @@ pub fn build_raw_mft_index_for_path_profiled_with_preference(
     limit: Option<usize>,
     prefer_volume: bool,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
-    build_raw_mft_index_for_path_impl(path, limit, prefer_volume)
+    build_raw_mft_index_for_path_impl(path, limit, prefer_volume, None)
+}
+
+/// Index build for a real scan: overlapped volume reads with cancellation
+/// checks and a coarse progress ticker (records scanned) while reading.
+fn build_raw_mft_index_for_scan(
+    path: &Path,
+    progress: &super::ScanProgress,
+) -> io::Result<RawMftIndex> {
+    Ok(build_raw_mft_index_for_path_impl(path, None, true, Some(progress))?.0)
 }
 
 fn build_raw_mft_index_for_path_impl(
     path: &Path,
     limit: Option<usize>,
     prefer_volume: bool,
+    progress: Option<&super::ScanProgress>,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
     let start = Instant::now();
     let eligibility = ntfs_eligibility(path)?;
@@ -577,6 +593,7 @@ fn build_raw_mft_index_for_path_impl(
                 valid_len,
                 &mut raw,
                 &mut timings,
+                progress,
             )?;
         }
     } else {
@@ -590,6 +607,7 @@ fn build_raw_mft_index_for_path_impl(
             valid_len,
             &mut raw,
             &mut timings,
+            progress,
         )?;
     }
 
@@ -1029,7 +1047,7 @@ fn enable_backup_privilege() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut privileges = TOKEN_PRIVILEGES {
+    let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
@@ -1040,7 +1058,7 @@ fn enable_backup_privilege() -> io::Result<()> {
         AdjustTokenPrivileges(
             token.0,
             0,
-            &mut privileges,
+            &privileges,
             size_of::<TOKEN_PRIVILEGES>() as u32,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -1095,8 +1113,10 @@ impl OverlappedVolumeReadSlot {
         }
 
         let event = HandleGuard(event);
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event.0;
+        let overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..OVERLAPPED::default()
+        };
         Ok(Self {
             _event: event,
             overlapped,
@@ -1192,7 +1212,7 @@ impl Drop for SuspendedBackupPrivilege {
             AdjustTokenPrivileges(
                 token.0,
                 0,
-                &mut self.previous_state,
+                &self.previous_state,
                 size_of::<TOKEN_PRIVILEGES>() as u32,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -1222,7 +1242,7 @@ fn suspend_backup_privilege() -> io::Result<SuspendedBackupPrivilege> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut privileges = TOKEN_PRIVILEGES {
+    let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
@@ -1241,7 +1261,7 @@ fn suspend_backup_privilege() -> io::Result<SuspendedBackupPrivilege> {
         AdjustTokenPrivileges(
             token.0,
             0,
-            &mut privileges,
+            &privileges,
             size_of::<TOKEN_PRIVILEGES>() as u32,
             &mut previous_state,
             &mut previous_state_len,
@@ -1395,12 +1415,12 @@ impl RawMftIndexBuild {
 
         entry.file_names.extend(file_names);
 
-        if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size) {
-            if entry.logical_size.is_none() || (from_owner && !entry.size_from_owner) {
-                entry.logical_size = Some(logical_size);
-                entry.allocated_size = Some(allocated_size);
-                entry.size_from_owner = from_owner;
-            }
+        if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size)
+            && (entry.logical_size.is_none() || (from_owner && !entry.size_from_owner))
+        {
+            entry.logical_size = Some(logical_size);
+            entry.allocated_size = Some(allocated_size);
+            entry.size_from_owner = from_owner;
         }
     }
 
@@ -1816,25 +1836,24 @@ fn materialized_file_names(
 
     let mut materialized: ParsedFileNameList = SmallVec::with_capacity(file_names.len());
     for candidate in file_names.into_iter() {
-        if let Some(existing) = materialized.last_mut() {
-            if existing.parent_record_number == candidate.parent_record_number
-                && existing.name == candidate.name
-            {
-                if candidate.namespace_rank > existing.namespace_rank {
-                    *existing = candidate;
-                }
-                continue;
+        if let Some(existing) = materialized.last_mut()
+            && existing.parent_record_number == candidate.parent_record_number
+            && existing.name == candidate.name
+        {
+            if candidate.namespace_rank > existing.namespace_rank {
+                *existing = candidate;
             }
+            continue;
         }
         if candidate.namespace_rank > 1 {
             materialized.push(candidate);
         }
     }
 
-    if materialized.is_empty() {
-        if let Some(best) = fallback_best {
-            materialized.push(best);
-        }
+    if materialized.is_empty()
+        && let Some(best) = fallback_best
+    {
+        materialized.push(best);
     }
 
     if materialized.len() > max_names {
@@ -2332,6 +2351,7 @@ fn probe_raw_mft_via_volume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_raw_mft_index_via_volume(
     volume_device: &str,
     volume_handle: HANDLE,
@@ -2342,6 +2362,7 @@ fn build_raw_mft_index_via_volume(
     valid_len: u64,
     build: &mut RawMftIndexBuild,
     timings: &mut RawMftBuildTimings,
+    progress: Option<&super::ScanProgress>,
 ) -> io::Result<()> {
     let mut output_buf = vec![
         0u8;
@@ -2432,6 +2453,23 @@ fn build_raw_mft_index_via_volume(
                 timings,
             );
 
+            if let Some(p) = progress {
+                if p.cancelled.load(Ordering::Relaxed) {
+                    // The next chunk's read may already be queued; drain it
+                    // before returning so the kernel doesn't write into a
+                    // dropped buffer.
+                    if schedule_next {
+                        let _ = finish_overlapped_volume_read(&volume_file, &mut slots[next_slot]);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+                }
+                // Coarse ticker while the MFT read runs: records scanned is a
+                // slight overcount of files (free records included) but keeps
+                // the scanning screen moving through this single long phase.
+                p.file_count
+                    .store(build.summary.records_scanned, Ordering::Relaxed);
+            }
+
             pending = schedule_next;
             pending_slot = next_slot;
         }
@@ -2451,6 +2489,7 @@ fn build_raw_mft_index_via_volume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_raw_mft_index_read_chunk(
     buf: &mut [u8],
     read: usize,
@@ -2827,11 +2866,11 @@ fn query_sizes_from_file_record(
     })
 }
 
-fn query_file_record_bytes<'a>(
+fn query_file_record_bytes(
     volume_handle: HANDLE,
     file_reference_number: i64,
-    output_buf: &'a mut [u8],
-) -> io::Result<&'a [u8]> {
+    output_buf: &mut [u8],
+) -> io::Result<&[u8]> {
     let mut input = NTFS_FILE_RECORD_INPUT_BUFFER {
         FileReferenceNumber: file_reference_number,
     };
@@ -3027,7 +3066,7 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {
         value
     } else {
-        ((value + alignment - 1) / alignment) * alignment
+        value.div_ceil(alignment) * alignment
     }
 }
 
@@ -3086,7 +3125,7 @@ unsafe fn parse_v3_record(record: &[u8]) -> io::Result<ParsedRecord> {
 }
 
 fn wide_name_from_record(record: &[u8], offset: usize, len_bytes: usize) -> io::Result<String> {
-    if len_bytes % size_of::<u16>() != 0 || offset + len_bytes > record.len() {
+    if !len_bytes.is_multiple_of(size_of::<u16>()) || offset + len_bytes > record.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid USN filename range",
@@ -3198,9 +3237,297 @@ fn trim_wide_nul(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+// ---------------------------------------------------------------------------
+// Scan integration: raw MFT index -> scanner FileNode tree
+// ---------------------------------------------------------------------------
+
+/// Decide whether a scan of `root` should use the raw-MFT fast path: the
+/// volume root of a local fixed NTFS drive whose raw device we can open
+/// (i.e. the process is elevated). When elevation is the only blocker, sets
+/// `mft_elevation_hint` on the progress so the UI can suggest running as
+/// administrator. Never errors — any doubt means "use the directory walker".
+pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> bool {
+    let Ok(eligibility) = ntfs_eligibility(root) else {
+        return false;
+    };
+    if !eligibility.is_ntfs() || !eligibility.is_local_fixed_drive() {
+        return false;
+    }
+    // Only whole-volume scans: the MFT covers the entire volume, so scanning
+    // a subtree through it would read all of $MFT to keep a fraction.
+    let is_volume_root = match (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(&eligibility.volume_root),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !is_volume_root {
+        return false;
+    }
+    if eligibility.can_open_volume {
+        return true;
+    }
+    if eligibility.needs_elevation() {
+        progress.mft_elevation_hint.store(true, Ordering::Relaxed);
+    }
+    false
+}
+
+/// Scan a whole NTFS volume via the raw MFT and build the scanner tree.
+///
+/// Hardlinked files (one MFT record materialized under several names) are
+/// placed under every parent but their size counts once; every link carries
+/// the hard-link mark — unlike directory enumeration, the MFT knows all the
+/// names of a record (see #117, whose bulk-walker semantics can only mark
+/// the second and later sightings).
+pub fn scan_volume_tree(root: &Path, progress: &super::ScanProgress) -> io::Result<FileNode> {
+    let index = build_raw_mft_index_for_scan(root, progress)?;
+    let visibility = collect_win32_root_visibility(root)?;
+    Ok(build_tree_from_index(&index, root, &visibility, progress))
+}
+
+const ENTRY_HARD_LINK: u8 = 1;
+const ENTRY_COUNTS_SIZE: u8 = 2;
+
+fn build_tree_from_index(
+    index: &RawMftIndex,
+    root: &Path,
+    visibility: &HashMap<String, RootVisibilityEntry>,
+    progress: &super::ScanProgress,
+) -> FileNode {
+    let entries = &index.entries;
+
+    // Hardlink flags. All names of a record are materialized consecutively,
+    // so runs of equal record numbers identify the links: the first name in
+    // a run carries the size, the rest count zero, and every name in the run
+    // gets the hard-link mark.
+    let mut flags = vec![ENTRY_COUNTS_SIZE; entries.len()];
+    let mut i = 0;
+    while i < entries.len() {
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].record_number == entries[i].record_number {
+            j += 1;
+        }
+        if j - i > 1 && !entries[i].is_directory {
+            for (k, flag) in flags[i..j].iter_mut().enumerate() {
+                *flag = ENTRY_HARD_LINK | if k == 0 { ENTRY_COUNTS_SIZE } else { 0 };
+            }
+        }
+        i = j;
+    }
+
+    // Parent record -> child entry indices.
+    let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.record_number == root_record {
+            continue; // the root directory's own entry parents itself
+        }
+        children
+            .entry(entry.parent_record_number)
+            .or_default()
+            .push(idx as u32);
+    }
+
+    // Corrupt or torn records could produce a parent cycle; the visited
+    // bitmap makes the walk terminate regardless (a directory's children are
+    // emitted only the first time the directory is reached). Atomic so the
+    // parallel subtree builds can share it.
+    let max_record = entries
+        .iter()
+        .map(|e| e.record_number.max(e.parent_record_number))
+        .max()
+        .unwrap_or(0) as usize;
+    let visited: Vec<std::sync::atomic::AtomicBool> = (0..=max_record)
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
+    visited[root_record as usize].store(true, Ordering::Relaxed);
+
+    let root_children: Vec<FileNode> = children
+        .get(&root_record)
+        .map(|kids| {
+            kids.par_iter()
+                .filter(|&&idx| {
+                    // Mirror the Win32 view of the root: skip metafiles and
+                    // entries a normal directory listing doesn't show.
+                    visibility.contains_key(&entries[idx as usize].name.to_lowercase())
+                })
+                .map(|&idx| build_tree_node(entries, &children, &flags, idx, &visited))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let size = root_children.iter().map(|c| c.size()).sum();
+    let file_count: u64 = root_children.iter().map(count_files).sum();
+    progress.file_count.store(file_count, Ordering::Relaxed);
+    progress.total_size.store(size, Ordering::Relaxed);
+
+    FileNode::Dir(Box::new(DirNode {
+        name: root.to_string_lossy().into_owned().into_boxed_str(),
+        size,
+        children: root_children,
+        expanded: false,
+        hidden: false,
+    }))
+}
+
+/// Fan out subtree construction when a directory has many children; below
+/// the threshold a plain loop avoids rayon task overhead (same idea as the
+/// walkers' PAR_THRESHOLD).
+const TREE_PAR_THRESHOLD: usize = 64;
+
+fn build_tree_node(
+    entries: &[RawMftIndexEntry],
+    children_map: &HashMap<u32, Vec<u32>>,
+    flags: &[u8],
+    idx: u32,
+    visited: &[std::sync::atomic::AtomicBool],
+) -> FileNode {
+    let entry = &entries[idx as usize];
+    let hidden = entry.name.starts_with('.') || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+
+    if !entry.is_directory {
+        let flag = flags[idx as usize];
+        // Allocated (on-disk) size, matching the directory walkers (#99).
+        let size = if flag & ENTRY_COUNTS_SIZE != 0 {
+            entry.subtree_allocated_size
+        } else {
+            0
+        };
+        let mut leaf = FileLeaf::new(entry.name.clone(), size, hidden);
+        leaf.set_hard_link(flag & ENTRY_HARD_LINK != 0);
+        return FileNode::File(leaf);
+    }
+
+    let first_visit = !visited[entry.record_number as usize].swap(true, Ordering::Relaxed);
+    let child_nodes: Vec<FileNode> = if first_visit {
+        match children_map.get(&entry.record_number) {
+            Some(kids) if kids.len() >= TREE_PAR_THRESHOLD => kids
+                .par_iter()
+                .map(|&k| build_tree_node(entries, children_map, flags, k, visited))
+                .collect(),
+            Some(kids) => kids
+                .iter()
+                .map(|&k| build_tree_node(entries, children_map, flags, k, visited))
+                .collect(),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let size = child_nodes.iter().map(|c| c.size()).sum();
+
+    FileNode::Dir(Box::new(DirNode {
+        name: entry.name.clone(),
+        size,
+        children: child_nodes,
+        expanded: false,
+        hidden,
+    }))
+}
+
+fn count_files(node: &FileNode) -> u64 {
+    match node {
+        FileNode::File(_) => 1,
+        FileNode::Dir(d) => d.children.iter().map(count_files).sum(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(
+        record: u32,
+        parent: u32,
+        name: &str,
+        is_directory: bool,
+        allocated: u64,
+    ) -> RawMftIndexEntry {
+        RawMftIndexEntry {
+            record_number: record,
+            parent_record_number: parent,
+            attributes: 0,
+            name: name.into(),
+            is_directory,
+            subtree_logical_size: allocated,
+            subtree_allocated_size: allocated,
+            subtree_file_count: u32::from(!is_directory),
+            subtree_dir_count: u32::from(is_directory),
+        }
+    }
+
+    fn test_progress() -> super::super::ScanProgress {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        super::super::ScanProgress {
+            file_count: AtomicU64::new(0),
+            total_size: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
+            access_denied_fallback_count: AtomicU64::new(0),
+            bulk_scan_fallback_count: AtomicU64::new(0),
+            fallback_details: std::sync::Mutex::new(Vec::new()),
+            cancelled: AtomicBool::new(false),
+            seen_inodes: Default::default(),
+            mft_used: AtomicBool::new(false),
+            mft_elevation_hint: AtomicBool::new(false),
+        }
+    }
+
+    fn count_marked(node: &FileNode) -> usize {
+        usize::from(node.is_hard_link()) + node.children().iter().map(count_marked).sum::<usize>()
+    }
+
+    #[test]
+    fn tree_from_index_dedups_hardlinks_and_filters_root() {
+        let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+        let entries = vec![
+            test_entry(40, root_record, "a", true, 0),
+            test_entry(41, 40, "f1", false, 100),
+            // One record, two names (a hardlink) — materialized consecutively.
+            test_entry(42, root_record, "h1", false, 50),
+            test_entry(42, 40, "h2", false, 50),
+            // Root entry not visible in the Win32 listing (e.g. a metafile).
+            test_entry(43, root_record, "$secret", false, 999),
+        ];
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries,
+        };
+        let mut visibility = HashMap::new();
+        visibility.insert("a".to_string(), RootVisibilityEntry { can_recurse: true });
+        visibility.insert("h1".to_string(), RootVisibilityEntry { can_recurse: false });
+
+        let progress = test_progress();
+        let tree = build_tree_from_index(&index, Path::new(r"C:\"), &visibility, &progress);
+
+        // Hardlinked record counts once; the filtered metafile not at all.
+        assert_eq!(tree.size(), 150, "100 (f1) + 50 (hardlink once)");
+        assert_eq!(count_marked(&tree), 2, "both hardlink names marked");
+        assert_eq!(
+            progress
+                .file_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "f1 + two hardlink names; $secret filtered"
+        );
+        assert_eq!(
+            progress
+                .total_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            150
+        );
+
+        // Tree shape: root -> [a (dir), h1]; a -> [f1, h2].
+        let a = tree
+            .children()
+            .iter()
+            .find(|c| c.name() == "a")
+            .expect("dir a present");
+        assert_eq!(a.children().len(), 2);
+        assert!(tree.children().iter().any(|c| c.name() == "h1"));
+        assert!(!tree.children().iter().any(|c| c.name() == "$secret"));
+    }
 
     fn file_name(
         parent_record_number: u64,

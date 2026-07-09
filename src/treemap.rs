@@ -890,7 +890,7 @@ fn paint_cached_leaf(
         2.0,
         // Fade the border with alpha² so it doesn't pop as a bright grid
         // ahead of the fills during the zoom transition.
-        egui::Stroke::new(1.0, border_color(30, alpha)),
+        egui::Stroke::new(1.0_f32, border_color(30, alpha)),
         egui::StrokeKind::Inside,
     );
 
@@ -898,7 +898,7 @@ fn paint_cached_leaf(
         painter.rect_stroke(
             tile.rect,
             2.0,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
     }
@@ -937,7 +937,7 @@ fn paint_other_bucket(
         rect,
         2.0,
         egui::Stroke::new(
-            1.0,
+            1.0_f32,
             apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha),
         ),
         egui::StrokeKind::Inside,
@@ -1005,7 +1005,7 @@ fn paint_cached_directory(
             tile_painter.rect_stroke(
                 cr,
                 1.0,
-                egui::Stroke::new(1.0, border_color(24, alpha)),
+                egui::Stroke::new(1.0_f32, border_color(24, alpha)),
                 egui::StrokeKind::Inside,
             );
 
@@ -1015,7 +1015,7 @@ fn paint_cached_directory(
                     tile_painter.rect_stroke(
                         cr,
                         1.0,
-                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -1040,14 +1040,14 @@ fn paint_cached_directory(
     painter.rect_stroke(
         rect,
         2.0,
-        egui::Stroke::new(1.0, border_color(30, alpha)),
+        egui::Stroke::new(1.0_f32, border_color(30, alpha)),
         egui::StrokeKind::Inside,
     );
     if is_focused {
         painter.rect_stroke(
             rect,
             2.0,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
         );
     }

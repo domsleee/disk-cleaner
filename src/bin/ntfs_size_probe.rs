@@ -75,7 +75,9 @@ fn main() {
     let file_record_first_error = if file_record_sizes.iter().all(|result| result.is_none()) {
         sampled_records
             .first()
-            .and_then(|sample| windows_ntfs::query_size_from_file_record_for_sample(&path, sample).err())
+            .and_then(|sample| {
+                windows_ntfs::query_size_from_file_record_for_sample(&path, sample).err()
+            })
             .map(|err| format!("{err:?}"))
     } else {
         None
@@ -175,12 +177,18 @@ fn main() {
     println!("Resolved paths   : {resolved_count}");
     println!("Path resolve     : {:.3?}", resolve_elapsed);
     if resolved_count > 0 {
-        println!("Path avg/file    : {:.3?}", resolve_elapsed / resolved_count as u32);
+        println!(
+            "Path avg/file    : {:.3?}",
+            resolve_elapsed / resolved_count as u32
+        );
     }
     println!("Metadata checks  : {compared}");
     println!("Metadata elapsed : {:.3?}", metadata_elapsed);
     if compared > 0 {
-        println!("Metadata avg/file: {:.3?}", metadata_elapsed / compared as u32);
+        println!(
+            "Metadata avg/file: {:.3?}",
+            metadata_elapsed / compared as u32
+        );
     }
     println!("Metadata errors  : {metadata_errors}");
     println!("Size mismatches  : {}", metadata_mismatches.len());

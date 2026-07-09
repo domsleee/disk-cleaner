@@ -56,7 +56,10 @@ fn main() {
     println!("In-use records       : {}", summary.in_use_records);
     println!("Directories          : {}", summary.directories);
     println!("Files                : {}", summary.files);
-    println!("No default size      : {}", summary.entries_without_data_size);
+    println!(
+        "No default size      : {}",
+        summary.entries_without_data_size
+    );
     println!("No size files        : {}", summary.files_without_data_size);
     println!("No size dirs         : {}", summary.dirs_without_data_size);
     println!("Hidden               : {}", summary.hidden);

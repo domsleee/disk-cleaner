@@ -91,9 +91,18 @@ fn main() {
     println!("Files                : {}", summary.total_file_entries);
     println!("Multi-name entries   : {}", summary.multi_name_entries);
     println!("Extra names          : {}", summary.extra_primary_names);
-    println!("Extra logical names  : {}", summary.extra_primary_name_logical_size);
-    println!("Extra alloc names    : {}", summary.extra_primary_name_allocated_size);
-    println!("No default size      : {}", summary.entries_without_data_size);
+    println!(
+        "Extra logical names  : {}",
+        summary.extra_primary_name_logical_size
+    );
+    println!(
+        "Extra alloc names    : {}",
+        summary.extra_primary_name_allocated_size
+    );
+    println!(
+        "No default size      : {}",
+        summary.entries_without_data_size
+    );
     println!("No size files        : {}", summary.files_without_data_size);
     println!("No size dirs         : {}", summary.dirs_without_data_size);
     println!("Total logical        : {}", summary.total_logical_size);

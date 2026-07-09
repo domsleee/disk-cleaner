@@ -471,6 +471,8 @@ impl Default for App {
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
                 seen_inodes: Default::default(),
+                mft_used: false.into(),
+                mft_elevation_hint: false.into(),
             }),
             receiver: None,
             error: None,
@@ -600,6 +602,8 @@ impl App {
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
             seen_inodes: Default::default(),
+            mft_used: false.into(),
+            mft_elevation_hint: false.into(),
         });
         self.scan_progress = progress.clone();
 
@@ -1591,6 +1595,30 @@ impl eframe::App for App {
                                     .small()
                                     .weak(),
                             );
+                            ui.separator();
+                        }
+
+                        // NTFS MFT fast-path status: say when it carried the
+                        // scan, or how to unlock it when admin rights are the
+                        // only thing missing.
+                        if self.scan_progress.mft_used.load(Ordering::Relaxed) {
+                            ui.label(egui::RichText::new("⚡ MFT fast scan").small().weak())
+                                .on_hover_text(
+                                    "Scanned via the raw NTFS MFT: the volume's file table is \
+                                     read sequentially instead of walking every directory.",
+                                );
+                            ui.separator();
+                        } else if self
+                            .scan_progress
+                            .mft_elevation_hint
+                            .load(Ordering::Relaxed)
+                        {
+                            ui.label(egui::RichText::new("💡 admin = faster").small().weak())
+                                .on_hover_text(
+                                    "Run as administrator to enable the NTFS fast scan for \
+                                     whole-drive scans — typically 2-3x faster when the disk \
+                                     cache is cold.",
+                                );
                             ui.separator();
                         }
 

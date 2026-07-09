@@ -600,6 +600,7 @@ dependencies = [
  "rayon",
  "rfd",
  "serde_json",
+ "smallvec",
  "tempfile",
  "trash",
  "windows-sys 0.61.2",

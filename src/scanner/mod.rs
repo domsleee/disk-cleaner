@@ -2,6 +2,11 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+/// Raw NTFS `$MFT` reader and index (prototype fast path, #89). Not wired
+/// into `scan_directory` yet — consumed by the `ntfs_*` probe binaries, so
+/// it is gated with them behind `internal-tools` until integration.
+#[cfg(all(target_os = "windows", feature = "internal-tools"))]
+pub mod windows_ntfs;
 
 use std::collections::HashSet;
 #[cfg(target_os = "windows")]

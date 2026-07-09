@@ -418,6 +418,12 @@ struct App {
     /// Cached visible row list for rendering; rebuilt when dirty.
     cached_rows: Vec<ui::CachedRow>,
     rows_dirty: bool,
+    /// Memoized match caches, keyed by the filter they were built for.
+    /// `NodeMatchSet` keys node addresses, so these are only valid while the
+    /// tree is structurally unchanged — invalidated on scan start/completion
+    /// and node removal (see `invalidate_match_memos`).
+    cat_cache_memo: Option<(categories::FileCategory, ui::NodeMatchSet)>,
+    text_cache_memo: Option<(String, ui::NodeMatchSet)>,
     /// Cached treemap layout; rebuilt when treemap_dirty.
     treemap_cache: Option<treemap::TreemapCache>,
     treemap_dirty: bool,
@@ -497,6 +503,8 @@ impl Default for App {
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
             rows_dirty: true,
+            cat_cache_memo: None,
+            text_cache_memo: None,
             treemap_cache: None,
             treemap_dirty: true,
             selected_paths: HashSet::new(),
@@ -576,6 +584,7 @@ impl App {
         self.scanning = true;
         self.error = None;
         self.tree = None;
+        self.invalidate_match_memos();
         self.selected_paths.clear();
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
@@ -617,21 +626,37 @@ impl App {
             return;
         }
 
-        let text_cache = if !self.applied_search.is_empty() {
-            self.tree
-                .as_ref()
-                .map(|t| ui::build_text_match_cache(t, &self.applied_search))
+        // Reuse memoized match caches when the filter is unchanged — building
+        // one is a full-tree walk, and refreshes fire on every expand/collapse.
+        // Safe because the memos are invalidated whenever the tree changes.
+        if !self.applied_search.is_empty() {
+            if let Some(tree) = self.tree.as_ref()
+                && self
+                    .text_cache_memo
+                    .as_ref()
+                    .is_none_or(|(q, _)| q != &self.applied_search)
+            {
+                self.text_cache_memo = Some((
+                    self.applied_search.clone(),
+                    ui::build_text_match_cache(tree, &self.applied_search),
+                ));
+            }
         } else {
-            None
-        };
+            self.text_cache_memo = None;
+        }
 
-        let cat_cache = if let Some(cat) = self.category_filter {
-            self.tree
-                .as_ref()
-                .map(|t| ui::build_category_match_cache(t, cat))
+        if let Some(cat) = self.category_filter {
+            if let Some(tree) = self.tree.as_ref()
+                && self.cat_cache_memo.as_ref().is_none_or(|(c, _)| *c != cat)
+            {
+                self.cat_cache_memo = Some((cat, ui::build_category_match_cache(tree, cat)));
+            }
         } else {
-            None
-        };
+            self.cat_cache_memo = None;
+        }
+
+        let text_cache = self.text_cache_memo.as_ref().map(|(_, s)| s);
+        let cat_cache = self.cat_cache_memo.as_ref().map(|(_, s)| s);
 
         // Drop old rows before building new ones to avoid holding two full
         // Vec<CachedRow> in memory simultaneously (OOM risk on large trees).
@@ -643,12 +668,20 @@ impl App {
                 &self.applied_search,
                 self.category_filter,
                 self.show_hidden,
-                text_cache.as_ref(),
-                cat_cache.as_ref(),
+                text_cache,
+                cat_cache,
                 Some(&self.expanded_file_groups),
             );
         }
         self.rows_dirty = false;
+    }
+
+    /// Drop memoized match caches. Must be called whenever the tree is
+    /// replaced or structurally mutated: the sets key node addresses, so a
+    /// stale set would give wrong (or address-reused) filter results.
+    fn invalidate_match_memos(&mut self) {
+        self.cat_cache_memo = None;
+        self.text_cache_memo = None;
     }
 
     /// Mark both tree-view and treemap caches as needing rebuild.
@@ -726,6 +759,9 @@ impl App {
                 } else {
                     if let Some(ref mut tree) = self.tree {
                         ui::remove_node(tree, &path);
+                        // Removal shifts sibling nodes in their parent Vec, so
+                        // memoized address-keyed match sets are now stale.
+                        self.invalidate_match_memos();
                         self.mark_dirty();
                     }
                     deleted_paths.push(path);
@@ -884,6 +920,7 @@ impl eframe::App for App {
         {
             self.category_stats = Some(result.stats);
             self.tree = Some(result.tree);
+            self.invalidate_match_memos();
             if let Some(ref mut t) = self.tree {
                 tree::auto_expand(t, 0, 2);
             }

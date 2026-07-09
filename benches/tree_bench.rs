@@ -532,6 +532,15 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
             },
         );
 
+        // Cost of building the match cache itself — this is what the app's
+        // per-refresh memoization (cat_cache_memo) skips on every
+        // expand/collapse while a category filter is active.
+        group.bench_with_input(
+            BenchmarkId::new("build_category_cache", n),
+            &tree,
+            |b, t| b.iter(|| ui::build_category_match_cache(t, categories::FileCategory::Video)),
+        );
+
         let cat_cache = ui::build_category_match_cache(&tree, categories::FileCategory::Video);
         group.bench_with_input(
             BenchmarkId::new("category_video_cached", n),

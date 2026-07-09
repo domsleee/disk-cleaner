@@ -2249,6 +2249,7 @@ fn probe_raw_mft_via_volume(
     let mft_record = query_file_record_bytes(volume_handle, 0, &mut output_buf)?;
     let data_runs = parse_nonresident_data_runs(mft_record)?;
     let bytes_per_cluster = volume_data.BytesPerCluster as u64;
+    ensure_runs_cover_valid_len(&data_runs, bytes_per_cluster, summary.mft_valid_data_length)?;
     let mut volume_file = open_raw_volume_file(volume_device)?;
     let mut next_record_number = 0u64;
     let mut bytes_remaining = summary.mft_valid_data_length;
@@ -2350,6 +2351,7 @@ fn build_raw_mft_index_via_volume(
     let mft_record = query_file_record_bytes(volume_handle, 0, &mut output_buf)?;
     let data_runs = parse_nonresident_data_runs(mft_record)?;
     let bytes_per_cluster = volume_data.BytesPerCluster as u64;
+    ensure_runs_cover_valid_len(&data_runs, bytes_per_cluster, valid_len)?;
     let volume_file = open_raw_volume_file_overlapped(volume_device)?;
     let mut next_record_number = 0u64;
     let mut bytes_remaining = valid_len;
@@ -2432,6 +2434,17 @@ fn build_raw_mft_index_via_volume(
 
             pending = schedule_next;
             pending_slot = next_slot;
+        }
+
+        // The next chunk's read is queued before the current chunk is
+        // consumed (that's the pipelining), so hitting `target_records`
+        // mid-chunk can exit the loop with an I/O still in flight. Drain it —
+        // dropping the OVERLAPPED and buffer while the kernel owns them would
+        // be a use-after-free.
+        if pending && (next_record_number as usize) >= target_records {
+            let read_start = Instant::now();
+            let _ = finish_overlapped_volume_read(&volume_file, &mut slots[pending_slot])?;
+            timings.read += read_start.elapsed();
         }
     }
 
@@ -2654,6 +2667,32 @@ fn apply_update_sequence_fixup_generic(
 struct DataRun {
     start_lcn: i64,
     cluster_len: u64,
+}
+
+/// The `$MFT` `$DATA` runlist parsed from base record 0 must cover the whole
+/// valid data length. On volumes where `$MFT` is fragmented enough to spill
+/// its runs into an attribute list, record 0 holds only the first extents —
+/// silently scanning just those would drop every later MFT record, so refuse
+/// and let callers fall back to the directory walker.
+fn ensure_runs_cover_valid_len(
+    data_runs: &[DataRun],
+    bytes_per_cluster: u64,
+    valid_len: u64,
+) -> io::Result<()> {
+    let covered: u64 = data_runs
+        .iter()
+        .map(|r| r.cluster_len.saturating_mul(bytes_per_cluster))
+        .sum();
+    if covered < valid_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "$MFT runlist from record 0 covers {covered} bytes but valid data length is \
+                 {valid_len}; $MFT likely uses an attribute list (unsupported)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_nonresident_data_runs(record: &[u8]) -> io::Result<Vec<DataRun>> {
@@ -3115,8 +3154,17 @@ fn volume_device_from_root(root: &Path) -> Option<String> {
     let s = root.as_os_str().to_string_lossy();
     let mut chars = s.chars();
     let drive = chars.next()?;
-    if chars.next()? != ':' {
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
         return None;
+    }
+    // Require a plain drive root ("X:" or "X:\"). GetVolumePathNameW can also
+    // return a mounted-folder volume root like "C:\Mount\vol\" — deriving
+    // "\\.\C:" from that would open the HOST drive's device and scan the
+    // wrong volume, so reject it (callers fall back to the directory walker).
+    match chars.next() {
+        None => {}
+        Some(sep) if (sep == '\\' || sep == '/') && chars.next().is_none() => {}
+        _ => return None,
     }
     Some(format!(r"\\.\{}:", drive.to_ascii_uppercase()))
 }

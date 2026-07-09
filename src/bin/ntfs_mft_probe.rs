@@ -1,9 +1,11 @@
-#![cfg(target_os = "windows")]
-
+#[cfg(target_os = "windows")]
 use disk_cleaner::scanner::windows_ntfs;
+#[cfg(target_os = "windows")]
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::time::Instant;
 
+#[cfg(target_os = "windows")]
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut limit: Option<usize> = None;

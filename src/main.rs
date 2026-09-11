@@ -2,6 +2,7 @@
 
 mod app_icon;
 mod categories;
+mod category_worker;
 mod deleter;
 mod icons;
 mod scanner;
@@ -166,11 +167,9 @@ fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-/// Result from the background scan thread — includes pre-computed stats
-/// so they don't block the UI thread.
+/// Publish the tree as soon as scanning finishes; category totals follow separately.
 struct ScanResult {
     tree: tree::FileNode,
-    stats: categories::CategoryStats,
 }
 use tree::FileNode;
 use treemap::TreemapAction;
@@ -379,8 +378,17 @@ struct PendingBatchDelete {
     targets: Vec<PathBuf>,
 }
 
+enum TreeEdit {
+    Toggle(PathBuf),
+    Expand(PathBuf, bool),
+    Remove(PathBuf),
+}
+
 struct App {
-    tree: Option<FileNode>,
+    tree: Option<Arc<FileNode>>,
+    category_worker: category_worker::CategoryWorker,
+    category_failed: bool,
+    pending_tree_edits: Vec<TreeEdit>,
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
@@ -460,6 +468,9 @@ impl Default for App {
         let (last_scan_path, show_hidden) = load_config();
         Self {
             tree: None,
+            category_worker: Default::default(),
+            category_failed: false,
+            pending_tree_edits: Vec::new(),
             scanning: false,
             scan_path: None,
             scan_progress: Arc::new(ScanProgress {
@@ -583,6 +594,10 @@ impl App {
         self.last_scan_path = Some(path.clone());
         self.scanning = true;
         self.error = None;
+        self.category_worker.cancel();
+        self.category_stats = None;
+        self.category_failed = false;
+        self.pending_tree_edits.clear();
         self.tree = None;
         self.invalidate_match_memos();
         self.selected_paths.clear();
@@ -615,10 +630,69 @@ impl App {
         self.scan_frame_times.clear();
 
         thread::spawn(move || {
-            let tree = scanner::scan_directory(&path, progress);
-            let stats = categories::compute_stats(&tree);
-            let _ = tx.send(ScanResult { tree, stats });
+            let mut tree = scanner::scan_directory(&path, progress);
+            tree::auto_expand(&mut tree, 0, 2);
+            let _ = tx.send(ScanResult { tree });
         });
+    }
+
+    fn edit_tree(&mut self, edit: TreeEdit) {
+        if self.tree.is_none() {
+            return;
+        }
+        self.pending_tree_edits.push(edit);
+        // Never clone the scan or wait for a reader on the UI thread.
+        self.category_worker.cancel();
+        self.apply_tree_edits();
+    }
+
+    fn apply_tree_edits(&mut self) {
+        if self.pending_tree_edits.is_empty() {
+            return;
+        }
+        let Some(tree) = self.tree.as_mut().and_then(Arc::get_mut) else {
+            return;
+        };
+        let mut removed = false;
+        for edit in self.pending_tree_edits.drain(..) {
+            match edit {
+                TreeEdit::Toggle(path) => {
+                    ui::toggle_expand(tree, &path);
+                }
+                TreeEdit::Expand(path, expanded) => {
+                    ui::set_expanded(tree, &path, expanded);
+                }
+                TreeEdit::Remove(path) => {
+                    removed |= ui::remove_node(tree, &path).is_some();
+                }
+            }
+        }
+        if removed {
+            self.category_stats = None;
+            self.category_failed = false;
+            self.invalidate_match_memos();
+        }
+        self.mark_dirty();
+    }
+
+    fn poll_categories(&mut self) {
+        match self.category_worker.poll() {
+            category_worker::Poll::Complete(Some(stats)) => self.category_stats = Some(stats),
+            category_worker::Poll::Failed => self.category_failed = true,
+            _ => {}
+        }
+        self.apply_tree_edits();
+    }
+
+    fn start_categories(&mut self) {
+        if self.category_stats.is_none()
+            && !self.category_failed
+            && !self.category_worker.is_active()
+            && self.pending_tree_edits.is_empty()
+            && let Some(tree) = &self.tree
+        {
+            self.category_worker.start(tree.clone());
+        }
     }
 
     fn rebuild_rows_if_dirty(&mut self) {
@@ -700,7 +774,7 @@ impl App {
     fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
         resolve_deletion_targets(
             &self.cached_rows,
-            self.tree.as_ref(),
+            self.tree.as_deref(),
             path,
             self.show_hidden,
         )
@@ -710,7 +784,7 @@ impl App {
     fn batch_targets(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
         resolve_batch_targets(
             &self.cached_rows,
-            self.tree.as_ref(),
+            self.tree.as_deref(),
             paths,
             self.show_hidden,
         )
@@ -757,12 +831,8 @@ impl App {
                 if let Some(msg) = err {
                     self.error = Some(format!("Delete failed: {msg}"));
                 } else {
-                    if let Some(ref mut tree) = self.tree {
-                        ui::remove_node(tree, &path);
-                        // Removal shifts sibling nodes in their parent Vec, so
-                        // memoized address-keyed match sets are now stale.
-                        self.invalidate_match_memos();
-                        self.mark_dirty();
+                    if self.tree.is_some() {
+                        self.edit_tree(TreeEdit::Remove(path.clone()));
                     }
                     deleted_paths.push(path);
                 }
@@ -900,6 +970,7 @@ impl eframe::App for App {
         }
 
         self.keep_titlebar_dark(ctx);
+        self.poll_categories();
 
         // Apply debounced search query after 150ms of no typing
         if let Some(changed_at) = self.search_changed_at {
@@ -918,12 +989,10 @@ impl eframe::App for App {
         if let Some(ref rx) = self.receiver
             && let Ok(result) = rx.try_recv()
         {
-            self.category_stats = Some(result.stats);
-            self.tree = Some(result.tree);
+            self.category_stats = None;
+            self.category_failed = false;
+            self.tree = Some(Arc::new(result.tree));
             self.invalidate_match_memos();
-            if let Some(ref mut t) = self.tree {
-                tree::auto_expand(t, 0, 2);
-            }
             self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
             self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
             self.last_scan_fallback_count =
@@ -1039,6 +1108,13 @@ impl eframe::App for App {
                         }
                         self.screenshot_state = ScreenshotState::WaitFrames(5);
                     }
+                }
+                ScreenshotState::WaitFrames(_)
+                    if self.show_categories
+                        && self.category_stats.is_none()
+                        && !self.category_failed =>
+                {
+                    ctx.request_repaint_after(Duration::from_millis(16));
                 }
                 ScreenshotState::WaitFrames(0) => {
                     self.screenshot_state = ScreenshotState::Capturing;
@@ -1177,14 +1253,13 @@ impl eframe::App for App {
                             }
                         }
                     }
-                } else if let Some(ref mut tree) = self.tree
+                } else if let Some(ref tree) = self.tree
                     && let Some((is_dir, expanded, has_children)) =
                         ui::find_node_info(tree, focused)
                 {
                     if left {
                         if is_dir && expanded {
-                            ui::set_expanded(tree, focused, false);
-                            self.mark_dirty();
+                            self.edit_tree(TreeEdit::Expand(focused.clone(), false));
                         } else if let Some(parent) = ui::find_parent_path(tree, focused) {
                             self.focused_path = Some(parent);
                             self.selected_paths.clear();
@@ -1192,8 +1267,7 @@ impl eframe::App for App {
                         }
                     } else if right {
                         if is_dir && !expanded && has_children {
-                            ui::set_expanded(tree, focused, true);
-                            self.mark_dirty();
+                            self.edit_tree(TreeEdit::Expand(focused.clone(), true));
                         } else if is_dir && expanded {
                             let rows = &self.cached_rows;
                             if let Some(idx) = rows.iter().position(|r| &r.path == focused)
@@ -1217,10 +1291,7 @@ impl eframe::App for App {
                     )
                 });
                 if space {
-                    if let Some(ref mut tree) = self.tree {
-                        ui::toggle_expand(tree, focused);
-                        self.mark_dirty();
-                    }
+                    self.edit_tree(TreeEdit::Toggle(focused.clone()));
                 } else if shift_del {
                     self.confirm_delete = Some(self.pending_delete_for(focused));
                 } else if del {
@@ -1411,10 +1482,6 @@ impl eframe::App for App {
                                 if let Some(ref path) = self.last_scan_path {
                                     save_config(path, self.show_hidden);
                                 }
-                                // Recompute stats
-                                if let Some(ref tree) = self.tree {
-                                    self.category_stats = Some(categories::compute_stats(tree));
-                                }
                             }
                         }
 
@@ -1456,6 +1523,16 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.heading("File Types");
                     ui.add_space(4.0);
+                    if self.category_stats.is_none() {
+                        if self.category_failed {
+                            ui.label("Could not calculate file types.");
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Calculating…");
+                            });
+                        }
+                    }
 
                     if let Some(ref stats) = self.category_stats {
                         let total_size: u64 = stats.entries.iter().map(|e| e.1).sum();
@@ -2077,12 +2154,11 @@ impl eframe::App for App {
                         }
                     }
                     // Apply expand/collapse changes to tree
-                    if let Some(ref mut tree) = self.tree {
+                    if self.tree.is_some() {
                         for action in &actions {
                             match action {
                                 ui::TreeAction::ToggleExpand(path) => {
-                                    ui::toggle_expand(tree, path);
-                                    self.rows_dirty = true;
+                                    self.edit_tree(TreeEdit::Toggle(path.clone()));
                                     self.selected_paths.clear();
                                     self.selection_anchor = None;
                                 }
@@ -2229,6 +2305,11 @@ impl eframe::App for App {
                 });
         }
 
+        self.start_categories();
+        if self.category_worker.is_active() || !self.pending_tree_edits.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         // Record frame time while scanning (only when debug output is enabled)
         if self.scanning && debug_enabled() {
             self.scan_frame_times.push(frame_start.elapsed());
@@ -2240,6 +2321,74 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use crate::tree::{dir, leaf};
+
+    #[test]
+    fn tree_can_render_before_category_counting_starts() {
+        let mut tree = dir("root", vec![leaf("movie.mp4", 100)]);
+        tree.set_expanded(true);
+        let mut app = App {
+            tree: Some(Arc::new(tree)),
+            show_hidden: true,
+            ..App::default()
+        };
+        app.rebuild_rows_if_dirty();
+        assert_eq!(app.cached_rows.len(), 2);
+        assert!(app.category_stats.is_none());
+        assert!(!app.category_worker.is_active());
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui::render_tree(
+                ui,
+                &app.cached_rows,
+                &None,
+                None,
+                false,
+                &app.selected_paths,
+            );
+        });
+        app.start_categories();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.category_stats.is_none() {
+            app.poll_categories();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            app.category_stats.unwrap().entries,
+            [(categories::FileCategory::Video, 100, 1)]
+        );
+    }
+
+    #[test]
+    fn edits_wait_without_cloning_and_recount_after_removal() {
+        let tree = Arc::new(dir("root", vec![dir("folder", vec![leaf("a.zip", 100)])]));
+        let reader = tree.clone();
+        let mut app = App {
+            category_stats: Some(categories::compute_stats(&tree)),
+            tree: Some(tree),
+            ..App::default()
+        };
+        app.edit_tree(TreeEdit::Expand(PathBuf::from("root/folder"), true));
+        app.edit_tree(TreeEdit::Remove(PathBuf::from("root/folder/a.zip")));
+        assert_eq!(app.pending_tree_edits.len(), 2);
+        assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &reader));
+        assert_eq!(reader.size(), 100);
+        drop(reader);
+        app.apply_tree_edits();
+        assert!(app.pending_tree_edits.is_empty());
+        assert!(app.category_stats.is_none());
+        let tree = app.tree.as_ref().unwrap();
+        assert_eq!(tree.size(), 0);
+        assert!(tree.children()[0].expanded());
+        app.start_categories();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.category_stats.is_none() {
+            app.poll_categories();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.category_stats.unwrap().entries.is_empty());
+    }
 
     /// Rendered rows — the source of truth deletion uses for group identity.
     fn rows_for(tree: &FileNode) -> Vec<ui::CachedRow> {

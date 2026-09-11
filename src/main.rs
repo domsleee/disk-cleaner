@@ -671,8 +671,10 @@ impl App {
             self.category_stats = None;
             self.category_failed = false;
             self.invalidate_match_memos();
+            self.mark_dirty();
+        } else {
+            self.rows_dirty = true;
         }
-        self.mark_dirty();
     }
 
     fn poll_categories(&mut self) {
@@ -2357,6 +2359,38 @@ mod tests {
             app.category_stats.unwrap().entries,
             [(categories::FileCategory::Video, 100, 1)]
         );
+    }
+
+    #[test]
+    fn removal_discards_completed_category_result() {
+        let mut app = App {
+            tree: Some(Arc::new(dir("root", vec![leaf("a.zip", 100)]))),
+            ..App::default()
+        };
+        app.start_categories();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Wait for counting to finish without polling its result. The worker
+        // releases its tree only after computing the old totals.
+        while Arc::strong_count(app.tree.as_ref().unwrap()) != 1 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.category_worker.is_active());
+        app.edit_tree(TreeEdit::Remove(PathBuf::from("root/a.zip")));
+        assert_eq!(app.tree.as_ref().unwrap().size(), 0);
+        while app.category_worker.is_active() {
+            app.poll_categories();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.category_stats.is_none(), "old totals must be discarded");
+        app.start_categories();
+        while app.category_stats.is_none() {
+            app.poll_categories();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.category_stats.unwrap().entries.is_empty());
     }
 
     #[test]

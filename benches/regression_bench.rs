@@ -50,7 +50,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
-use std::alloc::{GlobalAlloc, Layout, System};
+use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -65,7 +66,7 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = unsafe { MiMalloc.alloc(layout) };
         if !ptr.is_null() {
             let current = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             PEAK.fetch_max(current, Ordering::Relaxed);
@@ -75,7 +76,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
+        unsafe { MiMalloc.dealloc(ptr, layout) };
     }
 }
 

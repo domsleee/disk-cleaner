@@ -16,7 +16,7 @@ A fast, native cross-platform desktop app to visualize disk usage and clean up l
 - Scan any directory or volume with parallel traversal
 - Tree view sorted by size with proportional size bars
 - File type breakdown sidebar (archives, images, documents, etc.)
-- Filter files by name
+- Search by name, wildcards, and on-disk size, with combined filters
 - Treemap visualization
 - Trash or delete files directly from the UI
 - Resume previous scans
@@ -43,6 +43,10 @@ cargo build --release
 ```
 
 The binary will be at `target/release/disk-cleaner`.
+
+## Searching
+
+In Tree view, combine names, wildcards, and size filters: `*.zip >1g` finds ZIP files using more than 1 GB on disk.
 
 ## Screenshots
 

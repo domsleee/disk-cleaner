@@ -5,7 +5,11 @@ use bytesize::ByteSize;
 use eframe::egui;
 
 use crate::icons::IconCache;
+use crate::search::Query;
 use crate::tree::FileNode;
+
+/// Bound expanded search rows so broad queries cannot duplicate the whole scan in memory.
+pub const SEARCH_ROW_LIMIT: usize = 10_000;
 
 /// Paint a disclosure triangle (▶ or ▼). Visual only — click detection is
 /// handled by the unified row interaction.
@@ -52,8 +56,15 @@ fn bar_color(size: u64, ui: &egui::Ui) -> egui::Color32 {
 
 /// Returns true if this node's name matches the query or any descendant does.
 pub fn node_matches(node: &FileNode, query: &str) -> bool {
-    contains_case_insensitive(node.name(), query)
-        || node.children().iter().any(|c| node_matches(c, query))
+    let Ok(query) = Query::parse(query) else {
+        return false;
+    };
+    node_matches_query(node, &query)
+}
+
+fn node_matches_query(node: &FileNode, query: &Query) -> bool {
+    query.matches(node.name(), node.size())
+        || node.children().iter().any(|c| node_matches_query(c, query))
 }
 
 /// Pre-compute which subtrees contain nodes matching the text query.
@@ -74,12 +85,14 @@ fn node_id(node: &FileNode) -> usize {
 /// Pre-compute which subtrees match the query or have matching descendants.
 pub fn build_text_match_cache(node: &FileNode, query: &str) -> NodeMatchSet {
     let mut cache = HashSet::new();
-    build_text_match_inner(node, query, &mut cache);
+    if let Ok(query) = Query::parse(query) {
+        build_text_match_inner(node, &query, &mut cache);
+    }
     cache
 }
 
-fn build_text_match_inner(node: &FileNode, query: &str, cache: &mut NodeMatchSet) -> bool {
-    let self_matches = contains_case_insensitive(node.name(), query);
+fn build_text_match_inner(node: &FileNode, query: &Query, cache: &mut NodeMatchSet) -> bool {
+    let self_matches = query.matches(node.name(), node.size());
     // Must visit ALL children (not short-circuit) so every matching subtree is cached.
     let child_matches = node.children().iter().fold(false, |acc, c| {
         acc | build_text_match_inner(c, query, cache)
@@ -123,18 +136,6 @@ fn build_cat_match_inner(
     } else {
         false
     }
-}
-
-/// ASCII case-insensitive substring search without allocating.
-/// Only folds a-z/A-Z; non-ASCII characters are compared as-is.
-fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Actions produced by tree rendering, applied after the frame.
@@ -299,6 +300,9 @@ fn collect_cached_rows_inner(
     expanded_file_groups: Option<&HashSet<PathBuf>>,
     result: &mut Vec<CachedRow>,
 ) {
+    if !filter.is_empty() && result.len() >= SEARCH_ROW_LIMIT {
+        return;
+    }
     if !show_hidden && node.is_hidden() {
         return;
     }
@@ -326,7 +330,7 @@ fn collect_cached_rows_inner(
         name: node.name().into(),
         size: node.size(),
         is_dir: node.is_dir(),
-        expanded: node.expanded(),
+        expanded: node.expanded() || !filter.is_empty(),
         depth,
         parent_size,
         children_count: node.children().len(),
@@ -1469,6 +1473,82 @@ mod tests {
         for (a, b) in rows_uncached.iter().zip(rows_cached.iter()) {
             assert_eq!(a.path, b.path);
             assert_eq!(&*a.name, &*b.name);
+        }
+    }
+
+    #[test]
+    fn combined_search_respects_categories_hidden_files_and_ancestors() {
+        let tree = dir(
+            "root",
+            vec![dir(
+                "nested",
+                vec![
+                    leaf("big.zip", 2_000_000_000),
+                    leaf("small.zip", 10),
+                    leaf(".hidden.zip", 3_000_000_000),
+                    leaf("big.mp4", 2_000_000_000),
+                ],
+            )],
+        );
+        let query = "*.zip >1g";
+        let cache = build_text_match_cache(&tree, query);
+        let category = crate::categories::categorize("big.zip");
+        let cat_cache = build_category_match_cache(&tree, category);
+        for text_cache in [None, Some(&cache)] {
+            let rows = collect_cached_rows(
+                &tree,
+                query,
+                Some(category),
+                false,
+                text_cache,
+                Some(&cat_cache),
+                None,
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.name.as_ref()).collect::<Vec<_>>(),
+                ["root", "nested", "big.zip"]
+            );
+            assert!(rows[1].expanded);
+        }
+    }
+
+    #[test]
+    fn broad_search_is_bounded_and_scrolling_survives_shrinking_results() {
+        let tree = dir(
+            "root",
+            (0..SEARCH_ROW_LIMIT + 100)
+                .map(|i| leaf(&format!("file{i}.zip"), i as u64))
+                .collect(),
+        );
+        let cache = build_text_match_cache(&tree, "*");
+        let rows = collect_cached_rows(&tree, "*", None, true, Some(&cache), None, None);
+        assert_eq!(rows.len(), SEARCH_ROW_LIMIT);
+        assert!(!rows.iter().any(|r| r.is_file_group));
+        let ctx = egui::Context::default();
+        let focused = Some(rows.last().unwrap().path.clone());
+        let selected = HashSet::new();
+        // Keep the same scroll-area identity and offset across a broad query,
+        // a single result, no results, then restored results.
+        for visible in [&rows[..], &rows[..1], &rows[..0], &rows[..]] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_tree(
+                        ui,
+                        visible,
+                        &focused,
+                        None,
+                        visible.len() == rows.len(),
+                        &selected,
+                    );
+                },
+            );
         }
     }
 

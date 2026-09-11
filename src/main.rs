@@ -5,6 +5,7 @@ mod categories;
 mod deleter;
 mod icons;
 mod scanner;
+mod search;
 mod tree;
 mod treemap;
 mod ui;
@@ -389,6 +390,7 @@ struct App {
     confirm_delete: Option<PendingDelete>,
     confirm_batch_delete: Option<PendingBatchDelete>,
     search_query: String,
+    search_error: Option<String>,
     /// The search query currently applied to the cached rows (debounced).
     applied_search: String,
     /// When the search text last changed (for debouncing).
@@ -477,6 +479,7 @@ impl Default for App {
             confirm_delete: None,
             confirm_batch_delete: None,
             search_query: String::new(),
+            search_error: None,
             applied_search: String::new(),
             search_changed_at: None,
             focused_path: None,
@@ -619,6 +622,24 @@ impl App {
             let stats = categories::compute_stats(&tree);
             let _ = tx.send(ScanResult { tree, stats });
         });
+    }
+
+    fn apply_search(&mut self) {
+        match search::Query::parse(&self.search_query) {
+            Ok(_) => {
+                let query = self.search_query.trim().to_owned();
+                if self.applied_search != query {
+                    self.applied_search = query;
+                    // A hidden selection must never remain a deletion target.
+                    self.selected_paths.clear();
+                    self.selection_anchor = None;
+                    self.focused_path = None;
+                    self.rows_dirty = true;
+                }
+                self.search_error = None;
+            }
+            Err(message) => self.search_error = Some(message),
+        }
     }
 
     fn rebuild_rows_if_dirty(&mut self) {
@@ -904,9 +925,8 @@ impl eframe::App for App {
         // Apply debounced search query after 150ms of no typing
         if let Some(changed_at) = self.search_changed_at {
             if changed_at.elapsed() >= Duration::from_millis(150) {
-                self.applied_search = self.search_query.clone();
+                self.apply_search();
                 self.search_changed_at = None;
-                self.rows_dirty = true;
                 // Treemap doesn't filter by search text, so no treemap_dirty
             } else {
                 let remaining = Duration::from_millis(150).saturating_sub(changed_at.elapsed());
@@ -1377,26 +1397,40 @@ impl eframe::App for App {
                             }
                         }
 
-                        // Search/filter bar — hidden: filter feature crashes (DIS-253)
-                        // if self.tree.is_some() {
-                        //     ui.separator();
-                        //     ui.label("Filter:");
-                        //     let response = ui.add(
-                        //         egui::TextEdit::singleline(&mut self.search_query)
-                        //             .hint_text("file name...")
-                        //             .desired_width(200.0),
-                        //     );
-                        //     if response.changed() {
-                        //         self.search_query = self.search_query.to_lowercase();
-                        //         self.search_changed_at = Some(Instant::now());
-                        //     }
-                        //     if !self.search_query.is_empty() && ui.small_button("×").clicked() {
-                        //         self.search_query.clear();
-                        //         self.applied_search.clear();
-                        //         self.search_changed_at = None;
-                        //         self.rows_dirty = true;
-                        //     }
-                        // }
+                        if self.tree.is_some() && self.view_mode == ViewMode::Tree {
+                            ui.separator();
+                            ui.label("Search:");
+                            let response = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text("*.zip >1g")
+                                        .desired_width(200.0),
+                                )
+                                .on_hover_text(
+                                    "Search names or combine filters: *.zip >1g\n\
+                                 Spaces mean AND; quote names containing spaces.\n\
+                                 Wildcards: * and ?. Sizes: >, >=, =, <=, <.\n\
+                                 k/m/g/t use decimal units; KiB/MiB/GiB/TiB use binary units.\n\
+                                 Sizes match on-disk usage. Search applies to Tree view.",
+                                );
+                            if response.changed() {
+                                self.search_changed_at = Some(Instant::now());
+                                ctx.request_repaint_after(Duration::from_millis(150));
+                            }
+                            if (response.has_focus() || response.lost_focus())
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                self.apply_search();
+                                self.search_changed_at = None;
+                            }
+                            if !self.search_query.is_empty()
+                                && ui.small_button("×").on_hover_text("Clear search").clicked()
+                            {
+                                self.search_query.clear();
+                                self.apply_search();
+                                self.search_changed_at = None;
+                            }
+                        }
 
                         // Hidden files toggle
                         if self.tree.is_some() {
@@ -1988,6 +2022,16 @@ impl eframe::App for App {
                     let render_start = std::time::Instant::now();
                     let rebuild_needed = self.rows_dirty;
                     self.rebuild_rows_if_dirty();
+                    if let Some(error) = &self.search_error {
+                        ui.colored_label(egui::Color32::YELLOW, format!("{error} Previous results are still shown."));
+                    }
+                    if !self.applied_search.is_empty() {
+                        if self.cached_rows.is_empty() {
+                            ui.label("No matches. Try a different name or size filter.");
+                        } else if self.cached_rows.len() >= ui::SEARCH_ROW_LIMIT {
+                            ui.label("Showing the first 10,000 rows. Refine your search to see more specific results.");
+                        }
+                    }
                     let actions = ui::render_tree(
                         ui,
                         &self.cached_rows,
@@ -2240,6 +2284,79 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use crate::tree::{dir, leaf};
+
+    #[test]
+    fn search_filters_rows_clears_selection_and_restores_collapsed_tree() {
+        let mut tree = dir(
+            "root",
+            vec![dir(
+                "archives",
+                vec![leaf("big.zip", 2_000_000_000), leaf("small.zip", 500)],
+            )],
+        );
+        tree.set_expanded(true);
+        let selected = PathBuf::from("root/archives/small.zip");
+        let mut app = App {
+            tree: Some(tree),
+            show_hidden: true,
+            selected_paths: HashSet::from([selected.clone()]),
+            focused_path: Some(selected.clone()),
+            selection_anchor: Some(selected),
+            search_query: "*.zip >1g".into(),
+            ..App::default()
+        };
+        app.apply_search();
+        app.rebuild_rows_if_dirty();
+        assert_eq!(
+            app.cached_rows
+                .iter()
+                .map(|r| r.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["root", "archives", "big.zip"]
+        );
+        assert!(app.selected_paths.is_empty());
+        assert!(app.focused_path.is_none());
+        assert!(app.selection_anchor.is_none());
+        assert!(!app.tree.as_ref().unwrap().children()[0].expanded());
+
+        app.search_query = ">oops".into();
+        app.apply_search();
+        assert!(app.search_error.is_some());
+        assert_eq!(app.applied_search, "*.zip >1g");
+
+        app.search_query.clear();
+        app.apply_search();
+        app.rebuild_rows_if_dirty();
+        assert!(app.search_error.is_none());
+        assert!(app.text_cache_memo.is_none());
+        assert_eq!(app.cached_rows.len(), 2);
+    }
+
+    #[test]
+    fn filtered_deletion_targets_only_the_matching_file() {
+        let mut app = App {
+            tree: Some(dir(
+                "root",
+                vec![leaf("big.zip", 2_000_000_000), leaf("small.zip", 1)],
+            )),
+            show_hidden: true,
+            search_query: "*.zip >1g".into(),
+            ..App::default()
+        };
+        app.apply_search();
+        app.rebuild_rows_if_dirty();
+        app.selected_paths.insert(PathBuf::from("root/big.zip"));
+        assert_eq!(
+            app.pending_batch_delete().targets,
+            [PathBuf::from("root/big.zip")]
+        );
+        // Structural edits invalidate address-keyed matches before the next render.
+        ui::remove_node(app.tree.as_mut().unwrap(), Path::new("root/big.zip"));
+        app.invalidate_match_memos();
+        app.mark_dirty();
+        app.rebuild_rows_if_dirty();
+        assert!(app.cached_rows.is_empty());
+    }
 
     /// Rendered rows — the source of truth deletion uses for group identity.
     fn rows_for(tree: &FileNode) -> Vec<ui::CachedRow> {

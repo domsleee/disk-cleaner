@@ -46,29 +46,7 @@ The binary will be at `target/release/disk-cleaner`.
 
 ## Searching
 
-In **Tree** view, use the search box to narrow the scanned results:
-
-| Search | Matches |
-|--------|---------|
-| `backup` | Names containing "backup" (ASCII case-insensitive) |
-| `*.zip >1g` | ZIP files using more than 1 GB on disk |
-| `video >=500m <=2g` | Names containing "video", using 500 MB to 2 GB on disk |
-| `"summer holiday"` | Names containing the phrase "summer holiday" |
-| `file?.zip` | Names such as `file1.zip` (`?` matches one character) |
-
-Spaces combine conditions with AND. Wildcards match the whole name; `*`
-matches zero or more characters. Quoted terms are literal name substrings.
-Size comparisons support `>`, `>=`, `=`, `<=`, and `<`, with bytes by default.
-`k`, `m`, `g`, `t` (or `KB`, `MB`, `GB`, `TB`) are decimal units;
-`KiB`, `MiB`, `GiB`, `TiB` are binary units. Decimal values such as `>1.5g`
-are supported. Sizes use the same on-disk usage shown in the tree, including
-aggregate directory sizes, rather than file contents' logical size.
-
-Matching descendants retain their parent folders for context. Search shows
-up to 10,000 rows; refine the query if the limit is reached. Invalid queries
-show an explanation and keep the previous results. Clear search with **×**.
-Search applies to Tree view only; date, regex, and full-path searches are not
-supported.
+In Tree view, combine names, wildcards, and size filters: `*.zip >1g` finds ZIP files using more than 1 GB on disk.
 
 ## Screenshots
 

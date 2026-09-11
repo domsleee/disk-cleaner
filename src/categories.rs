@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use eframe::egui;
 
 use crate::tree::FileNode;
@@ -17,6 +15,16 @@ pub enum FileCategory {
 }
 
 impl FileCategory {
+    const ALL: [Self; 7] = [
+        Self::Video,
+        Self::Image,
+        Self::Audio,
+        Self::Document,
+        Self::Archive,
+        Self::Code,
+        Self::Other,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Video => "Videos",
@@ -45,21 +53,31 @@ impl FileCategory {
 /// Categorize a file by its name/extension.
 pub fn categorize(name: &str) -> FileCategory {
     let ext = name.rsplit('.').next().unwrap_or("");
-    match ext.to_ascii_lowercase().as_str() {
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" => FileCategory::Video,
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "svg" | "webp" | "tiff" | "ico" | "heic" => {
-            FileCategory::Image
+    // All recognized extensions fit in seven ASCII bytes ("numbers").
+    let mut lowercase = [0u8; 7];
+    if ext.len() > lowercase.len() {
+        return FileCategory::Other;
+    }
+    for (out, byte) in lowercase.iter_mut().zip(ext.bytes()) {
+        *out = byte.to_ascii_lowercase();
+    }
+    match &lowercase[..ext.len()] {
+        b"mp4" | b"mkv" | b"avi" | b"mov" | b"wmv" | b"flv" | b"webm" | b"m4v" => {
+            FileCategory::Video
         }
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus" => FileCategory::Audio,
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "rtf" | "csv"
-        | "pages" | "numbers" | "key" => FileCategory::Document,
-        "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" | "xz" | "tgz" | "zst" | "dmg" | "iso" => {
-            FileCategory::Archive
+        b"jpg" | b"jpeg" | b"png" | b"gif" | b"bmp" | b"svg" | b"webp" | b"tiff" | b"ico"
+        | b"heic" => FileCategory::Image,
+        b"mp3" | b"wav" | b"flac" | b"aac" | b"ogg" | b"wma" | b"m4a" | b"opus" => {
+            FileCategory::Audio
         }
-        "rs" | "js" | "ts" | "py" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "rb" | "swift"
-        | "kt" | "cs" | "jsx" | "tsx" | "vue" | "svelte" | "json" | "yaml" | "yml" | "toml"
-        | "xml" | "ini" | "cfg" | "conf" | "lock" | "html" | "htm" | "css" | "scss" | "sass"
-        | "less" | "md" | "mdx" => FileCategory::Code,
+        b"pdf" | b"doc" | b"docx" | b"xls" | b"xlsx" | b"ppt" | b"pptx" | b"txt" | b"rtf"
+        | b"csv" | b"pages" | b"numbers" | b"key" => FileCategory::Document,
+        b"zip" | b"tar" | b"gz" | b"rar" | b"7z" | b"bz2" | b"xz" | b"tgz" | b"zst" | b"dmg"
+        | b"iso" => FileCategory::Archive,
+        b"rs" | b"js" | b"ts" | b"py" | b"go" | b"c" | b"cpp" | b"h" | b"hpp" | b"java" | b"rb"
+        | b"swift" | b"kt" | b"cs" | b"jsx" | b"tsx" | b"vue" | b"svelte" | b"json" | b"yaml"
+        | b"yml" | b"toml" | b"xml" | b"ini" | b"cfg" | b"conf" | b"lock" | b"html" | b"htm"
+        | b"css" | b"scss" | b"sass" | b"less" | b"md" | b"mdx" => FileCategory::Code,
         _ => FileCategory::Other,
     }
 }
@@ -70,29 +88,57 @@ pub struct CategoryStats {
 }
 
 /// Compute file category statistics from a scanned tree.
+#[allow(dead_code)] // Library/benchmark entry point; the GUI uses the cancellable worker.
 pub fn compute_stats(tree: &FileNode) -> CategoryStats {
-    let mut map: HashMap<FileCategory, (u64, usize)> = HashMap::new();
-    collect_stats(tree, &mut map);
+    compute_stats_inner(tree, &|| false).expect("uncancelled category count")
+}
 
-    let mut entries: Vec<(FileCategory, u64, usize)> = map
+pub(crate) fn compute_stats_cancellable(
+    tree: &FileNode,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Option<CategoryStats> {
+    compute_stats_inner(tree, &|| {
+        cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+fn compute_stats_inner(tree: &FileNode, cancelled: &impl Fn() -> bool) -> Option<CategoryStats> {
+    let mut totals = [(0, 0); FileCategory::ALL.len()];
+    if !collect_stats(tree, &mut totals, cancelled) {
+        return None;
+    }
+
+    let mut entries: Vec<(FileCategory, u64, usize)> = FileCategory::ALL
         .into_iter()
+        .zip(totals)
+        .filter(|(_, (_, count))| *count != 0)
         .map(|(cat, (size, count))| (cat, size, count))
         .collect();
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
-    CategoryStats { entries }
+    Some(CategoryStats { entries })
 }
 
-fn collect_stats(node: &FileNode, map: &mut HashMap<FileCategory, (u64, usize)>) {
+fn collect_stats(
+    node: &FileNode,
+    totals: &mut [(u64, usize); FileCategory::ALL.len()],
+    cancelled: &impl Fn() -> bool,
+) -> bool {
+    if cancelled() {
+        return false;
+    }
     if !node.is_dir() {
         let cat = categorize(node.name());
-        let entry = map.entry(cat).or_insert((0, 0));
+        let entry = &mut totals[cat as usize];
         entry.0 += node.size();
         entry.1 += 1;
     }
     for child in node.children() {
-        collect_stats(child, map);
+        if !collect_stats(child, totals, cancelled) {
+            return false;
+        }
     }
+    true
 }
 
 /// Returns true if this node (or any descendant) matches the given category.
@@ -133,6 +179,34 @@ mod tests {
     fn categorize_unknown() {
         assert_eq!(categorize("mystery"), FileCategory::Other);
         assert_eq!(categorize("data.xyz"), FileCategory::Other);
+    }
+
+    #[test]
+    fn categorize_preserves_case_and_extension_edge_cases() {
+        for (name, expected) in [
+            ("budget.NuMbErS", FileCategory::Document),
+            (".MP4", FileCategory::Video),
+            ("archive.tar.GZ", FileCategory::Archive),
+            ("rs", FileCategory::Code),
+            ("", FileCategory::Other),
+            ("name.", FileCategory::Other),
+            ("name.numbersx", FileCategory::Other),
+            ("name.İso", FileCategory::Other),
+            ("name.🎥", FileCategory::Other),
+        ] {
+            assert_eq!(categorize(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn stats_keep_zero_byte_files_but_omit_absent_categories() {
+        let empty = dir("empty", vec![]);
+        assert!(compute_stats(&empty).entries.is_empty());
+        let tree = dir("root", vec![dir("nested", vec![leaf("empty.zip", 0)])]);
+        assert_eq!(
+            compute_stats(&tree).entries,
+            [(FileCategory::Archive, 0, 1)]
+        );
     }
 
     #[test]

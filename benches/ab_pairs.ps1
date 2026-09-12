@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-  Randomized paired A/B runner for scan speed. Resolves a few-percent effect
-  that a median-of-5 cannot.
+  Randomized paired A/B runner for warm-cache scan speed, with a confidence
+  interval to assess whether the measured difference is conclusive.
 
 .DESCRIPTION
   Each pair runs both binaries back to back, with the order within the pair
@@ -25,39 +25,62 @@ param(
     [string]$LabelA = 'base',
     [string]$LabelB = 'mimalloc',
     [Parameter(Mandatory = $true)][string]$ScanPath,
-    [int]$Pairs = 20,
-    [int]$Warmup = 3,
+    [ValidateRange(2, 2147483647)][int]$Pairs = 20,
+    [ValidateRange(0, 2147483647)][int]$Warmup = 3,
     [int]$Seed = 20260912,
-    [int]$Boot = 10000,
+    [ValidateRange(100, 2147483647)][int]$Boot = 10000,
     [string]$CsvPath = ''
 )
+
+$ErrorActionPreference = 'Stop'
 
 function Invoke-Scan {
     param([string]$Exe, [string]$Arg)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
-    $psi.Arguments = '"' + $Arg + '"'
+    if ($psi.PSObject.Properties['ArgumentList']) {
+        $psi.ArgumentList.Add($Arg)
+    } else {
+        # Windows PowerShell 5.1: escape quotes and double trailing backslashes
+        # before enclosing the argument in quotes (including drive roots).
+        $escaped = $Arg -replace '(\\*)"', '$1$1\"'
+        $escaped = $escaped -replace '(\\+)$', '$1$1'
+        $psi.Arguments = '"' + $escaped + '"'
+    }
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = [System.Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEnd()
-    $null = $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
-    $sw.Stop()
-    $p.Dispose()
+    try {
+        # Drain both pipes concurrently so a full stderr pipe cannot hang a run.
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $p.WaitForExit()
+        $sw.Stop()
+        $out = $outTask.GetAwaiter().GetResult()
+        $err = $errTask.GetAwaiter().GetResult()
+        if ($p.ExitCode -ne 0) {
+            throw "Scan failed: $Exe (exit $($p.ExitCode)): $err"
+        }
+    } finally {
+        $p.Dispose()
+    }
 
-    $scanMs = $null; $dropMs = $null; $files = $null
-    $m = [regex]::Match($out, 'BENCH scan_ms=([\d.]+) drop_ms=([\d.]+) files=(\d+) bytes=(\d+)')
-    if ($m.Success) {
-        $scanMs = [double]$m.Groups[1].Value
-        $dropMs = [double]$m.Groups[2].Value
-        $files  = [long]$m.Groups[3].Value
+    $m = [regex]::Match($out, '(?m)^BENCH scan_ms=([0-9]+(?:\.[0-9]+)?) drop_ms=([0-9]+(?:\.[0-9]+)?) files=([0-9]+) bytes=([0-9]+)\r?$')
+    if (-not $m.Success) {
+        throw "Failed to parse BENCH line from ${Exe}: $out $err"
+    }
+    $scanMs = [double]$m.Groups[1].Value
+    $dropMs = [double]$m.Groups[2].Value
+    $files = [uint64]$m.Groups[3].Value
+    $bytes = [uint64]$m.Groups[4].Value
+    if ($scanMs -le 0 -or [double]::IsInfinity($scanMs) -or [double]::IsInfinity($dropMs)) {
+        throw "Invalid BENCH timing from ${Exe}: scan_ms=$scanMs drop_ms=$dropMs"
     }
     [pscustomobject]@{
-        ScanMs = $scanMs; DropMs = $dropMs; Files = $files
+        ScanMs = $scanMs; DropMs = $dropMs; Files = $files; Bytes = $bytes
         ProcMs = $sw.Elapsed.TotalMilliseconds
     }
 }
@@ -99,13 +122,8 @@ for ($i = 0; $i -lt $Pairs; $i++) {
         $ra = Invoke-Scan -Exe $ExeA -Arg $ScanPath
     }
 
-    if ($null -eq $ra.ScanMs -or $null -eq $rb.ScanMs) {
-        Write-Host "  pair $($i+1): FAILED to parse BENCH line - aborting"
-        exit 1
-    }
-    if ($ra.Files -ne $rb.Files) {
-        Write-Host "  pair $($i+1): file count mismatch ($($ra.Files) vs $($rb.Files)) - aborting"
-        exit 1
+    if ($ra.Files -ne $rb.Files -or $ra.Bytes -ne $rb.Bytes) {
+        throw "Pair $($i+1): scan result mismatch (A: $($ra.Files) files, $($ra.Bytes) bytes; B: $($rb.Files) files, $($rb.Bytes) bytes)"
     }
 
     $rows += [pscustomobject]@{
@@ -114,6 +132,7 @@ for ($i = 0; $i -lt $Pairs; $i++) {
         AScan = $ra.ScanMs; BScan = $rb.ScanMs
         ADrop = $ra.DropMs; BDrop = $rb.DropMs
         AProc = $ra.ProcMs; BProc = $rb.ProcMs
+        Files = $ra.Files; Bytes = $ra.Bytes
         LogRatio = [math]::Log($rb.ScanMs / $ra.ScanMs)
     }
     Write-Host ("  pair {0,2} [{1}]  {2} {3,8:N1} ms  {4} {5,8:N1} ms   drop {6,6:N1}/{7,6:N1}" -f `
@@ -152,8 +171,8 @@ Write-Host ("  {0,-10} median {1,8:N1} ms   min {2,8:N1} ms" -f $LabelB, (Get-Me
 Write-Host ''
 Write-Host ("  geometric mean ratio {0}/{1} : {2:N4}" -f $LabelB, $LabelA, $ratio)
 Write-Host ("  scan time change            : {0:N2}%  (95% CI {1:N2}% .. {2:N2}%)" -f (100 * ($ratio - 1)), (100 * ($lo - 1)), (100 * ($hi - 1)))
-if ($lo -lt 1 -and $hi -gt 1) {
-    Write-Host '  VERDICT: CI spans zero - no significant scan-speed difference.'
+if ($lo -le 1 -and $hi -ge 1) {
+    Write-Host '  VERDICT: CI includes zero - no significant scan-speed difference.'
 } elseif ($hi -lt 1) {
     Write-Host ("  VERDICT: {0} is significantly FASTER on scan." -f $LabelB)
 } else {

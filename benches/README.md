@@ -98,9 +98,10 @@ identical on-disk layout.
 
 ### Paired A/B scan speed (`ab_pairs.ps1`, Windows)
 
-For resolving small (3-5%) scan-speed differences between two builds, where a
-median-of-5 is not enough. Runs randomized AB/BA pairs and reports the
-geometric mean ratio with a bootstrap confidence interval.
+For comparing warm-cache scan speed between two builds. Runs randomized AB/BA
+pairs and reports the geometric mean ratio with a bootstrap confidence interval.
+Whether a small difference is conclusive depends on variability and pair count.
+Each measured pair must report matching file counts and byte totals.
 
 `scan_only` prints `BENCH scan_ms=... drop_ms=...`, timing the scan separately
 from tearing the tree down. Teardown is ~200 ms on a 1.5M-file tree, so whole-
@@ -112,7 +113,14 @@ cargo build --profile release-dist --features internal-tools --bin scan_only
 Copy-Item target\release-dist\scan_only.exe $env:TEMP\scan_a.exe
 # switch branch, rebuild, then:
 .\benches\ab_pairs.ps1 -ExeA $env:TEMP\scan_a.exe -ExeB target\release-dist\scan_only.exe -ScanPath C:\Users\me\projects
-.\benches\ab_pairs.ps1 ... -Pairs 40 -CsvPath runs.csv   # tighter interval
+.\benches\ab_pairs.ps1 ... -Pairs 40 -CsvPath runs.csv   # more samples
+```
+
+Harness regression checks use `rustc` to build a small native fixture:
+
+```powershell
+powershell -NoProfile -File benches/ab_pairs.Tests.ps1
+pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
 ```
 
 ## Comparing branches

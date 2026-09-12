@@ -3283,6 +3283,11 @@ pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> bool 
 /// the second and later sightings).
 pub fn scan_volume_tree(root: &Path, progress: &super::ScanProgress) -> io::Result<FileNode> {
     let index = build_raw_mft_index_for_scan(root, progress)?;
+    // The read loop checks cancellation per chunk, but index finish and tree
+    // materialization run after it — don't start them for a cancelled scan.
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
     let visibility = collect_win32_root_visibility(root)?;
     Ok(build_tree_from_index(&index, root, &visibility, progress))
 }
@@ -3344,16 +3349,34 @@ fn build_tree_from_index(
         .collect();
     visited[root_record as usize].store(true, Ordering::Relaxed);
 
+    let cancelled = &progress.cancelled;
     let root_children: Vec<FileNode> = children
         .get(&root_record)
         .map(|kids| {
             kids.par_iter()
-                .filter(|&&idx| {
+                .filter_map(|&idx| {
+                    let entry = &entries[idx as usize];
                     // Mirror the Win32 view of the root: skip metafiles and
                     // entries a normal directory listing doesn't show.
-                    visibility.contains_key(&entries[idx as usize].name.to_lowercase())
+                    let vis = visibility.get(&entry.name.to_lowercase())?;
+                    // Directories the listing shows but can't open (e.g.
+                    // "System Volume Information") stay size 0, matching the
+                    // projection and what the directory walker reports —
+                    // the raw MFT would otherwise "see through" the ACL.
+                    if entry.is_directory && !vis.can_recurse {
+                        return Some(FileNode::Dir(Box::new(DirNode {
+                            name: entry.name.clone(),
+                            size: 0,
+                            children: Vec::new(),
+                            expanded: false,
+                            hidden: entry.name.starts_with('.')
+                                || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0,
+                        })));
+                    }
+                    Some(build_tree_node(
+                        entries, &children, &flags, idx, &visited, cancelled,
+                    ))
                 })
-                .map(|&idx| build_tree_node(entries, &children, &flags, idx, &visited))
                 .collect()
         })
         .unwrap_or_default();
@@ -3383,6 +3406,7 @@ fn build_tree_node(
     flags: &[u8],
     idx: u32,
     visited: &[std::sync::atomic::AtomicBool],
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> FileNode {
     let entry = &entries[idx as usize];
     let hidden = entry.name.starts_with('.') || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
@@ -3400,16 +3424,17 @@ fn build_tree_node(
         return FileNode::File(leaf);
     }
 
-    let first_visit = !visited[entry.record_number as usize].swap(true, Ordering::Relaxed);
+    let first_visit = !visited[entry.record_number as usize].swap(true, Ordering::Relaxed)
+        && !cancelled.load(Ordering::Relaxed);
     let child_nodes: Vec<FileNode> = if first_visit {
         match children_map.get(&entry.record_number) {
             Some(kids) if kids.len() >= TREE_PAR_THRESHOLD => kids
                 .par_iter()
-                .map(|&k| build_tree_node(entries, children_map, flags, k, visited))
+                .map(|&k| build_tree_node(entries, children_map, flags, k, visited, cancelled))
                 .collect(),
             Some(kids) => kids
                 .iter()
-                .map(|&k| build_tree_node(entries, children_map, flags, k, visited))
+                .map(|&k| build_tree_node(entries, children_map, flags, k, visited, cancelled))
                 .collect(),
             None => Vec::new(),
         }
@@ -3489,6 +3514,11 @@ mod tests {
             test_entry(42, 40, "h2", false, 50),
             // Root entry not visible in the Win32 listing (e.g. a metafile).
             test_entry(43, root_record, "$secret", false, 999),
+            // Root dir the listing shows but cannot open (ACL-blocked, e.g.
+            // "System Volume Information") — must stay empty/size 0 even
+            // though the raw MFT can see its contents.
+            test_entry(44, root_record, "blocked", true, 0),
+            test_entry(45, 44, "protected.bin", false, 777),
         ];
         let index = RawMftIndex {
             summary: RawMftIndexSummary::default(),
@@ -3497,6 +3527,10 @@ mod tests {
         let mut visibility = HashMap::new();
         visibility.insert("a".to_string(), RootVisibilityEntry { can_recurse: true });
         visibility.insert("h1".to_string(), RootVisibilityEntry { can_recurse: false });
+        visibility.insert(
+            "blocked".to_string(),
+            RootVisibilityEntry { can_recurse: false },
+        );
 
         let progress = test_progress();
         let tree = build_tree_from_index(&index, Path::new(r"C:\"), &visibility, &progress);
@@ -3527,6 +3561,15 @@ mod tests {
         assert_eq!(a.children().len(), 2);
         assert!(tree.children().iter().any(|c| c.name() == "h1"));
         assert!(!tree.children().iter().any(|c| c.name() == "$secret"));
+
+        // Blocked root dir present but empty: no ACL bypass via raw MFT.
+        let blocked = tree
+            .children()
+            .iter()
+            .find(|c| c.name() == "blocked")
+            .expect("blocked dir present");
+        assert_eq!(blocked.size(), 0);
+        assert!(blocked.children().is_empty());
     }
 
     fn file_name(

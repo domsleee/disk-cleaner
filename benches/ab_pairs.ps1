@@ -9,9 +9,9 @@
   leaves B permanently second, inheriting A's cache warming -- a bias that
   looks exactly like a real effect.
 
-  Requires binaries built from a scan_only.rs that prints the BENCH line, and
-  reports scan time separately from teardown. Timing the whole process instead
-  credits anything that merely speeds up `free`.
+  Requires binaries built from a scan_only.rs that prints the BENCH line.
+  Scan time covers the complete scan_directory call, including dedup-set
+  cleanup and sorting. Only teardown of the returned tree is timed separately.
 
   Reports the geometric mean of per-pair log ratios with a paired bootstrap CI.
   Median and min are diagnostics only.
@@ -25,7 +25,8 @@ param(
     [string]$LabelA = 'base',
     [string]$LabelB = 'mimalloc',
     [Parameter(Mandatory = $true)][string]$ScanPath,
-    [ValidateRange(2, 2147483647)][int]$Pairs = 20,
+    [ValidateRange(20, 2147483647)]
+    [ValidateScript({ $_ % 2 -eq 0 })][int]$Pairs = 20,
     [ValidateRange(0, 2147483647)][int]$Warmup = 3,
     [int]$Seed = 20260912,
     [ValidateRange(100, 2147483647)][int]$Boot = 10000,
@@ -34,10 +35,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# PowerShell's location can differ from the process CWD after Set-Location.
+# Resolve every input before starting a native process, including relative
+# scan paths; otherwise another checkout's binary or tree could be measured.
+$runDirectory = (Get-Location).ProviderPath
+$ExeA = Convert-Path -LiteralPath $ExeA
+$ExeB = Convert-Path -LiteralPath $ExeB
+$ScanPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ScanPath)
+if ($CsvPath -ne '') {
+    $CsvPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CsvPath)
+    # Clear previous results even if this run fails before completing a pair.
+    Set-Content -LiteralPath $CsvPath -Value '' -NoNewline
+}
+
 function Invoke-Scan {
     param([string]$Exe, [string]$Arg)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
+    $psi.WorkingDirectory = $runDirectory
     if ($psi.PSObject.Properties['ArgumentList']) {
         $psi.ArgumentList.Add($Arg)
     } else {
@@ -135,11 +150,12 @@ for ($i = 0; $i -lt $Pairs; $i++) {
         Files = $ra.Files; Bytes = $ra.Bytes
         LogRatio = [math]::Log($rb.ScanMs / $ra.ScanMs)
     }
+    if ($CsvPath -ne '') {
+        $rows[-1] | Export-Csv -NoTypeInformation -LiteralPath $CsvPath -Append:($i -gt 0)
+    }
     Write-Host ("  pair {0,2} [{1}]  {2} {3,8:N1} ms  {4} {5,8:N1} ms   drop {6,6:N1}/{7,6:N1}" -f `
         ($i + 1), $rows[-1].Order, $LabelA, $ra.ScanMs, $LabelB, $rb.ScanMs, $ra.DropMs, $rb.DropMs)
 }
-
-if ($CsvPath -ne '') { $rows | Export-Csv -NoTypeInformation -Path $CsvPath }
 
 $d = @($rows | ForEach-Object { $_.LogRatio })
 $n = $d.Count
@@ -172,7 +188,7 @@ Write-Host ''
 Write-Host ("  geometric mean ratio {0}/{1} : {2:N4}" -f $LabelB, $LabelA, $ratio)
 Write-Host ("  scan time change            : {0:N2}%  (95% CI {1:N2}% .. {2:N2}%)" -f (100 * ($ratio - 1)), (100 * ($lo - 1)), (100 * ($hi - 1)))
 if ($lo -le 1 -and $hi -ge 1) {
-    Write-Host '  VERDICT: CI includes zero - no significant scan-speed difference.'
+    Write-Host '  VERDICT: INCONCLUSIVE - CI includes zero; this run did not resolve a scan-speed difference.'
 } elseif ($hi -lt 1) {
     Write-Host ("  VERDICT: {0} is significantly FASTER on scan." -f $LabelB)
 } else {

@@ -3,6 +3,9 @@ use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
 use disk_cleaner::treemap;
 use eframe::egui;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ---------------------------------------------------------------------------
 // Synthetic tree builders
 // ---------------------------------------------------------------------------

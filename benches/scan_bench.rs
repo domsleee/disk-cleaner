@@ -14,7 +14,8 @@ use disk_cleaner::tree::FileNode;
 use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use eframe::egui;
-use std::alloc::{GlobalAlloc, Layout, System};
+use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = unsafe { MiMalloc.alloc(layout) };
         if !ptr.is_null() {
             let current = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             PEAK.fetch_max(current, Ordering::Relaxed);
@@ -42,14 +43,14 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
+        unsafe { MiMalloc.dealloc(ptr, layout) };
     }
 
     // Without this override the default realloc is alloc+copy+dealloc, which
     // both changes the program's allocation behavior vs. the real app and
     // double-counts every Vec/HashSet growth in the peak numbers.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
             if new_size >= layout.size() {
                 let grow = new_size - layout.size();

@@ -14,6 +14,9 @@ use disk_cleaner::ui;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ---------------------------------------------------------------------------
 // Synthetic tree builders
 // ---------------------------------------------------------------------------

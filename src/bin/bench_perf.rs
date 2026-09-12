@@ -109,14 +109,16 @@ fn bench_frame_time(scan_path: &Path) {
     let p = progress.clone();
     let path = scan_path.to_path_buf();
 
-    let scan_start = Instant::now();
+    // Timed on the scan thread; the poll loop would add up to 16.7ms of lag.
     std::thread::spawn(move || {
+        let scan_start = Instant::now();
         let tree = scanner::scan_directory(&path, p);
-        let _ = tx.send(tree);
+        let _ = tx.send((tree, scan_start.elapsed()));
     });
 
     let mut frame_times: Vec<Duration> = Vec::new();
     let mut result_tree = None;
+    let mut scan_duration = Duration::ZERO;
 
     // Simulate ~60fps polling loop
     loop {
@@ -127,8 +129,9 @@ fn bench_frame_time(scan_path: &Path) {
         let _total_size = progress.total_size.load(Ordering::Relaxed);
 
         match rx.try_recv() {
-            Ok(tree) => {
+            Ok((tree, elapsed)) => {
                 result_tree = Some(tree);
+                scan_duration = elapsed;
                 let frame_dur = frame_start.elapsed();
                 frame_times.push(frame_dur);
                 break;
@@ -147,7 +150,6 @@ fn bench_frame_time(scan_path: &Path) {
         }
     }
 
-    let scan_duration = scan_start.elapsed();
     let file_count = progress.file_count.load(Ordering::Relaxed);
     let total_size = progress.total_size.load(Ordering::Relaxed);
 

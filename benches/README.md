@@ -96,6 +96,46 @@ identical on-disk layout.
 .\benches\coldcache.ps1 -Cleanup   # delete the fixture
 ```
 
+### Paired A/B scan speed (`ab_pairs.ps1`, Windows)
+
+For comparing warm-cache scan speed between two builds. Runs randomized AB/BA
+pairs and reports the geometric mean ratio with a bootstrap confidence interval.
+Whether a small difference is conclusive depends on variability and pair count.
+Each measured pair must report matching file counts and byte totals.
+`-Pairs` must be even and at least 20 to balance run order and avoid the worst
+small-sample bootstrap behavior. This is a practical minimum, not a guarantee
+of 95% coverage: the percentile interval is approximate and assumes independent,
+representative pairs. Use a stable scan target and inspect the interval width.
+An interval including zero means the run is inconclusive.
+
+`scan_only` prints `BENCH scan_ms=... drop_ms=...`. `scan_ms` covers the complete
+`scan_directory()` call, including thread-pool initialization, dedup-set cleanup,
+and sorting. `drop_ms` covers only teardown of the returned tree (~200 ms on a
+1.5M-file tree), not all process cleanup. Allocator changes can affect both.
+Compare `scan_ms` for scan completion latency; process wall-clock also includes
+tree teardown and process startup/exit.
+
+Relative executable, scan, and CSV paths resolve from PowerShell's current
+location. With `-CsvPath`, each completed pair is saved immediately, preserving
+earlier measurements if a later pair fails. The CSV is cleared at the start of
+a run, and failed or mismatched pairs are never included. A partial CSV is raw
+data only; no overall verdict is produced for an incomplete run.
+
+```powershell
+cargo build --profile release-dist --features internal-tools --bin scan_only
+Copy-Item target\release-dist\scan_only.exe $env:TEMP\scan_a.exe
+# switch branch, rebuild, then:
+.\benches\ab_pairs.ps1 -ExeA $env:TEMP\scan_a.exe -ExeB target\release-dist\scan_only.exe -ScanPath C:\Users\me\projects
+.\benches\ab_pairs.ps1 ... -Pairs 40 -CsvPath runs.csv   # more samples
+```
+
+Harness regression checks use `rustc` to build a small native fixture:
+
+```powershell
+powershell -NoProfile -File benches/ab_pairs.Tests.ps1
+pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
+```
+
 ## Comparing branches
 
 ```sh

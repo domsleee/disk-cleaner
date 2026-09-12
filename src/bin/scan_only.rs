@@ -5,6 +5,7 @@ use disk_cleaner::scanner::{self, ScanProgress};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 fn main() {
     let path = std::env::args()
@@ -31,7 +32,9 @@ fn main() {
         seen_inodes: Default::default(),
     });
 
+    let scan_start = Instant::now();
     let tree = scanner::scan_directory(&path, progress.clone());
+    let scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
 
     let files = progress.file_count.load(Ordering::Relaxed);
     let size = progress.total_size.load(Ordering::Relaxed);
@@ -58,5 +61,12 @@ fn main() {
             bytesize::ByteSize::b(size)
         );
     }
-    std::hint::black_box(tree);
+
+    let tree = std::hint::black_box(tree);
+    let drop_start = Instant::now();
+    drop(tree);
+    let drop_ms = drop_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Parsed by benches/ab_pairs.ps1.
+    println!("BENCH scan_ms={scan_ms:.3} drop_ms={drop_ms:.3} files={files} bytes={size}");
 }

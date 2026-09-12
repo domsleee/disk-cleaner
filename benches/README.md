@@ -96,6 +96,25 @@ identical on-disk layout.
 .\benches\coldcache.ps1 -Cleanup   # delete the fixture
 ```
 
+### Paired A/B scan speed (`ab_pairs.ps1`, Windows)
+
+For resolving small (3-5%) scan-speed differences between two builds, where a
+median-of-5 is not enough. Runs randomized AB/BA pairs and reports the
+geometric mean ratio with a bootstrap confidence interval.
+
+`scan_only` prints `BENCH scan_ms=... drop_ms=...`, timing the scan separately
+from tearing the tree down. Teardown is ~200 ms on a 1.5M-file tree, so whole-
+process timing will report a change that only speeds up `free` as a scan win.
+Compare `scan_ms`, not process wall-clock.
+
+```powershell
+cargo build --profile release-dist --features internal-tools --bin scan_only
+Copy-Item target\release-dist\scan_only.exe $env:TEMP\scan_a.exe
+# switch branch, rebuild, then:
+.\benches\ab_pairs.ps1 -ExeA $env:TEMP\scan_a.exe -ExeB target\release-dist\scan_only.exe -ScanPath C:\Users\me\projects
+.\benches\ab_pairs.ps1 ... -Pairs 40 -CsvPath runs.csv   # tighter interval
+```
+
 ## Comparing branches
 
 ```sh

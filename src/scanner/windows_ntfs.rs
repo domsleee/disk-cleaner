@@ -611,6 +611,13 @@ fn build_raw_mft_index_for_path_impl(
         )?;
     }
 
+    // The read loop checks cancellation per chunk; finish() aggregates every
+    // entry, so don't start it for a scan that was cancelled during the read.
+    if let Some(p) = progress
+        && p.cancelled.load(Ordering::Relaxed)
+    {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
     let finish_start = Instant::now();
     let index = raw.finish();
     timings.finish += finish_start.elapsed();
@@ -1374,11 +1381,20 @@ impl RawMftIndexBuild {
             link_count,
             is_name_surrogate_reparse,
         } = fragment;
+        // References are 48-bit fields read straight off the disk; a corrupt
+        // one would size the dense tables below (and the tree builder's
+        // visited bitmap) by garbage, so bound them by the record count.
+        let record_limit = self.entry_index.len() as u64;
+        if owner_record_number >= record_limit {
+            self.summary.parse_errors += 1;
+            return;
+        }
+        let mut file_names = file_names;
+        let names_before = file_names.len();
+        file_names.retain(|name| name.parent_record_number < record_limit);
+        self.summary.parse_errors += (names_before - file_names.len()) as u64;
         let from_owner = record_number == owner_record_number;
         let owner_idx = owner_record_number as usize;
-        if owner_idx >= self.entry_index.len() {
-            self.entry_index.resize(owner_idx + 1, INVALID_INDEX);
-        }
         if self.entry_index[owner_idx] == INVALID_INDEX {
             let idx = self.entries.len();
             let idx_u32 = u32::try_from(idx).expect("raw MFT entry index overflow");
@@ -3136,19 +3152,19 @@ fn wide_name_from_record(record: &[u8], offset: usize, len_bytes: usize) -> io::
         return Ok(ascii);
     }
     let mut wide = Vec::with_capacity(len_bytes / size_of::<u16>());
-    for chunk in bytes.chunks_exact(size_of::<u16>()) {
-        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for chunk in bytes.as_chunks::<2>().0 {
+        wide.push(u16::from_le_bytes(*chunk));
     }
     Ok(String::from_utf16_lossy(&wide))
 }
 
 fn wide_ascii_name_from_record(bytes: &[u8]) -> Option<String> {
     let mut ascii = Vec::with_capacity(bytes.len() / size_of::<u16>());
-    for chunk in bytes.chunks_exact(size_of::<u16>()) {
-        if chunk[1] != 0 || chunk[0] >= 0x80 {
+    for &[lo, hi] in bytes.as_chunks::<2>().0 {
+        if hi != 0 || lo >= 0x80 {
             return None;
         }
-        ascii.push(chunk[0]);
+        ascii.push(lo);
     }
     Some(unsafe { String::from_utf8_unchecked(ascii) })
 }
@@ -3283,10 +3299,31 @@ pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> bool 
 /// the second and later sightings).
 pub fn scan_volume_tree(root: &Path, progress: &super::ScanProgress) -> io::Result<FileNode> {
     let index = build_raw_mft_index_for_scan(root, progress)?;
-    // The read loop checks cancellation per chunk, but index finish and tree
-    // materialization run after it — don't start them for a cancelled scan.
     if progress.cancelled.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
+    if index.entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw MFT index is empty",
+        ));
+    }
+    // A record that fails the update-sequence check or has out-of-range
+    // references is dropped from the index, orphaning anything under it.
+    // The scan still completes, so surface the count where the walkers'
+    // fallbacks show rather than reporting a silently smaller drive.
+    if index.summary.parse_errors > 0 {
+        progress.record_windows_bulk_scan_fallback(
+            "raw MFT record parse",
+            root,
+            &io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} MFT records failed to parse; their subtrees are missing",
+                    index.summary.parse_errors
+                ),
+            ),
+        );
     }
     let visibility = collect_win32_root_visibility(root)?;
     Ok(build_tree_from_index(&index, root, &visibility, progress))
@@ -3341,9 +3378,10 @@ fn build_tree_from_index(
     // parallel subtree builds can share it.
     let max_record = entries
         .iter()
-        .map(|e| e.record_number.max(e.parent_record_number))
+        .map(|e| e.record_number)
         .max()
-        .unwrap_or(0) as usize;
+        .unwrap_or(0)
+        .max(root_record) as usize;
     let visited: Vec<std::sync::atomic::AtomicBool> = (0..=max_record)
         .map(|_| std::sync::atomic::AtomicBool::new(false))
         .collect();
@@ -3570,6 +3608,51 @@ mod tests {
             .expect("blocked dir present");
         assert_eq!(blocked.size(), 0);
         assert!(blocked.children().is_empty());
+    }
+
+    #[test]
+    fn tree_from_empty_index_does_not_panic() {
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries: Vec::new(),
+        };
+        let progress = test_progress();
+        let tree = build_tree_from_index(&index, Path::new(r"C:\"), &HashMap::new(), &progress);
+        assert!(tree.children().is_empty());
+        assert_eq!(tree.size(), 0);
+    }
+
+    #[test]
+    fn raw_mft_index_rejects_out_of_range_references() {
+        let mut build =
+            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        // Owner reference beyond the record count: whole fragment dropped.
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 10,
+            owner_record_number: 1 << 40,
+            file_names: vec![file_name(5, "ext.txt", 3)].into(),
+            is_directory: false,
+            logical_size: Some(1),
+            allocated_size: Some(1),
+            link_count: Some(1),
+            is_name_surrogate_reparse: false,
+        });
+        // Parent reference beyond the record count: that name dropped, the
+        // in-range one kept.
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 11,
+            owner_record_number: 11,
+            file_names: vec![file_name(1 << 40, "bad", 3), file_name(5, "good.txt", 3)].into(),
+            is_directory: false,
+            logical_size: Some(2),
+            allocated_size: Some(2),
+            link_count: Some(2),
+            is_name_surrogate_reparse: false,
+        });
+        let index = build.finish();
+        assert_eq!(index.summary.parse_errors, 2);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(&*index.entries[0].name, "good.txt");
     }
 
     fn file_name(

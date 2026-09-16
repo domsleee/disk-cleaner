@@ -546,7 +546,7 @@ fn scan_directory_inner(
                     progress.mft_used.store(true, Ordering::Relaxed);
                     Some(node)
                 }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                Err(_) if progress.cancelled.load(Ordering::Relaxed) => {
                     progress.mft_used.store(true, Ordering::Relaxed);
                     Some(FileNode::Dir(Box::new(DirNode {
                         name: root_name.clone(),

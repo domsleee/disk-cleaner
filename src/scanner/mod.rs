@@ -287,6 +287,7 @@ pub enum ScanFallbackKind {
     AccessDeniedOpen,
     OtherOpen,
     BulkScan,
+    MftRecords,
 }
 
 impl ScanFallbackKind {
@@ -295,6 +296,7 @@ impl ScanFallbackKind {
             Self::AccessDeniedOpen => "Protected folder",
             Self::OtherOpen => "Open retry",
             Self::BulkScan => "Scan retry",
+            Self::MftRecords => "MFT records skipped",
         }
     }
 }
@@ -355,6 +357,16 @@ impl ScanProgress {
             .fetch_add(1, Ordering::Relaxed);
         self.push_fallback_detail(ScanFallbackKind::BulkScan, path, err);
         log_windows_fallback(stage, path, err);
+    }
+
+    /// The raw MFT scan completed but skipped records it could not parse.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_mft_parse_errors(&self, path: &Path, err: &io::Error) {
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.bulk_scan_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_fallback_detail(ScanFallbackKind::MftRecords, path, err);
+        log_windows_fallback("raw MFT record parse", path, err);
     }
 
     #[cfg(target_os = "windows")]

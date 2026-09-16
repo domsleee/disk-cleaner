@@ -216,7 +216,19 @@ pub struct RawMftIndexSummary {
     pub total_logical_size: u64,
     pub total_allocated_size: u64,
     pub sample_entries: Vec<RawMftIndexEntry>,
+    /// Parse failures grouped by message (first `MAX_PARSE_ERROR_KINDS`
+    /// distinct messages), so a report can say what went wrong and where.
+    pub parse_error_kinds: Vec<RawMftParseErrorKind>,
 }
+
+#[derive(Debug, Clone)]
+pub struct RawMftParseErrorKind {
+    pub message: Box<str>,
+    pub count: u64,
+    pub first_record: u64,
+}
+
+const MAX_PARSE_ERROR_KINDS: usize = 8;
 
 pub struct RawMftIndex {
     pub summary: RawMftIndexSummary,
@@ -1329,6 +1341,10 @@ struct RawMftIndexBuild {
     summary: RawMftIndexSummary,
     entries: Vec<RawMftIndexAggregate>,
     entry_index: Vec<u32>,
+    /// Live totals for the scanning screen while the read runs: file
+    /// records seen and their allocated bytes (before hardlink dedup).
+    running_files: u64,
+    running_allocated: u64,
 }
 
 #[derive(Default)]
@@ -1366,6 +1382,22 @@ impl RawMftIndexBuild {
             },
             entries,
             entry_index: vec![INVALID_INDEX; expected_records.saturating_add(1)],
+            running_files: 0,
+            running_allocated: 0,
+        }
+    }
+
+    fn record_parse_error(&mut self, record_number: u64, message: &str) {
+        self.summary.parse_errors += 1;
+        let kinds = &mut self.summary.parse_error_kinds;
+        if let Some(kind) = kinds.iter_mut().find(|kind| &*kind.message == message) {
+            kind.count += 1;
+        } else if kinds.len() < MAX_PARSE_ERROR_KINDS {
+            kinds.push(RawMftParseErrorKind {
+                message: message.into(),
+                count: 1,
+                first_record: record_number,
+            });
         }
     }
 
@@ -1386,13 +1418,15 @@ impl RawMftIndexBuild {
         // visited bitmap) by garbage, so bound them by the record count.
         let record_limit = self.entry_index.len() as u64;
         if owner_record_number >= record_limit {
-            self.summary.parse_errors += 1;
+            self.record_parse_error(record_number, "MFT base record reference out of range");
             return;
         }
         let mut file_names = file_names;
         let names_before = file_names.len();
         file_names.retain(|name| name.parent_record_number < record_limit);
-        self.summary.parse_errors += (names_before - file_names.len()) as u64;
+        for _ in file_names.len()..names_before {
+            self.record_parse_error(record_number, "MFT parent reference out of range");
+        }
         let from_owner = record_number == owner_record_number;
         let owner_idx = owner_record_number as usize;
         if self.entry_index[owner_idx] == INVALID_INDEX {
@@ -1408,6 +1442,10 @@ impl RawMftIndexBuild {
             } else {
                 (None, None, false)
             };
+            if !is_directory {
+                self.running_files += 1;
+                self.running_allocated += allocated_size.unwrap_or(0);
+            }
             self.entries.push(RawMftIndexAggregate {
                 record_number: owner_record_number,
                 file_names,
@@ -1434,9 +1472,13 @@ impl RawMftIndexBuild {
         if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size)
             && (entry.logical_size.is_none() || (from_owner && !entry.size_from_owner))
         {
+            let previous = entry.allocated_size.unwrap_or(0);
             entry.logical_size = Some(logical_size);
             entry.allocated_size = Some(allocated_size);
             entry.size_from_owner = from_owner;
+            if !entry.is_directory {
+                self.running_allocated = self.running_allocated - previous + allocated_size;
+            }
         }
     }
 
@@ -2479,11 +2521,12 @@ fn build_raw_mft_index_via_volume(
                     }
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
                 }
-                // Coarse ticker while the MFT read runs: records scanned is a
-                // slight overcount of files (free records included) but keeps
-                // the scanning screen moving through this single long phase.
-                p.file_count
-                    .store(build.summary.records_scanned, Ordering::Relaxed);
+                // Live ticker while the MFT read runs. Hardlinks are only
+                // deduplicated in the tree build, so the size can run a
+                // little high until the final numbers land.
+                p.file_count.store(build.running_files, Ordering::Relaxed);
+                p.total_size
+                    .store(build.running_allocated, Ordering::Relaxed);
             }
 
             pending = schedule_next;
@@ -2578,6 +2621,9 @@ fn process_raw_mft_records(
         let record_number = *next_record_number;
         *next_record_number += 1;
 
+        if is_uninitialized_record(record) {
+            continue;
+        }
         match apply_update_sequence_fixup(record, bytes_per_sector)
             .and_then(|fixed| parse_raw_mft_record(fixed, record_number))
         {
@@ -2607,6 +2653,9 @@ fn process_raw_mft_index_records(
         .enumerate()
         .map(|(idx, record)| {
             let record_number = base_record_number + idx as u64;
+            if is_uninitialized_record(record) {
+                return Ok(None);
+            }
             apply_update_sequence_fixup(record, bytes_per_sector)
                 .and_then(|fixed| parse_raw_mft_record_fragment(fixed, record_number))
         })
@@ -2614,14 +2663,21 @@ fn process_raw_mft_index_records(
     timings.parse_fixup += parse_start.elapsed();
 
     let merge_start = Instant::now();
-    for result in parsed {
+    for (idx, result) in parsed.into_iter().enumerate() {
         match result {
             Ok(Some(fragment)) => build.push_fragment(fragment),
             Ok(None) => {}
-            Err(_) => build.summary.parse_errors += 1,
+            Err(err) => build.record_parse_error(base_record_number + idx as u64, &err.to_string()),
         }
     }
     timings.merge += merge_start.elapsed();
+}
+
+/// A record NTFS has allocated but never written is all zeros: it has no
+/// update sequence array, so the fixup would reject it, but it is free
+/// space, not corruption.
+fn is_uninitialized_record(record: &[u8]) -> bool {
+    record.len() >= 8 && record[..8] == [0; 8]
 }
 
 fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io::Result<&[u8]> {
@@ -3313,14 +3369,25 @@ pub fn scan_volume_tree(root: &Path, progress: &super::ScanProgress) -> io::Resu
     // The scan still completes, so surface the count where the walkers'
     // fallbacks show rather than reporting a silently smaller drive.
     if index.summary.parse_errors > 0 {
-        progress.record_windows_bulk_scan_fallback(
-            "raw MFT record parse",
+        let kinds: Vec<String> = index
+            .summary
+            .parse_error_kinds
+            .iter()
+            .map(|kind| {
+                format!(
+                    "{}x {} (first at record {})",
+                    kind.count, kind.message, kind.first_record
+                )
+            })
+            .collect();
+        progress.record_windows_mft_parse_errors(
             root,
             &io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{} MFT records failed to parse; their subtrees are missing",
-                    index.summary.parse_errors
+                    "{} MFT records failed to parse; anything under them is missing: {}",
+                    index.summary.parse_errors,
+                    kinds.join("; ")
                 ),
             ),
         );
@@ -3620,6 +3687,36 @@ mod tests {
         let tree = build_tree_from_index(&index, Path::new(r"C:\"), &HashMap::new(), &progress);
         assert!(tree.children().is_empty());
         assert_eq!(tree.size(), 0);
+    }
+
+    #[test]
+    fn raw_mft_index_classifies_parse_errors_and_skips_zeroed_records() {
+        const RECORD: usize = 1024;
+        let mut buf = vec![0u8; RECORD * 3];
+        // Record 0: all zeros — allocated but never written, not an error.
+        // Record 1: garbage header, no update sequence array.
+        buf[RECORD..RECORD + 4].copy_from_slice(&[1, 2, 3, 4]);
+        // Record 2: FILE signature whose sector tails don't match the USA.
+        let r2 = &mut buf[RECORD * 2..];
+        r2[..4].copy_from_slice(b"FILE");
+        r2[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        r2[6..8].copy_from_slice(&3u16.to_le_bytes());
+        r2[0x30..0x32].copy_from_slice(&[0xAA, 0xBB]);
+
+        let mut build =
+            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 16);
+        let mut next = 0u64;
+        let mut timings = RawMftBuildTimings::default();
+        process_raw_mft_index_records(&mut buf, RECORD, 512, &mut next, &mut build, &mut timings);
+
+        assert_eq!(build.summary.records_scanned, 3);
+        assert_eq!(build.summary.parse_errors, 2);
+        let kinds = &build.summary.parse_error_kinds;
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(&*kinds[0].message, "invalid NTFS USA count");
+        assert_eq!(kinds[0].first_record, 1);
+        assert_eq!(&*kinds[1].message, "NTFS update sequence mismatch");
+        assert_eq!(kinds[1].first_record, 2);
     }
 
     #[test]

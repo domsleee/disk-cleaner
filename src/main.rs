@@ -244,6 +244,53 @@ fn print_help() {
     eprintln!("  -h, --help             Print this help message");
 }
 
+/// Relaunch this executable elevated (Windows shows a UAC prompt) with
+/// `scan_path` as its argument, so a whole-drive scan can take the raw NTFS
+/// MFT fast path. On success the caller closes this instance.
+#[cfg(target_os = "windows")]
+fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let mut arg = scan_path.to_string_lossy().into_owned();
+    if arg.contains(' ') {
+        // A backslash right before the closing quote would escape it.
+        if arg.ends_with('\\') {
+            arg.push('\\');
+        }
+        arg = format!("\"{arg}\"");
+    }
+    let wide =
+        |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+    let verb = wide(std::ffi::OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params = wide(std::ffi::OsStr::new(&arg));
+    const SW_SHOWNORMAL: i32 = 1;
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as usize;
+    // Documented as "greater than 32 on success"; 5 is the UAC prompt being
+    // declined.
+    match rc {
+        code if code > 32 => Ok(()),
+        5 => Err("permission was declined".to_string()),
+        code => Err(format!("ShellExecuteW failed with code {code}")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn relaunch_elevated(_scan_path: &std::path::Path) -> Result<(), String> {
+    Err("not supported on this platform".to_string())
+}
+
 fn main() -> eframe::Result {
     let process_start = Instant::now();
 
@@ -1632,6 +1679,7 @@ impl eframe::App for App {
         }
 
         let mut open_fallback_report = false;
+        let mut restart_elevated = false;
 
         // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
@@ -1695,12 +1743,18 @@ impl eframe::App for App {
                             .mft_elevation_hint
                             .load(Ordering::Relaxed)
                         {
-                            ui.label(egui::RichText::new("💡 admin = faster").small().weak())
-                                .on_hover_text(
-                                    "Run as administrator to enable the NTFS fast scan for \
-                                     whole-drive scans — typically 2-3x faster when the disk \
-                                     cache is cold.",
-                                );
+                            let button = egui::Button::new(
+                                egui::RichText::new("💡 Restart as admin").small().weak(),
+                            )
+                            .frame(false);
+                            let response = ui.add(button).on_hover_text(
+                                "Relaunch as administrator to enable the NTFS fast scan for \
+                                 whole-drive scans — typically 2-3x faster when the disk \
+                                 cache is cold. Windows will ask for permission.",
+                            );
+                            if response.clicked() {
+                                restart_elevated = true;
+                            }
                             ui.separator();
                         }
 
@@ -1764,6 +1818,14 @@ impl eframe::App for App {
 
         if open_fallback_report {
             self.open_fallback_report();
+        }
+        if restart_elevated && let Some(path) = self.scan_path.clone() {
+            match relaunch_elevated(&path) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(err) => {
+                    self.error = Some(format!("Could not restart as administrator: {err}"));
+                }
+            }
         }
 
         // Main content

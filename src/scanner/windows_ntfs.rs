@@ -3304,8 +3304,19 @@ fn parse_data_attribute_sizes(record: &[u8]) -> io::Result<(u64, u64, bool)> {
                     offset += attr_len;
                     continue;
                 }
-                let allocated_size =
-                    u64::from_le_bytes(record[offset + 0x28..offset + 0x30].try_into().unwrap());
+                let attr_flags =
+                    u16::from_le_bytes(record[offset + 0x0C..offset + 0x0E].try_into().unwrap());
+                let allocated_offset =
+                    if attr_flags & (ATTR_FLAG_COMPRESSION_MASK | ATTR_FLAG_SPARSE) != 0 {
+                        0x40
+                    } else {
+                        0x28
+                    };
+                let allocated_size = u64::from_le_bytes(
+                    record[offset + allocated_offset..offset + allocated_offset + 8]
+                        .try_into()
+                        .unwrap(),
+                );
                 let logical_size =
                     u64::from_le_bytes(record[offset + 0x30..offset + 0x38].try_into().unwrap());
                 return Ok((logical_size, allocated_size, false));

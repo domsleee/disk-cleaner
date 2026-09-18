@@ -108,6 +108,11 @@ of 95% coverage: the percentile interval is approximate and assumes independent,
 representative pairs. Use a stable scan target and inspect the interval width.
 An interval including zero means the run is inconclusive.
 
+Not suitable for comparing the raw-MFT scanner against the directory walker:
+the two evict each other's caches, so alternating pairs are biased, and the
+harness aborts on their legitimate file-count difference. See
+[`src/scanner/README.md`](../src/scanner/README.md).
+
 `scan_only` prints `BENCH scan_ms=... drop_ms=...`. `scan_ms` covers the complete
 `scan_directory()` call, including thread-pool initialization, dedup-set cleanup,
 and sorting. `drop_ms` covers only teardown of the returned tree (~200 ms on a

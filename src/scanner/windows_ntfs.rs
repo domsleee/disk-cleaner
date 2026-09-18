@@ -32,7 +32,7 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BusTypeNvme, BusTypeSCM, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    BusTypeNvme, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
     FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
@@ -85,8 +85,8 @@ const ATTR_FLAG_SPARSE: u16 = 0x8000;
 /// than disk-bound (0.78-1.06 GB/s achieved on NVMe, ~1.0-1.4 us/file against
 /// the walker's 0.8-1.5), so the win is a near-tie decided by device latency:
 /// 25% on one NVMe volume, 8% on another, and 3.1x/5.7x *losses* on two SATA
-/// volumes. Measured on four volumes of one machine; anything unrecognised
-/// keeps the walker, which is the safe direction.
+/// volumes. Measured on four volumes of one machine. Only buses measured to win
+/// appear here; an unrecognised bus, or a query that fails, keeps the walker.
 ///
 /// Volume shape does not appear here on purpose. Counting in-use records from
 /// `$MFT`'s `$BITMAP` moves the predicted ratios to 0.66/0.65/2.39/3.36, which
@@ -94,7 +94,7 @@ const ATTR_FLAG_SPARSE: u16 = 0x8000;
 /// term (at most 1.5x). It would start to matter on a high-free-fraction NVMe
 /// volume, which is the case to build and measure before adding it.
 fn bus_favours_mft(bus_type: i32) -> bool {
-    bus_type == BusTypeNvme || bus_type == BusTypeSCM
+    bus_type == BusTypeNvme
 }
 
 fn volume_bus_type(volume_handle: HANDLE) -> io::Result<i32> {
@@ -3505,9 +3505,10 @@ pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> Optio
         return None;
     }
     if eligibility.can_open_volume {
+        // A volume we cannot ask about keeps the walker.
         return match mft_worth_it(&eligibility) {
-            Ok(false) => None,
-            _ => Some(eligibility),
+            Ok(true) => Some(eligibility),
+            _ => None,
         };
     }
     if eligibility.needs_elevation() {

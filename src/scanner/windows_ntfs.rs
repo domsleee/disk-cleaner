@@ -124,7 +124,13 @@ fn volume_bus_type(volume_handle: HANDLE) -> io::Result<i32> {
             "short storage device descriptor",
         ));
     }
-    Ok(unsafe { &*buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>() }.BusType)
+    // `buf` is a byte array, so it is not aligned for the descriptor.
+    let descriptor = unsafe {
+        buf.as_ptr()
+            .cast::<STORAGE_DEVICE_DESCRIPTOR>()
+            .read_unaligned()
+    };
+    Ok(descriptor.BusType)
 }
 
 #[derive(Debug)]
@@ -316,7 +322,7 @@ pub struct RawMftIndexSummary {
     pub total_logical_size: u64,
     pub total_allocated_size: u64,
     pub sample_entries: Vec<RawMftIndexEntry>,
-    /// Parse failures grouped by message (first `MAX_PARSE_ERROR_KINDS`
+    /// Parse failures grouped by message, up to `MAX_PARSE_ERROR_KINDS` kinds.
     pub parse_error_kinds: Vec<RawMftParseErrorKind>,
 }
 
@@ -746,7 +752,7 @@ fn build_raw_mft_index_for_path_impl(
         )?;
     }
 
-    // The read loop checks cancellation per chunk; finish() aggregates every
+    // finish() aggregates every entry, so skip it for a cancelled scan.
     if let Some(p) = progress
         && p.cancelled.load(Ordering::Relaxed)
     {
@@ -1464,7 +1470,7 @@ struct RawMftIndexBuild {
     entries: Vec<RawMftIndexAggregate>,
     entry_index: Vec<u32>,
     record_limit: u64,
-    /// Live totals for the scanning screen while the read runs: file
+    /// Live totals for the scanning screen, before hardlink dedup.
     running_files: u64,
     running_allocated: u64,
 }
@@ -1538,7 +1544,7 @@ impl RawMftIndexBuild {
             link_count,
             is_name_surrogate_reparse,
         } = fragment;
-        // References are 48-bit fields read straight off the disk; a corrupt
+        // References come straight off disk; a corrupt one would size the dense tables by garbage.
         let record_limit = self.record_limit;
         if owner_record_number >= record_limit {
             self.record_parse_error(record_number, "MFT base record reference out of range");
@@ -2273,7 +2279,7 @@ fn scan_raw_mft_attributes(record: &[u8]) -> io::Result<ScannedRawMftAttributes>
                         let attr_flags = u16::from_le_bytes(
                             record[offset + 0x0C..offset + 0x0E].try_into().unwrap(),
                         );
-                        // AllocatedSize counts holes; TotalAllocatedSize is the
+                        // Sparse/compressed: AllocatedSize counts holes, TotalAllocatedSize is the physical bytes.
                         let allocated_offset =
                             if attr_flags & (ATTR_FLAG_COMPRESSION_MASK | ATTR_FLAG_SPARSE) != 0 {
                                 0x40
@@ -2691,13 +2697,13 @@ fn build_raw_mft_index_via_volume(
 
             if let Some(p) = progress {
                 if p.cancelled.load(Ordering::Relaxed) {
-                    // The next chunk's read may already be queued; drain it
+                    // Drain the queued read so the kernel cannot write into a dropped buffer.
                     if schedule_next {
                         let _ = finish_overlapped_volume_read(&volume_file, &mut slots[next_slot]);
                     }
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
                 }
-                // Live ticker while the MFT read runs. Hardlinks are only
+                // Live ticker; hardlinks are deduplicated later, so this can run high.
                 p.file_count.store(build.running_files, Ordering::Relaxed);
                 p.total_size
                     .store(build.running_allocated, Ordering::Relaxed);
@@ -2847,7 +2853,7 @@ fn process_raw_mft_index_records(
     timings.merge += merge_start.elapsed();
 }
 
-/// A record NTFS has allocated but never written is all zeros: it has no
+/// A never-written record is all zeros: free space, not corruption.
 fn is_uninitialized_record(record: &[u8]) -> bool {
     record.len() >= 8 && record[..8] == [0; 8]
 }
@@ -3481,8 +3487,8 @@ fn trim_wide_nul(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// Decide whether a scan of `root` should use the raw-MFT fast path: the
-/// `mft_elevation_hint` on the progress so the UI can suggest running as
+/// Eligibility to scan `root` via the raw MFT, or `None` to use the walker.
+/// Sets `mft_elevation_hint` when admin rights are the only thing missing.
 pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> Option<NtfsEligibility> {
     if mft_mode() == "off" {
         return None;
@@ -3491,7 +3497,7 @@ pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> Optio
     if !eligibility.is_ntfs() || !eligibility.is_local_fixed_drive() {
         return None;
     }
-    // Only whole-volume scans: the MFT covers the entire volume, so scanning
+    // Only whole-volume scans: a subtree would read all of $MFT to keep a fraction.
     let is_volume_root = match (
         std::fs::canonicalize(root),
         std::fs::canonicalize(&eligibility.volume_root),
@@ -3530,7 +3536,7 @@ pub fn scan_volume_tree(
             "raw MFT index is empty",
         ));
     }
-    // A record that fails the update-sequence check or has out-of-range
+    // Dropped records orphan their subtrees, so report the count rather than a smaller drive.
     if index.summary.parse_errors > 0 {
         let kinds: Vec<String> = index
             .summary
@@ -3562,7 +3568,7 @@ pub fn scan_volume_tree(
         collect_win32_root_visibility(root)?
     };
     let tree = build_tree_from_index(&index, root, &visibility, progress);
-    // Cancelling mid-build leaves arbitrary subtrees empty, so the partial tree
+    // Cancelling mid-build leaves arbitrary subtrees empty, so discard the partial tree.
     if progress.cancelled.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
     }
@@ -3579,7 +3585,7 @@ struct ChildIndex {
 
 impl ChildIndex {
     fn build(entries: &[RawMftIndexEntry], max_record: usize, root_record: u32) -> Self {
-        // The root directory's own entry parents itself; leaving it out keeps
+        // The root's own entry parents itself; excluding it stops the walk re-entering it.
         let counted = |entry: &RawMftIndexEntry| entry.record_number != root_record;
 
         let mut starts = vec![0u32; max_record + 2];
@@ -3641,7 +3647,7 @@ fn build_tree_from_index(
         .max(root_record) as usize;
     let children = ChildIndex::build(entries, max_record, root_record);
 
-    // Corrupt or torn records could produce a parent cycle; the visited
+    // The visited bitmap terminates parent cycles; atomic so parallel builds share it.
     let visited: Vec<std::sync::atomic::AtomicBool> = (0..=max_record)
         .map(|_| std::sync::atomic::AtomicBool::new(false))
         .collect();
@@ -3657,9 +3663,9 @@ fn build_tree_from_index(
         .par_iter()
         .filter_map(|&idx| {
             let entry = &entries[idx as usize];
-            // Mirror the Win32 view of the root: skip metafiles and
+            // Mirror the Win32 root listing: skip metafiles and anything it does not show.
             let vis = visibility.get(&entry.name.to_lowercase())?;
-            // Directories the listing shows but can't open (e.g.
+            // Directories the listing shows but cannot open stay size 0, matching the walker.
             if entry.is_directory && !vis.can_recurse {
                 progress.record_windows_mft_blocked_dir(&root.join(&*entry.name));
                 return Some(FileNode::Dir(Box::new(DirNode {

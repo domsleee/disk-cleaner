@@ -32,14 +32,13 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BusTypeAta, BusTypeNvme, BusTypeRAID, BusTypeSCM, BusTypeSas, BusTypeSata, CreateFileW,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
-    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdType,
-    FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, OpenFileById, ReadFile,
-    VOLUME_NAME_DOS,
+    BusTypeNvme, BusTypeSCM, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileIdType, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    OpenFileById, ReadFile, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::{
     DeviceIoControl, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0,
@@ -80,19 +79,22 @@ const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
 const ATTR_FLAG_COMPRESSION_MASK: u16 = 0x00FF;
 const ATTR_FLAG_SPARSE: u16 = 0x8000;
 
-/// Measured 0.8-1.4 us per entry across four NTFS volumes on one machine.
-const WALKER_SECS_PER_ENTRY: f64 = 1.35e-6;
-const MFT_REQUIRED_MARGIN: f64 = 0.8;
-
-/// Sequential read rate to expect from the device behind a volume. Measuring
-/// it for real means reading $MFT, which evicts the cache the walker needs
-/// when the answer turns out to be "use the walker".
-fn expected_read_bytes_per_sec(bus_type: i32) -> f64 {
-    match bus_type {
-        t if t == BusTypeNvme || t == BusTypeSCM => 1.2e9,
-        t if t == BusTypeSata || t == BusTypeSas || t == BusTypeRAID || t == BusTypeAta => 3.5e8,
-        _ => 1.0e8,
-    }
+/// Buses on which the raw MFT has been measured to beat the bulk walker.
+///
+/// This is a whitelist, not a cost model. Reading `$MFT` is parse-bound rather
+/// than disk-bound (0.78-1.06 GB/s achieved on NVMe, ~1.0-1.4 us/file against
+/// the walker's 0.8-1.5), so the win is a near-tie decided by device latency:
+/// 25% on one NVMe volume, 8% on another, and 3.1x/5.7x *losses* on two SATA
+/// volumes. Measured on four volumes of one machine; anything unrecognised
+/// keeps the walker, which is the safe direction.
+///
+/// Volume shape does not appear here on purpose. Counting in-use records from
+/// `$MFT`'s `$BITMAP` moves the predicted ratios to 0.66/0.65/2.39/3.36, which
+/// changes none of those four decisions — the bus gap (3.4x) dwarfs the shape
+/// term (at most 1.5x). It would start to matter on a high-free-fraction NVMe
+/// volume, which is the case to build and measure before adding it.
+fn bus_favours_mft(bus_type: i32) -> bool {
+    bus_type == BusTypeNvme || bus_type == BusTypeSCM
 }
 
 fn volume_bus_type(volume_handle: HANDLE) -> io::Result<i32> {
@@ -144,25 +146,12 @@ impl std::fmt::Display for MftSlowerThanWalker {
 
 impl std::error::Error for MftSlowerThanWalker {}
 
-/// Whether the raw MFT is likely to beat the walker on this volume. Compares
-/// `$MFT` bytes at the device's expected read rate against a per-entry cost
-/// for the walker; unknown devices keep the walker.
 fn mft_worth_it(eligibility: &NtfsEligibility) -> io::Result<bool> {
     if mft_mode() == "force" {
         return Ok(true);
     }
     let volume = open_volume(&eligibility.volume_device)?;
-    let volume_data = ntfs_volume_data(volume.0)?;
-    let record_size = volume_data.BytesPerFileRecordSegment as u64;
-    if record_size == 0 {
-        return Ok(false);
-    }
-    let valid_len = u64::try_from(volume_data.MftValidDataLength).unwrap_or_default();
-    let total_records = valid_len / record_size;
-    let rate = expected_read_bytes_per_sec(volume_bus_type(volume.0)?);
-    let projected_mft = valid_len as f64 / rate;
-    let projected_walker = total_records as f64 * WALKER_SECS_PER_ENTRY;
-    Ok(projected_mft < projected_walker * MFT_REQUIRED_MARGIN)
+    Ok(bus_favours_mft(volume_bus_type(volume.0)?))
 }
 
 pub fn is_mft_declined(err: &io::Error) -> bool {

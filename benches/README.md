@@ -1,14 +1,15 @@
 # Benchmarks
 
-Benchmarks are organised into three categories matching the app's main subsystems,
-plus two special-purpose suites.
+Benchmarks cover scanning, tree view, and treemap rendering, with additional
+suites for regression checks and scan comparisons.
 
 ## Categories
 
 ### Scanning (`scan_bench`)
 
-Disk I/O and tree construction. Synthetic fixtures (deep nesting + 20k-file),
-real directory scans (sample_size=10), directory-heavy layouts, and memory-per-node tracking.
+Measures disk I/O and tree construction using deep nesting, a 20k-file fixture,
+real directory scans (`sample_size=10`), and directory-heavy layouts.
+Also tracks memory per node.
 
 ```sh
 cargo bench --bench scan_bench
@@ -16,8 +17,8 @@ cargo bench --bench scan_bench
 
 ### Tree view (`tree_bench`)
 
-Per-frame hot path for the tree view. `collect_cached_rows`, `node_matches`,
-tree walks (find/toggle/expand/remove), selection ops, filter caches,
+Measures the per-frame hot path: `collect_cached_rows`, `node_matches`,
+find/toggle/expand/remove tree walks, selection operations, filter caches,
 category matching, `auto_expand`, and `compute_stats`.
 
 ```sh
@@ -26,8 +27,8 @@ cargo bench --bench tree_bench
 
 ### Treemap (`treemap_bench`)
 
-Treemap rendering. `build_treemap_cache`, `squarify` layout algorithm,
-`find_node`/`breadcrumbs` navigation, label formatting, and `FontId` allocation.
+Measures `build_treemap_cache`, `squarify` layout, `find_node`/`breadcrumbs`
+navigation, label formatting, and `FontId` allocation.
 
 ```sh
 cargo bench --bench treemap_bench
@@ -37,8 +38,8 @@ cargo bench --bench treemap_bench
 
 ### Regression gate (`regression_bench`)
 
-Fixed 50K-file synthetic fixture for CI. Reports bytes/node and scan time
-against hard thresholds. Not for iteration — use `scan_bench` instead.
+Checks bytes/node and scan time against hard thresholds using a fixed
+50K-file CI fixture. Use `scan_bench` for iteration.
 
 ```sh
 cargo bench --bench regression_bench
@@ -46,8 +47,9 @@ cargo bench --bench regression_bench
 
 ### Statistical scan (`stat_bench`)
 
-Runs N full scans of a real directory (default: `$HOME`, 10 runs) and reports
-mean/stddev/CI for scan time and memory. Custom `main()`, not criterion.
+Runs N full scans of a real directory (default: `$HOME`, 10 runs), reporting
+mean, standard deviation, and confidence intervals for scan time and memory.
+Uses a custom `main()`, not Criterion.
 
 ```sh
 cargo bench --bench stat_bench                              # default: ~/
@@ -56,12 +58,11 @@ BENCH_DIR=/path/to/scan BENCH_RUNS=5 cargo bench --bench stat_bench
 
 ### Cold-cache scan (`coldscan.sh`, macOS)
 
-Cold metadata cache without sudo: fixture lives on an APFS sparse image,
-detached/reattached between runs to evict the volume's vnode/metadata
-cache. Note the image's backing file may stay in the boot volume's page
-cache, so this measures a cold mount, not necessarily cold storage — it
-is a consistent A/B baseline, not a disk-seek benchmark. All other
-benches are warm-cache.
+Detaches and reattaches an APFS sparse-image fixture between runs to evict
+the volume's vnode/metadata cache without sudo. The backing file may remain
+in the boot volume's page cache, so this measures a cold mount, not necessarily
+cold storage. It provides a consistent A/B baseline, not a disk-seek benchmark.
+Suites other than the cold-cache scans use warm caches.
 
 ```sh
 ./benches/coldscan.sh                  # 5 cold runs, mean ± stddev
@@ -71,25 +72,25 @@ RUNS=10 SCAN_THREADS=16 ./benches/coldscan.sh
 
 ### Cold-cache scan (`coldcache.ps1`, Windows)
 
-Scans a VHDX-backed NTFS volume that is dismounted/remounted before every
-run, so each scan starts with a cold NTFS metadata cache — no reboot needed.
-Hot-cache benches understate I/O-bound improvements; use this for experiments
-that target first-scan latency (traversal order, handle pipelining, I/O depth).
-Requires an elevated PowerShell. The fixture VHDX is created once under
-`target/coldcache/` and reused across builds, so A/B comparisons see the
-identical on-disk layout.
+Dismounts and remounts a VHDX-backed NTFS volume before each scan, giving it
+a cold NTFS metadata cache without rebooting. Use this for first-scan latency
+experiments, such as traversal order, handle pipelining, and I/O depth:
+warm-cache benchmarks understate I/O-bound improvements.
+
+Requires elevated PowerShell. The fixture is created once in
+`target/coldcache/` and reused across builds to preserve the on-disk layout.
 
 ```powershell
-# 5 cold runs against a generated 50k-file fixture (creates it on first use)
+# 5 cold runs against a generated 50k-file fixture (created on first use)
 .\benches\coldcache.ps1
 
-# Fixture copied from a real tree, 10 runs, plus a hot re-scan for contrast
+# Copy a real tree, run 10 times, and include hot re-scans
 .\benches\coldcache.ps1 -SourcePath C:\Users\me\projects -Runs 10 -AlsoHot
 
-# Evict the .vhdx backing file from the host page cache too (block-level cold)
+# Also evict the backing file from the host page cache (block-level cold)
 .\benches\coldcache.ps1 -PurgeStandby
 
-# A/B: benchmark a saved binary from another ref against the same fixture
+# Compare a saved binary against the same fixture
 .\benches\coldcache.ps1 -Exe C:\temp\scan_only_main.exe
 
 .\benches\coldcache.ps1 -Rebuild   # regenerate the fixture
@@ -98,43 +99,43 @@ identical on-disk layout.
 
 ### Paired A/B scan speed (`ab_pairs.ps1`, Windows)
 
-For comparing warm-cache scan speed between two builds. Runs randomized AB/BA
-pairs and reports the geometric mean ratio with a bootstrap confidence interval.
-Whether a small difference is conclusive depends on variability and pair count.
-Each measured pair must report matching file counts and byte totals.
-`-Pairs` must be even and at least 20 to balance run order and avoid the worst
-small-sample bootstrap behavior. This is a practical minimum, not a guarantee
-of 95% coverage: the percentile interval is approximate and assumes independent,
-representative pairs. Use a stable scan target and inspect the interval width.
-An interval including zero means the run is inconclusive.
+Compares two builds with randomized warm-cache AB/BA pairs, reporting the
+geometric mean ratio and a bootstrap confidence interval. Each measured pair
+must have matching file counts and byte totals.
 
-Not suitable for comparing the raw-MFT scanner against the directory walker:
-the two evict each other's caches, so alternating pairs are biased, and the
-harness aborts on their legitimate file-count difference. See
+`-Pairs` must be even and at least 20 to balance order and limit small-sample
+bootstrap problems. This minimum does not guarantee 95% coverage: the
+percentile interval is approximate and assumes independent, representative
+pairs. Use a stable target and inspect interval width; an improvement interval
+including zero is inconclusive.
+
+Do not use this harness to compare raw MFT scanning with directory walking.
+They evict each other's caches, biasing alternating pairs, and their legitimate
+file-count difference aborts the harness. See
 [`src/scanner/README.md`](../src/scanner/README.md).
 
-`scan_only` prints `BENCH scan_ms=... drop_ms=...`. `scan_ms` covers the complete
+`scan_only` prints `BENCH scan_ms=... drop_ms=...`. `scan_ms` covers the full
 `scan_directory()` call, including thread-pool initialization, dedup-set cleanup,
-and sorting. `drop_ms` covers only teardown of the returned tree (~200 ms on a
-1.5M-file tree), not all process cleanup. Allocator changes can affect both.
-Compare `scan_ms` for scan completion latency; process wall-clock also includes
-tree teardown and process startup/exit.
+and sorting. `drop_ms` covers returned-tree teardown (~200 ms for a 1.5M-file
+tree), not all process cleanup. Allocator changes can affect both. Compare
+`scan_ms` for scan completion latency; process wall-clock also includes tree
+teardown and process startup/exit.
 
 Relative executable, scan, and CSV paths resolve from PowerShell's current
-location. With `-CsvPath`, each completed pair is saved immediately, preserving
-earlier measurements if a later pair fails. The CSV is cleared at the start of
-a run, and failed or mismatched pairs are never included. A partial CSV is raw
-data only; no overall verdict is produced for an incomplete run.
+location. `-CsvPath` clears the CSV at startup and saves each completed pair
+immediately, preserving earlier measurements if a later pair fails.
+Failed or mismatched pairs are excluded. A partial CSV contains raw data only;
+incomplete runs produce no overall verdict.
 
 ```powershell
 cargo build --profile release-dist --features internal-tools --bin scan_only
 Copy-Item target\release-dist\scan_only.exe $env:TEMP\scan_a.exe
-# switch branch, rebuild, then:
+# Switch branch and rebuild, then:
 .\benches\ab_pairs.ps1 -ExeA $env:TEMP\scan_a.exe -ExeB target\release-dist\scan_only.exe -ScanPath C:\Users\me\projects
 .\benches\ab_pairs.ps1 ... -Pairs 40 -CsvPath runs.csv   # more samples
 ```
 
-Harness regression checks use `rustc` to build a small native fixture:
+Harness regression checks compile a small native fixture with `rustc`:
 
 ```powershell
 powershell -NoProfile -File benches/ab_pairs.Tests.ps1
@@ -147,10 +148,10 @@ pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
 # Save a baseline on main
 ./benches/baseline.sh save
 
-# Switch to your branch, compare
+# Switch to your branch and compare
 ./benches/baseline.sh compare
 
-# Or A/B two refs directly
+# Or compare two refs directly
 ./benches/ab.sh main my-feature-branch
 ```
 

@@ -3500,6 +3500,64 @@ pub fn scan_volume_tree(
 }
 
 const ENTRY_HARD_LINK: u8 = 1;
+const ENTRY_OWNS_SIZE: u8 = 2;
+
+/// Volume-relative path of one entry, or `None` if it does not reach the root.
+fn entry_path(
+    entries: &[RawMftIndexEntry],
+    dir_of_record: &[u32],
+    root_record: u32,
+    idx: usize,
+) -> Option<String> {
+    let mut parts = vec![&*entries[idx].name];
+    let mut parent = entries[idx].parent_record_number;
+    // Bounded by the directory depth; a cycle exits on the repeat check below.
+    for _ in 0..4096 {
+        if parent == root_record {
+            parts.reverse();
+            return Some(parts.join("\\"));
+        }
+        let dir = *dir_of_record.get(parent as usize)?;
+        if dir == u32::MAX {
+            return None;
+        }
+        let entry = &entries[dir as usize];
+        if entry.parent_record_number == parent {
+            return None;
+        }
+        parts.push(&entry.name);
+        parent = entry.parent_record_number;
+    }
+    None
+}
+
+/// Which name of a hard-linked record is charged its bytes. Whichever parallel
+/// task arrived first would otherwise take them, moving directory sizes between
+/// runs. Prefers a name the tree will actually reach, so the bytes are not lost
+/// to a name hidden at the root.
+fn hardlink_size_owner(
+    entries: &[RawMftIndexEntry],
+    dir_of_record: &[u32],
+    visibility: &HashMap<String, RootVisibilityEntry>,
+    root_record: u32,
+    from: usize,
+    to: usize,
+) -> usize {
+    let mut best: Option<(bool, String, usize)> = None;
+    for idx in from..to {
+        let Some(path) = entry_path(entries, dir_of_record, root_record, idx) else {
+            continue;
+        };
+        let top = path.split('\\').next().unwrap_or_default().to_lowercase();
+        let reachable = visibility.get(&top).is_some_and(|vis| vis.can_recurse)
+            || (!path.contains('\\') && visibility.contains_key(&top));
+        let candidate = (!reachable, path, idx);
+        if best.as_ref().is_none_or(|b| candidate < *b) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, idx)| idx).unwrap_or(from)
+}
 
 /// CSR child index: avoids hashing and one allocation per directory.
 struct ChildIndex {
@@ -3549,6 +3607,23 @@ fn build_tree_from_index(
 ) -> FileNode {
     let entries = &index.entries;
 
+    let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+    let max_record = entries
+        .iter()
+        .flat_map(|e| [e.record_number, e.parent_record_number])
+        .max()
+        .unwrap_or(0)
+        .max(root_record) as usize;
+
+    // First directory entry per record, so a name can be walked up to the root.
+    let mut dir_of_record = vec![u32::MAX; max_record + 1];
+    for (idx, entry) in entries.iter().enumerate() {
+        let slot = &mut dir_of_record[entry.record_number as usize];
+        if entry.is_directory && *slot == u32::MAX {
+            *slot = idx as u32;
+        }
+    }
+
     let mut flags = vec![0u8; entries.len()];
     let mut i = 0;
     while i < entries.len() {
@@ -3558,17 +3633,12 @@ fn build_tree_from_index(
         }
         if j - i > 1 && !entries[i].is_directory {
             flags[i..j].fill(ENTRY_HARD_LINK);
+            let owner = hardlink_size_owner(entries, &dir_of_record, visibility, root_record, i, j);
+            flags[owner] |= ENTRY_OWNS_SIZE;
         }
         i = j;
     }
 
-    let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
-    let max_record = entries
-        .iter()
-        .flat_map(|e| [e.record_number, e.parent_record_number])
-        .max()
-        .unwrap_or(0)
-        .max(root_record) as usize;
     let children = ChildIndex::build(entries, max_record, root_record);
 
     // The visited bitmap terminates parent cycles; atomic so parallel builds share it.
@@ -3576,10 +3646,6 @@ fn build_tree_from_index(
         .map(|_| std::sync::atomic::AtomicBool::new(false))
         .collect();
     visited[root_record as usize].store(true, Ordering::Relaxed);
-    // Charge a hard-linked record's size to its first reachable name.
-    let size_taken: Vec<std::sync::atomic::AtomicBool> = (0..=max_record)
-        .map(|_| std::sync::atomic::AtomicBool::new(false))
-        .collect();
 
     let cancelled = &progress.cancelled;
     let root_children: Vec<FileNode> = children
@@ -3602,13 +3668,7 @@ fn build_tree_from_index(
                 })));
             }
             Some(build_tree_node(
-                entries,
-                &children,
-                &flags,
-                idx,
-                &visited,
-                &size_taken,
-                cancelled,
+                entries, &children, &flags, idx, &visited, cancelled,
             ))
         })
         .collect();
@@ -3636,17 +3696,16 @@ fn build_tree_node(
     flags: &[u8],
     idx: u32,
     visited: &[std::sync::atomic::AtomicBool],
-    size_taken: &[std::sync::atomic::AtomicBool],
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> FileNode {
     let entry = &entries[idx as usize];
     let hidden = entry.name.starts_with('.') || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
 
     if !entry.is_directory {
-        let hard_link = flags[idx as usize] & ENTRY_HARD_LINK != 0;
+        let flag = flags[idx as usize];
+        let hard_link = flag & ENTRY_HARD_LINK != 0;
         // Allocated (on-disk) size, matching the directory walkers (#99).
-        let counts_size =
-            !hard_link || !size_taken[entry.record_number as usize].swap(true, Ordering::Relaxed);
+        let counts_size = !hard_link || flag & ENTRY_OWNS_SIZE != 0;
         let size = if counts_size {
             entry.subtree_allocated_size
         } else {
@@ -3664,17 +3723,7 @@ fn build_tree_node(
     } else {
         &[]
     };
-    let build = |&k: &u32| {
-        build_tree_node(
-            entries,
-            children_map,
-            flags,
-            k,
-            visited,
-            size_taken,
-            cancelled,
-        )
-    };
+    let build = |&k: &u32| build_tree_node(entries, children_map, flags, k, visited, cancelled);
     let child_nodes: Vec<FileNode> = if kids.len() >= TREE_PAR_THRESHOLD {
         kids.par_iter().map(build).collect()
     } else {

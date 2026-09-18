@@ -1,14 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app_icon;
-mod categories;
-mod category_worker;
 mod deleter;
-mod icons;
-mod scanner;
-mod tree;
-mod treemap;
-mod ui;
+
+use disk_cleaner::{app_icon, categories, category_worker, icons, scanner, tree, treemap, ui};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -242,6 +236,50 @@ fn print_help() {
     eprintln!("Options:");
     eprintln!("  --screenshot <prefix>  Take screenshots and save as <prefix>_home.png, etc.");
     eprintln!("  -h, --help             Print this help message");
+}
+
+/// `scan_path` as its argument, so a whole-drive scan can take the raw NTFS
+#[cfg(target_os = "windows")]
+fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let mut arg = scan_path.to_string_lossy().into_owned();
+    if arg.contains(' ') {
+        // A backslash right before the closing quote would escape it.
+        if arg.ends_with('\\') {
+            arg.push('\\');
+        }
+        arg = format!("\"{arg}\"");
+    }
+    let wide =
+        |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
+    let verb = wide(std::ffi::OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params = wide(std::ffi::OsStr::new(&arg));
+    const SW_SHOWNORMAL: i32 = 1;
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as usize;
+    // Documented as "greater than 32 on success"; 5 is the UAC prompt being
+    match rc {
+        code if code > 32 => Ok(()),
+        5 => Err("permission was declined".to_string()),
+        code => Err(format!("ShellExecuteW failed with code {code}")),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn relaunch_elevated(_scan_path: &std::path::Path) -> Result<(), String> {
+    Err("not supported on this platform".to_string())
 }
 
 fn main() -> eframe::Result {
@@ -485,6 +523,8 @@ impl Default for App {
                 fallback_details: std::sync::Mutex::new(Vec::new()),
                 cancelled: false.into(),
                 seen_inodes: Default::default(),
+                mft_used: false.into(),
+                mft_elevation_hint: false.into(),
             }),
             receiver: None,
             error: None,
@@ -618,6 +658,8 @@ impl App {
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: false.into(),
             seen_inodes: Default::default(),
+            mft_used: false.into(),
+            mft_elevation_hint: false.into(),
         });
         self.scan_progress = progress.clone();
 
@@ -1628,6 +1670,7 @@ impl eframe::App for App {
         }
 
         let mut open_fallback_report = false;
+        let mut restart_elevated = false;
 
         // Bottom status bar with scan info + selection + keyboard hints
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
@@ -1673,6 +1716,33 @@ impl eframe::App for App {
                                     .small()
                                     .weak(),
                             );
+                            ui.separator();
+                        }
+
+                        if self.scan_progress.mft_used.load(Ordering::Relaxed) {
+                            ui.label(egui::RichText::new("⚡ MFT fast scan").small().weak())
+                                .on_hover_text(
+                                    "Scanned via the raw NTFS MFT: the volume's file table is \
+                                     read sequentially instead of walking every directory.",
+                                );
+                            ui.separator();
+                        } else if self
+                            .scan_progress
+                            .mft_elevation_hint
+                            .load(Ordering::Relaxed)
+                        {
+                            let button = egui::Button::new(
+                                egui::RichText::new("💡 Restart as admin").small().weak(),
+                            )
+                            .frame(false);
+                            let response = ui.add(button).on_hover_text(
+                                "Relaunch as administrator to enable the NTFS fast scan for \
+                                 whole-drive scans — typically 2-3x faster when the disk \
+                                 cache is cold. Windows will ask for permission.",
+                            );
+                            if response.clicked() {
+                                restart_elevated = true;
+                            }
                             ui.separator();
                         }
 
@@ -1736,6 +1806,14 @@ impl eframe::App for App {
 
         if open_fallback_report {
             self.open_fallback_report();
+        }
+        if restart_elevated && let Some(path) = self.scan_path.clone() {
+            match relaunch_elevated(&path) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(err) => {
+                    self.error = Some(format!("Could not restart as administrator: {err}"));
+                }
+            }
         }
 
         // Main content
@@ -2325,7 +2403,22 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{dir, leaf};
+    use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
+
+    fn leaf(name: &str, size: u64) -> FileNode {
+        FileNode::File(FileLeaf::new(name.into(), size, name.starts_with('.')))
+    }
+
+    fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
+        let size = children.iter().map(|c| c.size()).sum();
+        FileNode::Dir(Box::new(DirNode {
+            name: name.into(),
+            size,
+            children,
+            expanded: false,
+            hidden: name.starts_with('.'),
+        }))
+    }
 
     #[test]
     fn tree_can_render_before_category_counting_starts() {

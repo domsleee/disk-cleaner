@@ -2,10 +2,9 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-/// Raw NTFS `$MFT` reader and index (prototype fast path, #89). Not wired
-/// into `scan_directory` yet — consumed by the `ntfs_*` probe binaries, so
-/// it is gated with them behind `internal-tools` until integration.
-#[cfg(all(target_os = "windows", feature = "internal-tools"))]
+/// Raw NTFS `$MFT` fast path for elevated whole-volume scans; also used by the
+/// `ntfs_*` probe binaries.
+#[cfg(target_os = "windows")]
 pub mod windows_ntfs;
 
 use std::collections::HashSet;
@@ -264,6 +263,8 @@ pub struct ScanProgress {
     /// Hardlinked inodes already counted (dedup). See [`InodeSet`].
     /// Only read by the macOS/Windows bulk walkers; inert elsewhere.
     pub seen_inodes: InodeSet,
+    pub mft_used: AtomicBool,
+    pub mft_elevation_hint: AtomicBool,
 }
 
 #[cfg(target_os = "windows")]
@@ -275,6 +276,7 @@ pub enum ScanFallbackKind {
     AccessDeniedOpen,
     OtherOpen,
     BulkScan,
+    MftRecords,
 }
 
 impl ScanFallbackKind {
@@ -283,6 +285,7 @@ impl ScanFallbackKind {
             Self::AccessDeniedOpen => "Protected folder",
             Self::OtherOpen => "Open retry",
             Self::BulkScan => "Scan retry",
+            Self::MftRecords => "MFT records skipped",
         }
     }
 }
@@ -343,6 +346,25 @@ impl ScanProgress {
             .fetch_add(1, Ordering::Relaxed);
         self.push_fallback_detail(ScanFallbackKind::BulkScan, path, err);
         log_windows_fallback(stage, path, err);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_mft_parse_errors(&self, count: u64, path: &Path, err: &io::Error) {
+        self.fallback_count.fetch_add(count, Ordering::Relaxed);
+        self.bulk_scan_fallback_count
+            .fetch_add(count, Ordering::Relaxed);
+        self.push_fallback_detail(ScanFallbackKind::MftRecords, path, err);
+        log_windows_fallback("raw MFT record parse", path, err);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn record_windows_mft_blocked_dir(&self, path: &Path) {
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        self.fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.access_denied_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.push_fallback_detail(ScanFallbackKind::AccessDeniedOpen, path, &err);
+        log_windows_fallback("raw MFT blocked directory", path, &err);
     }
 
     #[cfg(target_os = "windows")]
@@ -524,20 +546,54 @@ fn scan_directory_inner(
             .map(|m| is_hidden_from_metadata(&root_name, &m))
             .unwrap_or_else(|_| root_name.starts_with('.'));
 
-        match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
-            windows::walk_dir_bulk(
-                root_dir,
-                root,
-                root_name.clone(),
-                root_hidden,
-                &progress,
-                &skip,
-            )
-        }) {
-            Ok(node) => node,
-            Err(err) => {
-                progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
-                walk_dir(root, &progress, &skip)
+        let mft_node = if let Some(eligibility) = windows_ntfs::should_use_mft_scan(root, &progress)
+        {
+            match windows_ntfs::scan_volume_tree(root, &eligibility, &progress) {
+                Ok(node) => {
+                    progress.mft_used.store(true, Ordering::Relaxed);
+                    Some(node)
+                }
+                Err(_) if progress.cancelled.load(Ordering::Relaxed) => {
+                    Some(FileNode::Dir(Box::new(DirNode {
+                        name: root_name.clone(),
+                        size: 0,
+                        children: Vec::new(),
+                        expanded: false,
+                        hidden: false,
+                    })))
+                }
+                Err(err) => {
+                    // Reset MFT totals before the fallback walker accumulates its own.
+                    progress.file_count.store(0, Ordering::Relaxed);
+                    progress.total_size.store(0, Ordering::Relaxed);
+                    if !windows_ntfs::is_mft_declined(&err) {
+                        progress.record_windows_bulk_scan_fallback("raw MFT scan", root, &err);
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(node) = mft_node {
+            node
+        } else {
+            match windows::DirectoryHandle::open_root(root).and_then(|root_dir| {
+                windows::walk_dir_bulk(
+                    root_dir,
+                    root,
+                    root_name.clone(),
+                    root_hidden,
+                    &progress,
+                    &skip,
+                )
+            }) {
+                Ok(node) => node,
+                Err(err) => {
+                    progress.record_windows_bulk_scan_fallback("root bulk scan", root, &err);
+                    walk_dir(root, &progress, &skip)
+                }
             }
         }
     };
@@ -716,6 +772,8 @@ mod tests {
             fallback_details: Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
             seen_inodes: Default::default(),
+            mft_used: AtomicBool::new(false),
+            mft_elevation_hint: AtomicBool::new(false),
         })
     }
 

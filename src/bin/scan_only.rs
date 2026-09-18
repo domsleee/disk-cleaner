@@ -72,6 +72,13 @@ fn main() {
     drop(tree);
     let drop_ms = drop_start.elapsed().as_secs_f64() * 1000.0;
 
+    let scanner = if progress.mft_used.load(Ordering::Relaxed) {
+        "mft"
+    } else {
+        "walker"
+    };
     // Parsed by benches/ab_pairs.ps1.
-    println!("BENCH scan_ms={scan_ms:.3} drop_ms={drop_ms:.3} files={files} bytes={size}");
+    println!(
+        "BENCH scan_ms={scan_ms:.3} drop_ms={drop_ms:.3} files={files} bytes={size} scanner={scanner}"
+    );
 }

@@ -1,14 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app_icon;
-mod categories;
-mod category_worker;
 mod deleter;
-mod icons;
-mod scanner;
-mod tree;
-mod treemap;
-mod ui;
+
+use disk_cleaner::{app_icon, categories, category_worker, icons, scanner, tree, treemap, ui};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -244,9 +238,7 @@ fn print_help() {
     eprintln!("  -h, --help             Print this help message");
 }
 
-/// Relaunch this executable elevated (Windows shows a UAC prompt) with
 /// `scan_path` as its argument, so a whole-drive scan can take the raw NTFS
-/// MFT fast path. On success the caller closes this instance.
 #[cfg(target_os = "windows")]
 fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -278,7 +270,6 @@ fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
         )
     } as usize;
     // Documented as "greater than 32 on success"; 5 is the UAC prompt being
-    // declined.
     match rc {
         code if code > 32 => Ok(()),
         5 => Err("permission was declined".to_string()),
@@ -1728,9 +1719,6 @@ impl eframe::App for App {
                             ui.separator();
                         }
 
-                        // NTFS MFT fast-path status: say when it carried the
-                        // scan, or how to unlock it when admin rights are the
-                        // only thing missing.
                         if self.scan_progress.mft_used.load(Ordering::Relaxed) {
                             ui.label(egui::RichText::new("⚡ MFT fast scan").small().weak())
                                 .on_hover_text(
@@ -2415,7 +2403,22 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{dir, leaf};
+    use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
+
+    fn leaf(name: &str, size: u64) -> FileNode {
+        FileNode::File(FileLeaf::new(name.into(), size, name.starts_with('.')))
+    }
+
+    fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
+        let size = children.iter().map(|c| c.size()).sum();
+        FileNode::Dir(Box::new(DirNode {
+            name: name.into(),
+            size,
+            children,
+            expanded: false,
+            hidden: name.starts_with('.'),
+        }))
+    }
 
     #[test]
     fn tree_can_render_before_category_counting_starts() {

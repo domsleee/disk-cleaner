@@ -1272,6 +1272,8 @@ impl OverlappedVolumeReadSlot {
     }
 }
 
+/// The kernel writes into `slot` after this returns, so the caller must leave
+/// the slot and its buffer alone until `finish_overlapped_volume_read`.
 fn start_overlapped_volume_read(
     file: &File,
     slot: &mut OverlappedVolumeReadSlot,
@@ -1981,6 +1983,8 @@ fn parse_raw_mft_record_fragment(
         return Ok(None);
     }
 
+    // A file reference is a 48-bit record number plus a 16-bit sequence number;
+    // only the record number is kept, so a reused record is not detected.
     let base_record_number = u64::from_le_bytes(
         record[FILE_RECORD_BASE_RECORD_OFFSET..FILE_RECORD_BASE_RECORD_OFFSET + 8]
             .try_into()
@@ -2865,6 +2869,8 @@ fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io
     apply_update_sequence_fixup_generic(record, bytes_per_sector)
 }
 
+/// NTFS overwrites the last two bytes of every sector with a marker; check it,
+/// then put the real trailers back from the update sequence array.
 fn apply_update_sequence_fixup_1k(record: &mut [u8]) -> io::Result<&[u8]> {
     let usa_offset = u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize;
     let usa_count = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
@@ -3042,6 +3048,7 @@ fn parse_data_runs(buf: &[u8]) -> io::Result<Vec<DataRun>> {
             break;
         }
 
+        // Low nibble sizes the run length, high nibble the signed LCN delta.
         let len_size = (header & 0x0F) as usize;
         let off_size = (header >> 4) as usize;
         if len_size == 0 || offset + len_size + off_size > buf.len() {

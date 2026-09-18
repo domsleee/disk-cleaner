@@ -18,8 +18,7 @@ use crate::tree::{DirNode, FileLeaf, FileNode};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice,
-    ParallelSliceMut,
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
 use smallvec::SmallVec;
 use windows_sys::Win32::Foundation::{
@@ -59,7 +58,6 @@ const RAW_MFT_PIPELINE_DEPTH: usize = 2;
 const RAW_MFT_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const RAW_MFT_VOLUME_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const RAW_MFT_VOLUME_OVERLAPPED_SLOTS: usize = 2;
-const RAW_MFT_MATERIALIZE_CHUNK: usize = 16_384;
 const USN_PAGE_HEADER_SIZE: usize = size_of::<u64>();
 const ATTR_TYPE_DATA: u32 = 0x80;
 const ATTR_TYPE_FILE_NAME: u32 = 0x30;
@@ -1467,18 +1465,6 @@ struct RawMftIndexBuild {
     running_allocated: u64,
 }
 
-#[derive(Default)]
-struct MaterializedRawMftSummary {
-    materialized_entries: usize,
-    entries_without_data_size: usize,
-    files_without_data_size: usize,
-    dirs_without_data_size: usize,
-    multi_name_entries: usize,
-    extra_primary_names: u64,
-    extra_primary_name_logical_size: u64,
-    extra_primary_name_allocated_size: u64,
-}
-
 struct RawMftReadChunk {
     data: Vec<u8>,
     read_duration: Duration,
@@ -1608,44 +1594,11 @@ impl RawMftIndexBuild {
 
     fn finish(mut self, rollup: SubtreeRollup) -> io::Result<RawMftIndex> {
         let record_index_len = self.entry_index.len();
-        let materialized_summaries: Vec<_> = self
-            .entries
-            .par_chunks(RAW_MFT_MATERIALIZE_CHUNK)
-            .map(|chunk| {
-                let mut out = MaterializedRawMftSummary::default();
-                for entry in chunk {
-                    accumulate_materialized_entry_summary(entry, &mut out);
-                }
-                out
-            })
-            .collect();
-
-        let total_materialized = materialized_summaries
-            .iter()
-            .map(|chunk| chunk.materialized_entries)
-            .sum();
-        let mut final_entries = Vec::with_capacity(total_materialized);
-        for chunk in materialized_summaries {
-            self.summary.entries_without_data_size += chunk.entries_without_data_size;
-            self.summary.files_without_data_size += chunk.files_without_data_size;
-            self.summary.dirs_without_data_size += chunk.dirs_without_data_size;
-            self.summary.multi_name_entries += chunk.multi_name_entries;
-            self.summary.extra_primary_names = self
-                .summary
-                .extra_primary_names
-                .saturating_add(chunk.extra_primary_names);
-            self.summary.extra_primary_name_logical_size = self
-                .summary
-                .extra_primary_name_logical_size
-                .saturating_add(chunk.extra_primary_name_logical_size);
-            self.summary.extra_primary_name_allocated_size = self
-                .summary
-                .extra_primary_name_allocated_size
-                .saturating_add(chunk.extra_primary_name_allocated_size);
-        }
-
-        for entry in self.entries.into_iter() {
-            materialize_raw_mft_entry(entry, &mut final_entries, total_materialized)?;
+        // One name selection, not two: the counters come from what was actually
+        // emitted, so they cannot disagree with it.
+        let mut final_entries = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            materialize_raw_mft_entry(entry, &mut final_entries, &mut self.summary)?;
         }
 
         let mut root_entries = 0usize;
@@ -1776,7 +1729,7 @@ enum SubtreeRollup {
 fn materialize_raw_mft_entry(
     entry: RawMftIndexAggregate,
     out: &mut Vec<RawMftIndexEntry>,
-    total_materialized: usize,
+    summary: &mut RawMftIndexSummary,
 ) -> io::Result<usize> {
     if entry.is_name_surrogate_reparse {
         return Ok(0);
@@ -1790,20 +1743,30 @@ fn materialize_raw_mft_entry(
     if file_names.is_empty() {
         return Ok(0);
     }
-    if out.len().saturating_add(file_names.len()) > total_materialized {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "raw MFT materialization overflow: len={} + pushed={} > total={} record={} link_limit={} dir={}",
-                out.len(),
-                file_names.len(),
-                total_materialized,
-                entry.record_number,
-                link_limit,
-                entry.is_directory
-            ),
-        ));
+
+    let count = file_names.len();
+    if count > 1 {
+        summary.multi_name_entries += 1;
+        let extra = (count - 1) as u64;
+        summary.extra_primary_names = summary.extra_primary_names.saturating_add(extra);
+        if !entry.is_directory {
+            summary.extra_primary_name_logical_size = summary
+                .extra_primary_name_logical_size
+                .saturating_add(extra.saturating_mul(entry.logical_size.unwrap_or(0)));
+            summary.extra_primary_name_allocated_size = summary
+                .extra_primary_name_allocated_size
+                .saturating_add(extra.saturating_mul(entry.allocated_size.unwrap_or(0)));
+        }
     }
+    if entry.logical_size.is_none() {
+        summary.entries_without_data_size += count;
+        if entry.is_directory {
+            summary.dirs_without_data_size += count;
+        } else {
+            summary.files_without_data_size += count;
+        }
+    }
+
     let record_number = to_u32_record(entry.record_number, "record number")?;
     let logical_size = entry.logical_size.unwrap_or(0);
     let allocated_size = entry.allocated_size.unwrap_or(0);
@@ -1843,71 +1806,6 @@ fn to_u32_index(value: usize, what: &str) -> io::Result<u32> {
             format!("raw MFT {what} {value} exceeds u32"),
         )
     })
-}
-
-fn accumulate_materialized_entry_summary(
-    entry: &RawMftIndexAggregate,
-    out: &mut MaterializedRawMftSummary,
-) {
-    if entry.is_name_surrogate_reparse {
-        return;
-    }
-    let link_limit = if entry.is_directory {
-        1
-    } else {
-        usize::from(entry.link_count.unwrap_or(1).max(1))
-    };
-    let materialized_count = materialized_file_name_count(&entry.file_names, link_limit);
-    if materialized_count == 0 {
-        return;
-    }
-
-    out.materialized_entries += materialized_count;
-    if materialized_count > 1 {
-        out.multi_name_entries += 1;
-        let extra_names = (materialized_count - 1) as u64;
-        out.extra_primary_names += extra_names;
-        if !entry.is_directory {
-            out.extra_primary_name_logical_size = out
-                .extra_primary_name_logical_size
-                .saturating_add(extra_names.saturating_mul(entry.logical_size.unwrap_or(0)));
-            out.extra_primary_name_allocated_size = out
-                .extra_primary_name_allocated_size
-                .saturating_add(extra_names.saturating_mul(entry.allocated_size.unwrap_or(0)));
-        }
-    }
-    if entry.logical_size.is_none() {
-        out.entries_without_data_size += materialized_count;
-        if entry.is_directory {
-            out.dirs_without_data_size += materialized_count;
-        } else {
-            out.files_without_data_size += materialized_count;
-        }
-    }
-}
-
-fn materialized_file_name_count(file_names: &[ParsedFileNameAttribute], max_names: usize) -> usize {
-    if max_names == 0 || file_names.is_empty() {
-        return 0;
-    }
-    if file_names.len() == 1 {
-        return 1;
-    }
-    if file_names.len() == 2 {
-        let a = &file_names[0];
-        let b = &file_names[1];
-        if a.parent_record_number == b.parent_record_number && a.name == b.name {
-            return 1;
-        }
-        let mut count = usize::from(a.namespace_rank > 1) + usize::from(b.namespace_rank > 1);
-        if count == 0 {
-            count = 1;
-        }
-        return count.min(max_names);
-    }
-
-    let cloned: ParsedFileNameList = file_names.iter().cloned().collect();
-    materialized_file_names(cloned, max_names).len()
 }
 
 fn parse_raw_mft_record(

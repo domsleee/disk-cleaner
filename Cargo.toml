@@ -116,3 +116,9 @@ name = "ntfs_mft_index_probe"
 path = "src/bin/ntfs_mft_index_probe.rs"
 bench = false
 required-features = ["internal-tools"]
+
+[[bin]]
+name = "mft_diff"
+path = "src/bin/mft_diff.rs"
+bench = false
+required-features = ["internal-tools"]

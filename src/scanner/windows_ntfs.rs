@@ -69,6 +69,7 @@ const FILE_RECORD_HEADER_SIZE: usize = 0x30;
 const FILE_RECORD_ATTR_OFFSET: usize = 0x14;
 const FILE_RECORD_LINK_COUNT_OFFSET: usize = 0x12;
 const FILE_RECORD_FLAGS_OFFSET: usize = 0x16;
+const FILE_RECORD_NUMBER_OFFSET: usize = 0x2C;
 const FILE_RECORD_BASE_RECORD_OFFSET: usize = 0x20;
 const NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE: usize = size_of::<i64>() + size_of::<u32>();
 const FILE_RECORD_FLAG_IN_USE: u16 = 0x0001;
@@ -1961,6 +1962,23 @@ fn parse_raw_mft_record_fragment(
     }
     if &record[..4] != b"FILE" {
         return Ok(None);
+    }
+
+    // Every identity here is a record's position in the byte stream, so a short
+    // read or a bad runlist would silently renumber the rest of the volume.
+    // NTFS 3.1 stamps the number into the record, turning that into an error.
+    if record.len() >= FILE_RECORD_NUMBER_OFFSET + 4 {
+        let stamped = u32::from_le_bytes(
+            record[FILE_RECORD_NUMBER_OFFSET..FILE_RECORD_NUMBER_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if stamped != 0 && u64::from(stamped) != record_number {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MFT record number does not match its position",
+            ));
+        }
     }
 
     let flags = u16::from_le_bytes(

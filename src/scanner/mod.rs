@@ -2,6 +2,10 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+mod windows_volumes;
+#[cfg(target_os = "windows")]
+pub use windows_volumes::{disk_space, list_volumes};
 /// Raw NTFS `$MFT` reader and index (prototype fast path, #89). Not wired
 /// into `scan_directory` yet — consumed by the `ntfs_*` probe binaries, so
 /// it is gated with them behind `internal-tools` until integration.
@@ -64,7 +68,7 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     Some((total, available))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -95,12 +99,13 @@ fn is_real_drive(path: &Path) -> bool {
     is_mount_point && local && !read_only && disk_backed
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_real_drive(_path: &Path) -> bool {
     true
 }
 
 /// List mounted volumes. On macOS, reads `/Volumes/` and includes root `/`.
+#[cfg(not(target_os = "windows"))]
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
 

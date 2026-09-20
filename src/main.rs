@@ -1907,9 +1907,6 @@ impl eframe::App for App {
                 if !self.volumes_query.is_active() {
                     ctx.request_repaint_after(Duration::from_secs(5));
                 }
-
-                // Keep discovery current even when the home screen is idle.
-                ctx.request_repaint_after(Duration::from_secs(5));
                 let foreground = egui::Color32::from_rgb(238, 240, 244);
                 let secondary = egui::Color32::from_rgb(177, 185, 198);
                 let width = 540.0_f32.min(ui.available_width() - 32.0);

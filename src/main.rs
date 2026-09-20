@@ -2004,6 +2004,7 @@ impl eframe::App for App {
                                         } else {
                                             0.0
                                         };
+                                        let mut truncated = false;
                                         let card = egui::Frame::new()
                                             .fill(egui::Color32::from_rgb(34, 37, 43))
                                             .stroke(egui::Stroke::new(
@@ -2040,6 +2041,18 @@ impl eframe::App for App {
                                                                 name_width + drive_width,
                                                             );
                                                             ui.spacing_mut().item_spacing.x = 5.0;
+                                                            truncated = ui
+                                                                .painter()
+                                                                .layout_no_wrap(
+                                                                    label.to_owned(),
+                                                                    egui::FontId::proportional(
+                                                                        15.0,
+                                                                    ),
+                                                                    foreground,
+                                                                )
+                                                                .size()
+                                                                .x
+                                                                > name_width;
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     egui::RichText::new(label)
@@ -2124,12 +2137,14 @@ impl eframe::App for App {
                                                 egui::Id::new(("vol_card", &vol.path)),
                                                 egui::Sense::click(),
                                             )
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .on_hover_text(format!(
-                                                "{}\n{}\nClick to scan",
-                                                vol.name,
-                                                vol.path.display()
-                                            ));
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        // The row already says the rest; only the
+                                        // clipped-off name is worth a tooltip.
+                                        let response = if truncated {
+                                            response.on_hover_text(&vol.name)
+                                        } else {
+                                            response
+                                        };
                                         if response.hovered() || response.has_focus() {
                                             ui.painter().rect_stroke(
                                                 card.response.rect,

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod background_query;
 mod categories;
 mod category_worker;
 mod deleter;
@@ -410,7 +411,9 @@ struct App {
     treemap_zoom: Option<PathBuf>,
     treemap_zoom_anim: Option<f64>,
     volumes: Vec<scanner::VolumeInfo>,
+    volumes_query: background_query::BackgroundQuery<Vec<scanner::VolumeInfo>>,
     volumes_last_refresh: Option<std::time::Instant>,
+    disk_space_query: background_query::BackgroundQuery<Option<(u64, u64)>>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
     scan_is_volume: bool,               // true when scanning a volume root
     category_filter: Option<categories::FileCategory>,
@@ -498,8 +501,14 @@ impl Default for App {
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
-            volumes: scanner::list_volumes(),
-            volumes_last_refresh: Some(std::time::Instant::now()),
+            volumes: Vec::new(),
+            volumes_query: {
+                let mut query = background_query::BackgroundQuery::default();
+                query.request(scanner::list_volumes);
+                query
+            },
+            volumes_last_refresh: None,
+            disk_space_query: Default::default(),
             scan_disk_info: None,
             scan_is_volume: false,
             category_filter: None,
@@ -565,6 +574,7 @@ impl App {
     }
 
     fn cancel_scan(&mut self) {
+        self.disk_space_query.cancel();
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
@@ -606,7 +616,8 @@ impl App {
         self.selected_paths.clear();
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
-        self.scan_disk_info = scanner::disk_space(&path);
+        self.scan_disk_info = None;
+        self.refresh_disk_info();
         self.scan_is_volume = self.volumes.iter().any(|v| v.path == path);
 
         let progress = Arc::new(ScanProgress {
@@ -850,8 +861,25 @@ impl App {
 
     /// Re-query disk space so the status bar reflects freed space after deletions.
     fn refresh_disk_info(&mut self) {
-        if let Some(ref path) = self.scan_path {
-            self.scan_disk_info = scanner::disk_space(path);
+        if let Some(path) = self.scan_path.clone() {
+            self.disk_space_query
+                .request(move || scanner::disk_space(&path));
+        }
+    }
+
+    fn poll_disk_queries(&mut self, ctx: &egui::Context) {
+        if let Some(volumes) = self.volumes_query.poll(ctx) {
+            self.volumes = volumes;
+            self.volumes_last_refresh = Some(Instant::now());
+            self.scan_is_volume = self
+                .scan_path
+                .as_ref()
+                .is_some_and(|path| self.volumes.iter().any(|volume| volume.path == *path));
+            ctx.request_repaint();
+        }
+        if let Some(info) = self.disk_space_query.poll(ctx) {
+            self.scan_disk_info = info;
+            ctx.request_repaint();
         }
     }
 }
@@ -1104,7 +1132,9 @@ impl eframe::App for App {
 
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
-                    if !self.scanning {
+                    // Home screenshots should include the asynchronously loaded
+                    // drive cards, rather than racing the first discovery query.
+                    if !self.scanning && (self.tree.is_some() || !self.volumes_query.is_active()) {
                         // Expand all file groups so individual files (e.g. hard
                         // links) are visible instead of a collapsed "[N files]".
                         if let Some(tree) = &self.tree {
@@ -1867,12 +1897,15 @@ impl eframe::App for App {
 
             if self.tree.is_none() {
                 // Refresh volume list every 5 seconds
-                let should_refresh = self
-                    .volumes_last_refresh
-                    .is_none_or(|t| t.elapsed().as_secs() >= 5);
+                let should_refresh = !self.volumes_query.is_active()
+                    && self
+                        .volumes_last_refresh
+                        .is_none_or(|t| t.elapsed().as_secs() >= 5);
                 if should_refresh {
-                    self.volumes = scanner::list_volumes();
-                    self.volumes_last_refresh = Some(std::time::Instant::now());
+                    self.volumes_query.request(scanner::list_volumes);
+                }
+                if !self.volumes_query.is_active() {
+                    ctx.request_repaint_after(Duration::from_secs(5));
                 }
 
                 let avail = ui.available_height();
@@ -2310,6 +2343,9 @@ impl eframe::App for App {
                 });
         }
 
+        // Start requests queued by this frame's actions and apply completed
+        // results. A slow device never blocks rendering or scan cancellation.
+        self.poll_disk_queries(ctx);
         self.start_categories();
         if self.category_worker.is_active() || !self.pending_tree_edits.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));

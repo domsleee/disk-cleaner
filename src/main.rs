@@ -1909,6 +1909,7 @@ impl eframe::App for App {
                 }
                 let foreground = egui::Color32::from_rgb(238, 240, 244);
                 let secondary = egui::Color32::from_rgb(177, 185, 198);
+                let short = ui.available_height() < 500.0;
                 let width = 540.0_f32.min(ui.available_width() - 32.0);
                 let rescan_path = self
                     .last_scan_path
@@ -1921,19 +1922,13 @@ impl eframe::App for App {
                 ui.vertical_centered(|ui| {
                     ui.visuals_mut().override_text_color = Some(foreground);
                     ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-                    ui.add_space(24.0);
+                    ui.add_space(if short { 12.0 } else { 24.0 });
                     ui.label(
                         egui::RichText::new("Choose a drive to scan")
-                            .size(26.0)
+                            .size(if short { 22.0 } else { 26.0 })
                             .strong(),
                     );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Find large files and see what's taking up space.")
-                            .size(14.0)
-                            .color(secondary),
-                    );
-                    ui.add_space(26.0);
+                    ui.add_space(if short { 12.0 } else { 26.0 });
                     ui.allocate_ui_with_layout(
                         egui::vec2(width, 22.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -1944,7 +1939,7 @@ impl eframe::App for App {
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "{} available",
+                                            "{} drives · Select to scan",
                                             self.volumes.len()
                                         ))
                                         .size(12.0)
@@ -1957,7 +1952,7 @@ impl eframe::App for App {
                     ui.add_space(8.0);
 
                     // Reserve room for actions and errors outside the scrolling list.
-                    let footer_height = if self.error.is_some() { 116.0 } else { 92.0 };
+                    let footer_height = if self.error.is_some() { 95.0 } else { 64.0 };
                     let list_height = (ui.available_height() - footer_height).max(0.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(width + 12.0, list_height),
@@ -1993,18 +1988,27 @@ impl eframe::App for App {
                                                 egui::Color32::from_rgb(60, 65, 76),
                                             ))
                                             .corner_radius(7.0)
-                                            .inner_margin(12.0)
+                                            .inner_margin(10.0)
                                             .show(ui, |ui| {
                                                 ui.set_width(width - 30.0);
                                                 ui.horizontal(|ui| {
-                                                    let name_width =
-                                                        (ui.available_width() - 90.0).max(0.0);
+                                                    let bar_width =
+                                                        if short { 80.0 } else { 160.0 };
+                                                    let bar_height = if short { 6.0 } else { 7.0 };
+                                                    // Room for "<free> free of <total>" at 13pt.
+                                                    let label_width =
+                                                        if short { 185.0 } else { 198.0 };
+                                                    let name_width = (ui.available_width()
+                                                        - bar_width
+                                                        - label_width)
+                                                        .max(0.0);
                                                     ui.allocate_ui_with_layout(
                                                         egui::vec2(name_width, 20.0),
                                                         egui::Layout::left_to_right(
                                                             egui::Align::Center,
                                                         ),
                                                         |ui| {
+                                                            ui.set_min_width(name_width);
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     egui::RichText::new(&vol.name)
@@ -2015,75 +2019,62 @@ impl eframe::App for App {
                                                             );
                                                         },
                                                     );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{:.0}% used",
-                                                                    fraction * 100.0
-                                                                ))
-                                                                .size(13.0),
-                                                            );
-                                                        },
+                                                    let (bar, _) = ui.allocate_exact_size(
+                                                        egui::vec2(bar_width, bar_height),
+                                                        egui::Sense::hover(),
                                                     );
-                                                });
-                                                ui.add_space(5.0);
-                                                let (bar, _) = ui.allocate_exact_size(
-                                                    egui::vec2(ui.available_width(), 7.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    bar,
-                                                    3.0,
-                                                    egui::Color32::from_rgb(17, 19, 23),
-                                                );
-                                                let color = if fraction > 0.9 {
-                                                    egui::Color32::from_rgb(239, 106, 108)
-                                                } else if fraction > 0.7 {
-                                                    egui::Color32::from_rgb(230, 176, 78)
-                                                } else {
-                                                    egui::Color32::from_rgb(83, 164, 233)
-                                                };
-                                                ui.painter().rect_filled(
-                                                    egui::Rect::from_min_size(
-                                                        bar.min,
-                                                        egui::vec2(
-                                                            bar.width() * fraction.clamp(0.0, 1.0),
-                                                            bar.height(),
+                                                    ui.painter().rect_filled(
+                                                        bar,
+                                                        3.0,
+                                                        egui::Color32::from_rgb(40, 45, 54),
+                                                    );
+                                                    let color = if fraction > 0.9 {
+                                                        egui::Color32::from_rgb(239, 106, 108)
+                                                    } else if fraction > 0.7 {
+                                                        egui::Color32::from_rgb(230, 176, 78)
+                                                    } else {
+                                                        egui::Color32::from_rgb(83, 164, 233)
+                                                    };
+                                                    ui.painter().rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            bar.min,
+                                                            egui::vec2(
+                                                                (bar.width()
+                                                                    * fraction.clamp(0.0, 1.0))
+                                                                .max(1.0),
+                                                                bar.height(),
+                                                            ),
                                                         ),
-                                                    ),
-                                                    3.0,
-                                                    color,
-                                                );
-                                                ui.add_space(5.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "{} free",
-                                                            bytesize::ByteSize::b(
-                                                                vol.available_bytes
-                                                            )
-                                                        ))
-                                                        .size(13.0)
-                                                        .color(secondary),
+                                                        3.0,
+                                                        color,
                                                     );
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(
                                                             egui::Align::Center,
                                                         ),
                                                         |ui| {
+                                                            ui.spacing_mut().item_spacing.x = 5.0;
                                                             ui.label(
                                                                 egui::RichText::new(format!(
-                                                                    "{} total",
+                                                                    "of {}",
                                                                     bytesize::ByteSize::b(
                                                                         vol.total_bytes
                                                                     )
                                                                 ))
                                                                 .size(13.0)
-                                                                .color(secondary),
+                                                                .color(egui::Color32::from_rgb(
+                                                                    134, 143, 157,
+                                                                )),
+                                                            );
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "{} free",
+                                                                    bytesize::ByteSize::b(
+                                                                        vol.available_bytes
+                                                                    )
+                                                                ))
+                                                                .size(13.0)
+                                                                .color(foreground),
                                                             );
                                                         },
                                                     );

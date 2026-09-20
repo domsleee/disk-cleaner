@@ -424,6 +424,9 @@ struct App {
     volumes: Vec<scanner::VolumeInfo>,
     volumes_query: background_query::BackgroundQuery<Vec<scanner::VolumeInfo>>,
     volumes_last_refresh: Option<std::time::Instant>,
+    /// Last frame's drive-list height, so a short list can keep the actions
+    /// under it rather than at the bottom of the window.
+    volumes_list_height: f32,
     disk_space_query: background_query::BackgroundQuery<Option<(u64, u64)>>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
     scan_is_volume: bool,               // true when scanning a volume root
@@ -519,6 +522,7 @@ impl Default for App {
                 query
             },
             volumes_last_refresh: None,
+            volumes_list_height: 0.0,
             disk_space_query: Default::default(),
             scan_disk_info: None,
             scan_is_volume: false,
@@ -1928,6 +1932,7 @@ impl eframe::App for App {
                     .filter(|last| !self.volumes.iter().any(|volume| volume.path == **last))
                     .cloned();
                 let mut scan_path = None;
+                let mut measured_list_height = 0.0_f32;
                 let mut pick_folder = false;
 
                 ui.vertical_centered(|ui| {
@@ -1964,8 +1969,15 @@ impl eframe::App for App {
 
                     // Reserve room for actions and errors outside the scrolling list.
                     let footer_height = if self.error.is_some() { 95.0 } else { 64.0 };
-                    let list_height = (ui.available_height() - footer_height).max(0.0);
-                    ui.allocate_ui_with_layout(
+                    let available = (ui.available_height() - footer_height).max(0.0);
+                    // Size the list to the drives it drew last frame, so a short
+                    // list keeps the actions under it rather than at the bottom.
+                    let list_height = if self.volumes_list_height > 0.0 {
+                        self.volumes_list_height.min(available)
+                    } else {
+                        available
+                    };
+                    let list_content = ui.allocate_ui_with_layout(
                         egui::vec2(width + 12.0, list_height),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
@@ -2134,9 +2146,12 @@ impl eframe::App for App {
                                         }
                                         ui.add_space(8.0);
                                     }
-                                });
+                                })
+                                .content_size
+                                .y
                         },
                     );
+                    measured_list_height = list_content.inner;
                     ui.add_space(14.0);
                     let button_width = (width - ui.spacing().item_spacing.x) / 2.0;
                     let actions_width = if rescan_path.is_some() {
@@ -2202,6 +2217,7 @@ impl eframe::App for App {
                         .on_hover_text(err);
                     }
                 });
+                self.volumes_list_height = measured_list_height;
                 if pick_folder {
                     scan_path = rfd::FileDialog::new().pick_folder();
                 }

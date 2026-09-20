@@ -59,6 +59,17 @@ fn middle_truncate(s: &str, max: usize) -> String {
     format!("{head_s}\u{2026}{tail_s}")
 }
 
+/// Split a trailing drive letter off a volume name so it survives truncation.
+fn split_drive_letter(name: &str) -> (&str, &str) {
+    if name.ends_with(":)")
+        && let Some(open) = name.rfind(" (")
+        && name.len() - open == 5
+    {
+        return (&name[..open], &name[open + 1..]);
+    }
+    (name, "")
+}
+
 /// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
 fn group_thousands(n: u64) -> String {
     let s = n.to_string();
@@ -1998,9 +2009,14 @@ impl eframe::App for App {
                                                     // Room for "<free> free of <total>" at 13pt.
                                                     let label_width =
                                                         if short { 185.0 } else { 198.0 };
+                                                    let (label, drive) =
+                                                        split_drive_letter(&vol.name);
+                                                    let drive_width =
+                                                        if drive.is_empty() { 0.0 } else { 38.0 };
                                                     let name_width = (ui.available_width()
                                                         - bar_width
-                                                        - label_width)
+                                                        - label_width
+                                                        - drive_width)
                                                         .max(0.0);
                                                     ui.allocate_ui_with_layout(
                                                         egui::vec2(name_width, 20.0),
@@ -2009,9 +2025,10 @@ impl eframe::App for App {
                                                         ),
                                                         |ui| {
                                                             ui.set_min_width(name_width);
+                                                            ui.spacing_mut().item_spacing.x = 4.0;
                                                             ui.add(
                                                                 egui::Label::new(
-                                                                    egui::RichText::new(&vol.name)
+                                                                    egui::RichText::new(label)
                                                                         .size(15.0)
                                                                         .strong(),
                                                                 )
@@ -2019,6 +2036,13 @@ impl eframe::App for App {
                                                             );
                                                         },
                                                     );
+                                                    if !drive.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(drive)
+                                                                .size(15.0)
+                                                                .strong(),
+                                                        );
+                                                    }
                                                     let (bar, _) = ui.allocate_exact_size(
                                                         egui::vec2(bar_width, bar_height),
                                                         egui::Sense::hover(),
@@ -2451,6 +2475,22 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_drive_letter_keeps_the_letter() {
+        assert_eq!(split_drive_letter("Windows (C:)"), ("Windows", "(C:)"));
+        assert_eq!(
+            split_drive_letter("Backup and archived files (E:)"),
+            ("Backup and archived files", "(E:)")
+        );
+    }
+
+    #[test]
+    fn split_drive_letter_leaves_other_names_alone() {
+        assert_eq!(split_drive_letter("Macintosh HD"), ("Macintosh HD", ""));
+        assert_eq!(split_drive_letter("Photos (2024)"), ("Photos (2024)", ""));
+        assert_eq!(split_drive_letter("(C:)"), ("(C:)", ""));
+    }
+
     use super::*;
     use crate::tree::{dir, leaf};
 

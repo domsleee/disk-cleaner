@@ -59,6 +59,45 @@ fn middle_truncate(s: &str, max: usize) -> String {
     format!("{head_s}\u{2026}{tail_s}")
 }
 
+/// Paint the title bar dark before the window is ever shown.
+///
+/// `ViewportCommand::SetTheme` only reaches the decorations at the end of the
+/// first frame, by which point the window is visible, so DWM animates the
+/// caption from light to dark in front of the user. Setting the attribute on
+/// the raw handle during setup wins that race.
+#[cfg(target_os = "windows")]
+fn set_dark_titlebar(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+    let enabled: i32 = 1;
+    // Attribute 20 arrived in Windows 10 build 18985; older builds use 19 and
+    // reject 20, so fall back rather than leave the caption light.
+    for attribute in [DWMWA_USE_IMMERSIVE_DARK_MODE as u32, 19] {
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                (&raw const enabled).cast(),
+                size_of::<i32>() as u32,
+            )
+        };
+        if hr >= 0 {
+            return;
+        }
+    }
+    if debug_enabled() {
+        eprintln!("[titlebar] the dark caption attribute was rejected");
+    }
+}
+
 /// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
 fn group_thousands(n: u64) -> String {
     let s = n.to_string();
@@ -328,6 +367,8 @@ fn main() -> eframe::Result {
             // Tell the OS to use dark window decorations (title bar on Windows).
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+            #[cfg(target_os = "windows")]
+            set_dark_titlebar(cc);
             let mut app = App {
                 process_start: Some(process_start),
                 screenshot_prefix: screenshot_prefix.clone(),

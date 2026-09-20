@@ -2019,13 +2019,15 @@ impl eframe::App for App {
                                                         - drive_width)
                                                         .max(0.0);
                                                     ui.allocate_ui_with_layout(
-                                                        egui::vec2(name_width, 20.0),
+                                                        egui::vec2(name_width + drive_width, 20.0),
                                                         egui::Layout::left_to_right(
                                                             egui::Align::Center,
                                                         ),
                                                         |ui| {
-                                                            ui.set_min_width(name_width);
-                                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                                            ui.set_min_width(
+                                                                name_width + drive_width,
+                                                            );
+                                                            ui.spacing_mut().item_spacing.x = 5.0;
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     egui::RichText::new(label)
@@ -2034,15 +2036,15 @@ impl eframe::App for App {
                                                                 )
                                                                 .truncate(),
                                                             );
+                                                            if !drive.is_empty() {
+                                                                ui.label(
+                                                                    egui::RichText::new(drive)
+                                                                        .size(15.0)
+                                                                        .strong(),
+                                                                );
+                                                            }
                                                         },
                                                     );
-                                                    if !drive.is_empty() {
-                                                        ui.label(
-                                                            egui::RichText::new(drive)
-                                                                .size(15.0)
-                                                                .strong(),
-                                                        );
-                                                    }
                                                     let (bar, _) = ui.allocate_exact_size(
                                                         egui::vec2(bar_width, bar_height),
                                                         egui::Sense::hover(),

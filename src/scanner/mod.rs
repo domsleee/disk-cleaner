@@ -2,6 +2,10 @@
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+mod windows_volumes;
+#[cfg(target_os = "windows")]
+pub use windows_volumes::{disk_space, list_volumes};
 /// Raw NTFS `$MFT` reader and index (prototype fast path, #89). Not wired
 /// into `scan_directory` yet — consumed by the `ntfs_*` probe binaries, so
 /// it is gated with them behind `internal-tools` until integration.
@@ -64,7 +68,7 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     Some((total, available))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn disk_space(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -95,19 +99,42 @@ fn is_real_drive(path: &Path) -> bool {
     is_mount_point && local && !read_only && disk_backed
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_real_drive(_path: &Path) -> bool {
     true
 }
 
+/// The startup disk's own name. macOS symlinks it into `/Volumes` under
+/// whatever the user called it, which is rarely still "Macintosh HD".
+#[cfg(target_os = "macos")]
+fn root_volume_name() -> String {
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_root = std::fs::read_link(&path).is_ok_and(|target| target == Path::new("/"))
+                || std::fs::canonicalize(&path).is_ok_and(|c| c == Path::new("/"));
+            if is_root && let Some(name) = path.file_name() {
+                return name.to_string_lossy().to_string();
+            }
+        }
+    }
+    "Macintosh HD".to_string()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn root_volume_name() -> String {
+    "Filesystem".to_string()
+}
+
 /// List mounted volumes. On macOS, reads `/Volumes/` and includes root `/`.
+#[cfg(not(target_os = "windows"))]
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let mut volumes = Vec::new();
 
     // Root filesystem
     if let Some((total, available)) = disk_space(Path::new("/")) {
         volumes.push(VolumeInfo {
-            name: "Macintosh HD".to_string(),
+            name: root_volume_name(),
             path: PathBuf::from("/"),
             total_bytes: total,
             available_bytes: available,
@@ -705,6 +732,16 @@ fn walk_dir(dir: &Path, progress: &Arc<ScanProgress>, skip: &Arc<HashSet<PathBuf
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn root_volume_is_named_after_the_disk() {
+        let name = root_volume_name();
+        assert!(!name.trim().is_empty());
+        assert!(!name.contains('/'), "{name}");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(name, "Filesystem");
+    }
 
     fn new_progress() -> Arc<ScanProgress> {
         Arc::new(ScanProgress {

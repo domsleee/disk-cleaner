@@ -1977,6 +1977,7 @@ impl eframe::App for App {
                 let mut scan_path = None;
                 let mut measured_list_height = 0.0_f32;
                 let mut pick_folder = false;
+                let discovering = self.volumes.is_empty() && self.volumes_query.is_active();
 
                 ui.vertical_centered(|ui| {
                     ui.visuals_mut().override_text_color = Some(foreground);
@@ -1997,10 +1998,15 @@ impl eframe::App for App {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} drives · Select to scan",
-                                            self.volumes.len()
-                                        ))
+                                        egui::RichText::new(if discovering {
+                                            "Finding drives…".to_owned()
+                                        } else {
+                                            format!(
+                                                "{} {} · Select to scan",
+                                                self.volumes.len(),
+                                                if self.volumes.len() == 1 { "drive" } else { "drives" }
+                                            )
+                                        })
                                         .size(12.0)
                                         .color(secondary),
                                     );
@@ -2032,9 +2038,11 @@ impl eframe::App for App {
                                     if self.volumes.is_empty() {
                                         ui.add_space(24.0);
                                         ui.label(
-                                            egui::RichText::new(
-                                                "No drives available. Choose a folder to scan.",
-                                            )
+                                            egui::RichText::new(if discovering {
+                                                "Finding drives. You can also choose a folder to scan."
+                                            } else {
+                                                "No drives available. Choose a folder to scan."
+                                            })
                                             .size(14.0)
                                             .color(secondary),
                                         );

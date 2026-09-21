@@ -96,8 +96,11 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
                 String::from_utf16_lossy(&label[..len]),
                 letter as char
             )
+        } else if kind == DRIVE_REMOVABLE {
+            // Match the names Explorer gives an unlabelled drive.
+            format!("Removable Disk ({}:)", letter as char)
         } else {
-            format!("{}:", letter as char)
+            format!("Local Disk ({}:)", letter as char)
         };
         volumes.push(VolumeInfo {
             name,
@@ -136,6 +139,11 @@ mod tests {
             .find(|v| v.path == root)
             .expect("system drive card");
         assert!(volume.name.contains(&system));
+        // Every drive carries a label and its letter, never a bare "C:".
+        for volume in &volumes {
+            assert!(volume.name.ends_with(":)"), "{}", volume.name);
+            assert!(volume.name.contains(" ("), "{}", volume.name);
+        }
         assert!(volume.total_bytes > 0);
         assert!(volume.available_bytes <= volume.total_bytes);
         assert_eq!(volume.total_bytes, disk_space(&root).unwrap().0);

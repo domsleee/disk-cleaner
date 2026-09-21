@@ -64,6 +64,7 @@ fn split_drive_letter(name: &str) -> (&str, &str) {
     if name.ends_with(":)")
         && let Some(open) = name.rfind(" (")
         && name.len() - open == 5
+        && name.as_bytes()[open + 2].is_ascii_alphabetic()
     {
         return (&name[..open], &name[open + 1..]);
     }
@@ -2053,14 +2054,20 @@ impl eframe::App for App {
                                                                 .size()
                                                                 .x
                                                                 > name_width;
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(label)
-                                                                        .size(15.0)
-                                                                        .strong(),
-                                                                )
-                                                                .truncate(),
-                                                            );
+                                                            // Cap the label so a long one cannot
+                                                            // eat the drive letter's room, while
+                                                            // a short one still sits against it.
+                                                            ui.scope(|ui| {
+                                                                ui.set_max_width(name_width);
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(label)
+                                                                            .size(15.0)
+                                                                            .strong(),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            });
                                                             if !drive.is_empty() {
                                                                 ui.label(
                                                                     egui::RichText::new(drive)
@@ -2232,6 +2239,10 @@ impl eframe::App for App {
                         .on_hover_text(err);
                     }
                 });
+                // The new height only takes effect next frame, so ask for one.
+                if (self.volumes_list_height - measured_list_height).abs() > 0.5 {
+                    ctx.request_repaint();
+                }
                 self.volumes_list_height = measured_list_height;
                 if pick_folder {
                     scan_path = rfd::FileDialog::new().pick_folder();
@@ -2522,6 +2533,9 @@ mod tests {
         assert_eq!(split_drive_letter("Macintosh HD"), ("Macintosh HD", ""));
         assert_eq!(split_drive_letter("Photos (2024)"), ("Photos (2024)", ""));
         assert_eq!(split_drive_letter("(C:)"), ("(C:)", ""));
+        // A Unix volume that merely looks like one keeps its whole name.
+        assert_eq!(split_drive_letter("Backup (1:)"), ("Backup (1:)", ""));
+        assert_eq!(split_drive_letter("資料 (é:)"), ("資料 (é:)", ""));
     }
 
     use super::*;

@@ -78,8 +78,9 @@ fn set_dark_titlebar(cc: &eframe::CreationContext<'_>) {
     };
     let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
     let enabled: i32 = 1;
-    // Attribute 20 arrived in Windows 10 build 18985; older builds use 19 and
-    // reject 20, so fall back rather than leave the caption light.
+    // Attribute 20 arrived in Windows 10 build 18985. Builds between 17763 and
+    // 18984 took the same value under the undocumented 19, so try that before
+    // giving up; older builds have no dark caption at all.
     for attribute in [DWMWA_USE_IMMERSIVE_DARK_MODE as u32, 19] {
         let hr = unsafe {
             DwmSetWindowAttribute(

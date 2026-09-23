@@ -496,6 +496,15 @@ fn platform_skip_paths(_root: &Path) -> HashSet<PathBuf> {
 }
 
 pub fn scan_directory(root: &Path, progress: Arc<ScanProgress>) -> FileNode {
+    // Reading a dir stamps its atime; those writes made cold scans ~28% slower.
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        // IOPOL_TYPE_VFS_ATIME_UPDATES, IOPOL_SCOPE_PROCESS, IOPOL_ATIME_UPDATES_OFF
+        unsafe { setiopolicy_np(2, 0, 1) };
+    }
     let skip = build_skip_set(root);
     scan_pool().install(|| scan_directory_inner(root, progress, skip))
 }

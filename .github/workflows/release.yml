@@ -62,7 +62,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 
@@ -166,7 +166,7 @@ jobs:
           zip "../../Disk-Cleaner-${GITHUB_REF_NAME}-windows-x86_64.zip" disk-cleaner.exe
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: false
           files: |

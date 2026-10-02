@@ -9,11 +9,17 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::sync_channel;
 use std::thread;
+
+use crate::tree::{DirNode, FileLeaf, FileNode};
 use std::time::{Duration, Instant};
 
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
 use smallvec::SmallVec;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_JOURNAL_NOT_ACTIVE,
@@ -25,21 +31,23 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
-    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileIdType,
-    FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING, OpenFileById, ReadFile,
-    VOLUME_NAME_DOS,
+    BusTypeNvme, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileIdType, FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    OpenFileById, ReadFile, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::{
     DeviceIoControl, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0_0,
 };
 use windows_sys::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_FILE_RECORD, FSCTL_GET_NTFS_VOLUME_DATA, MFT_ENUM_DATA_V0,
-    NTFS_FILE_RECORD_INPUT_BUFFER, NTFS_FILE_RECORD_OUTPUT_BUFFER, NTFS_VOLUME_DATA_BUFFER,
-    USN_RECORD_V2, USN_RECORD_V3,
+    FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_FILE_RECORD, FSCTL_GET_NTFS_VOLUME_DATA,
+    IOCTL_STORAGE_QUERY_PROPERTY, MFT_ENUM_DATA_V0, NTFS_FILE_RECORD_INPUT_BUFFER,
+    NTFS_FILE_RECORD_OUTPUT_BUFFER, NTFS_VOLUME_DATA_BUFFER, PropertyStandardQuery,
+    STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY, StorageDeviceProperty, USN_RECORD_V2,
+    USN_RECORD_V3,
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken};
 
@@ -50,7 +58,6 @@ const RAW_MFT_PIPELINE_DEPTH: usize = 2;
 const RAW_MFT_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const RAW_MFT_VOLUME_READ_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const RAW_MFT_VOLUME_OVERLAPPED_SLOTS: usize = 2;
-const RAW_MFT_MATERIALIZE_CHUNK: usize = 16_384;
 const USN_PAGE_HEADER_SIZE: usize = size_of::<u64>();
 const ATTR_TYPE_DATA: u32 = 0x80;
 const ATTR_TYPE_FILE_NAME: u32 = 0x30;
@@ -60,6 +67,7 @@ const FILE_RECORD_HEADER_SIZE: usize = 0x30;
 const FILE_RECORD_ATTR_OFFSET: usize = 0x14;
 const FILE_RECORD_LINK_COUNT_OFFSET: usize = 0x12;
 const FILE_RECORD_FLAGS_OFFSET: usize = 0x16;
+const FILE_RECORD_NUMBER_OFFSET: usize = 0x2C;
 const FILE_RECORD_BASE_RECORD_OFFSET: usize = 0x20;
 const NTFS_FILE_RECORD_OUTPUT_HEADER_SIZE: usize = size_of::<i64>() + size_of::<u32>();
 const FILE_RECORD_FLAG_IN_USE: u16 = 0x0001;
@@ -67,6 +75,98 @@ const FILE_RECORD_FLAG_DIRECTORY: u16 = 0x0002;
 const FILE_NAME_VALUE_MIN_SIZE: usize = 0x42;
 const NTFS_VOLUME_ROOT_RECORD_NUMBER: u64 = 5;
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+const ATTR_FLAG_COMPRESSION_MASK: u16 = 0x00FF;
+const ATTR_FLAG_SPARSE: u16 = 0x8000;
+
+/// Buses on which the raw MFT has been measured to beat the bulk walker.
+///
+/// This is a whitelist, not a cost model. Reading `$MFT` is parse-bound rather
+/// than disk-bound (0.78-1.06 GB/s achieved on NVMe, ~1.0-1.4 us/file against
+/// the walker's 0.8-1.5), so the win is a near-tie decided by device latency:
+/// 25% on one NVMe volume, 8% on another, and 3.1x/5.7x *losses* on two SATA
+/// volumes. Measured on four volumes of one machine. Only buses measured to win
+/// appear here; an unrecognised bus, or a query that fails, keeps the walker.
+///
+/// Volume shape does not appear here on purpose. Counting in-use records from
+/// `$MFT`'s `$BITMAP` moves the predicted ratios to 0.66/0.65/2.39/3.36, which
+/// changes none of those four decisions — the bus gap (3.4x) dwarfs the shape
+/// term (at most 1.5x). It would start to matter on a high-free-fraction NVMe
+/// volume, which is the case to build and measure before adding it.
+fn bus_favours_mft(bus_type: i32) -> bool {
+    bus_type == BusTypeNvme
+}
+
+fn volume_bus_type(volume_handle: HANDLE) -> io::Result<i32> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut buf = [0u8; 512];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            volume_handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast(),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (returned as usize) < size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short storage device descriptor",
+        ));
+    }
+    // `buf` is a byte array, so it is not aligned for the descriptor.
+    let descriptor = unsafe {
+        buf.as_ptr()
+            .cast::<STORAGE_DEVICE_DESCRIPTOR>()
+            .read_unaligned()
+    };
+    Ok(descriptor.BusType)
+}
+
+#[derive(Debug)]
+struct MftSlowerThanWalker;
+
+impl std::fmt::Display for MftSlowerThanWalker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "raw MFT read projected slower than the directory walker")
+    }
+}
+
+impl std::error::Error for MftSlowerThanWalker {}
+
+fn mft_worth_it(eligibility: &NtfsEligibility) -> io::Result<bool> {
+    if mft_mode() == "force" {
+        return Ok(true);
+    }
+    let volume = open_volume(&eligibility.volume_device)?;
+    Ok(bus_favours_mft(volume_bus_type(volume.0)?))
+}
+
+pub fn is_mft_declined(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<MftSlowerThanWalker>())
+}
+
+/// `DISK_CLEANER_MFT`: `auto` (default), `off`, or `force` to skip the check.
+fn mft_mode() -> &'static str {
+    static MODE: OnceLock<String> = OnceLock::new();
+    MODE.get_or_init(|| {
+        std::env::var("DISK_CLEANER_MFT")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_else(|_| "auto".to_string())
+    })
+}
 const INVALID_INDEX: u32 = u32::MAX;
 
 type ParsedFileNameList = SmallVec<[ParsedFileNameAttribute; 2]>;
@@ -210,7 +310,18 @@ pub struct RawMftIndexSummary {
     pub total_logical_size: u64,
     pub total_allocated_size: u64,
     pub sample_entries: Vec<RawMftIndexEntry>,
+    /// Parse failures grouped by message, up to `MAX_PARSE_ERROR_KINDS` kinds.
+    pub parse_error_kinds: Vec<RawMftParseErrorKind>,
 }
+
+#[derive(Debug, Clone)]
+pub struct RawMftParseErrorKind {
+    pub message: Box<str>,
+    pub count: u64,
+    pub first_record: u64,
+}
+
+const MAX_PARSE_ERROR_KINDS: usize = 8;
 
 pub struct RawMftIndex {
     pub summary: RawMftIndexSummary,
@@ -490,14 +601,14 @@ pub fn probe_raw_mft_for_path(path: &Path, limit: Option<usize>) -> io::Result<R
 }
 
 pub fn build_raw_mft_index_for_path(path: &Path, limit: Option<usize>) -> io::Result<RawMftIndex> {
-    Ok(build_raw_mft_index_for_path_impl(path, limit, true)?.0)
+    Ok(build_raw_mft_index_for_path_impl(path, limit, true, None, None, SubtreeRollup::Compute)?.0)
 }
 
 pub fn build_raw_mft_index_for_path_profiled(
     path: &Path,
     limit: Option<usize>,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
-    build_raw_mft_index_for_path_impl(path, limit, true)
+    build_raw_mft_index_for_path_impl(path, limit, true, None, None, SubtreeRollup::Compute)
 }
 
 pub fn build_raw_mft_index_for_path_profiled_with_preference(
@@ -505,16 +616,49 @@ pub fn build_raw_mft_index_for_path_profiled_with_preference(
     limit: Option<usize>,
     prefer_volume: bool,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
-    build_raw_mft_index_for_path_impl(path, limit, prefer_volume)
+    build_raw_mft_index_for_path_impl(
+        path,
+        limit,
+        prefer_volume,
+        None,
+        None,
+        SubtreeRollup::Compute,
+    )
+}
+
+fn build_raw_mft_index_for_scan(
+    path: &Path,
+    eligibility: &NtfsEligibility,
+    progress: &super::ScanProgress,
+) -> io::Result<RawMftIndex> {
+    Ok(build_raw_mft_index_for_path_impl(
+        path,
+        None,
+        true,
+        Some(progress),
+        Some(eligibility),
+        SubtreeRollup::Skip,
+    )?
+    .0)
 }
 
 fn build_raw_mft_index_for_path_impl(
     path: &Path,
     limit: Option<usize>,
     prefer_volume: bool,
+    progress: Option<&super::ScanProgress>,
+    known_eligibility: Option<&NtfsEligibility>,
+    rollup: SubtreeRollup,
 ) -> io::Result<(RawMftIndex, RawMftBuildTimings)> {
     let start = Instant::now();
-    let eligibility = ntfs_eligibility(path)?;
+    let probed;
+    let eligibility = match known_eligibility {
+        Some(eligibility) => eligibility,
+        None => {
+            probed = ntfs_eligibility(path)?;
+            &probed
+        }
+    };
     if !eligibility.is_ntfs() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -549,6 +693,7 @@ fn build_raw_mft_index_for_path_impl(
         eligibility.volume_device.clone(),
         volume_data.BytesPerFileRecordSegment,
         target_records,
+        total_records,
     );
     let mut timings = RawMftBuildTimings {
         setup: start.elapsed(),
@@ -577,6 +722,7 @@ fn build_raw_mft_index_for_path_impl(
                 valid_len,
                 &mut raw,
                 &mut timings,
+                progress,
             )?;
         }
     } else {
@@ -590,11 +736,18 @@ fn build_raw_mft_index_for_path_impl(
             valid_len,
             &mut raw,
             &mut timings,
+            progress,
         )?;
     }
 
+    // finish() aggregates every entry, so skip it for a cancelled scan.
+    if let Some(p) = progress
+        && p.cancelled.load(Ordering::Relaxed)
+    {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
     let finish_start = Instant::now();
-    let index = raw.finish();
+    let index = raw.finish(rollup)?;
     timings.finish += finish_start.elapsed();
 
     Ok((index, timings))
@@ -1029,7 +1182,7 @@ fn enable_backup_privilege() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut privileges = TOKEN_PRIVILEGES {
+    let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
@@ -1040,7 +1193,7 @@ fn enable_backup_privilege() -> io::Result<()> {
         AdjustTokenPrivileges(
             token.0,
             0,
-            &mut privileges,
+            &privileges,
             size_of::<TOKEN_PRIVILEGES>() as u32,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -1095,8 +1248,10 @@ impl OverlappedVolumeReadSlot {
         }
 
         let event = HandleGuard(event);
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event.0;
+        let overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..OVERLAPPED::default()
+        };
         Ok(Self {
             _event: event,
             overlapped,
@@ -1105,6 +1260,8 @@ impl OverlappedVolumeReadSlot {
     }
 }
 
+/// The kernel writes into `slot` after this returns, so the caller must leave
+/// the slot and its buffer alone until `finish_overlapped_volume_read`.
 fn start_overlapped_volume_read(
     file: &File,
     slot: &mut OverlappedVolumeReadSlot,
@@ -1192,7 +1349,7 @@ impl Drop for SuspendedBackupPrivilege {
             AdjustTokenPrivileges(
                 token.0,
                 0,
-                &mut self.previous_state,
+                &self.previous_state,
                 size_of::<TOKEN_PRIVILEGES>() as u32,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -1222,7 +1379,7 @@ fn suspend_backup_privilege() -> io::Result<SuspendedBackupPrivilege> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut privileges = TOKEN_PRIVILEGES {
+    let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
@@ -1241,7 +1398,7 @@ fn suspend_backup_privilege() -> io::Result<SuspendedBackupPrivilege> {
         AdjustTokenPrivileges(
             token.0,
             0,
-            &mut privileges,
+            &privileges,
             size_of::<TOKEN_PRIVILEGES>() as u32,
             &mut previous_state,
             &mut previous_state_len,
@@ -1302,18 +1459,10 @@ struct RawMftIndexBuild {
     summary: RawMftIndexSummary,
     entries: Vec<RawMftIndexAggregate>,
     entry_index: Vec<u32>,
-}
-
-#[derive(Default)]
-struct MaterializedRawMftSummary {
-    materialized_entries: usize,
-    entries_without_data_size: usize,
-    files_without_data_size: usize,
-    dirs_without_data_size: usize,
-    multi_name_entries: usize,
-    extra_primary_names: u64,
-    extra_primary_name_logical_size: u64,
-    extra_primary_name_allocated_size: u64,
+    record_limit: u64,
+    /// Live totals for the scanning screen, before hardlink dedup.
+    running_files: u64,
+    running_allocated: u64,
 }
 
 struct RawMftReadChunk {
@@ -1322,11 +1471,13 @@ struct RawMftReadChunk {
 }
 
 impl RawMftIndexBuild {
+    /// `expected_records` sizes the read; `total_records` bounds valid references.
     fn new(
         volume_root: PathBuf,
         volume_device: String,
         bytes_per_file_record: u32,
         expected_records: usize,
+        total_records: usize,
     ) -> Self {
         let mut entries = Vec::new();
         let _ = entries.try_reserve_exact(expected_records);
@@ -1338,7 +1489,24 @@ impl RawMftIndexBuild {
                 ..RawMftIndexSummary::default()
             },
             entries,
-            entry_index: vec![INVALID_INDEX; expected_records.saturating_add(1)],
+            entry_index: vec![INVALID_INDEX; total_records.saturating_add(1)],
+            record_limit: total_records as u64,
+            running_files: 0,
+            running_allocated: 0,
+        }
+    }
+
+    fn record_parse_error(&mut self, record_number: u64, message: &str) {
+        self.summary.parse_errors += 1;
+        let kinds = &mut self.summary.parse_error_kinds;
+        if let Some(kind) = kinds.iter_mut().find(|kind| &*kind.message == message) {
+            kind.count += 1;
+        } else if kinds.len() < MAX_PARSE_ERROR_KINDS {
+            kinds.push(RawMftParseErrorKind {
+                message: message.into(),
+                count: 1,
+                first_record: record_number,
+            });
         }
     }
 
@@ -1354,14 +1522,26 @@ impl RawMftIndexBuild {
             link_count,
             is_name_surrogate_reparse,
         } = fragment;
+        // References come straight off disk; a corrupt one would size the dense tables by garbage.
+        let record_limit = self.record_limit;
+        if owner_record_number >= record_limit {
+            self.record_parse_error(record_number, "MFT base record reference out of range");
+            return;
+        }
+        let mut file_names = file_names;
+        let names_before = file_names.len();
+        file_names.retain(|name| name.parent_record_number < record_limit);
+        for _ in file_names.len()..names_before {
+            self.record_parse_error(record_number, "MFT parent reference out of range");
+        }
         let from_owner = record_number == owner_record_number;
         let owner_idx = owner_record_number as usize;
-        if owner_idx >= self.entry_index.len() {
-            self.entry_index.resize(owner_idx + 1, INVALID_INDEX);
-        }
         if self.entry_index[owner_idx] == INVALID_INDEX {
             let idx = self.entries.len();
-            let idx_u32 = u32::try_from(idx).expect("raw MFT entry index overflow");
+            let Ok(idx_u32) = u32::try_from(idx) else {
+                self.record_parse_error(record_number, "MFT index has more than u32::MAX entries");
+                return;
+            };
             let (logical_size, allocated_size, size_from_owner) = if let (
                 Some(logical_size),
                 Some(allocated_size),
@@ -1372,6 +1552,10 @@ impl RawMftIndexBuild {
             } else {
                 (None, None, false)
             };
+            if !is_directory {
+                self.running_files += 1;
+                self.running_allocated += allocated_size.unwrap_or(0);
+            }
             self.entries.push(RawMftIndexAggregate {
                 record_number: owner_record_number,
                 file_names,
@@ -1395,56 +1579,31 @@ impl RawMftIndexBuild {
 
         entry.file_names.extend(file_names);
 
-        if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size) {
-            if entry.logical_size.is_none() || (from_owner && !entry.size_from_owner) {
-                entry.logical_size = Some(logical_size);
-                entry.allocated_size = Some(allocated_size);
-                entry.size_from_owner = from_owner;
+        if let (Some(logical_size), Some(allocated_size)) = (logical_size, allocated_size)
+            && (entry.logical_size.is_none() || (from_owner && !entry.size_from_owner))
+        {
+            let previous = entry.allocated_size.unwrap_or(0);
+            entry.logical_size = Some(logical_size);
+            entry.allocated_size = Some(allocated_size);
+            entry.size_from_owner = from_owner;
+            if !entry.is_directory {
+                self.running_allocated = self.running_allocated - previous + allocated_size;
             }
         }
     }
 
-    fn finish(mut self) -> RawMftIndex {
+    fn finish(mut self, rollup: SubtreeRollup) -> io::Result<RawMftIndex> {
         let record_index_len = self.entry_index.len();
-        let materialized_summaries: Vec<_> = self
-            .entries
-            .par_chunks(RAW_MFT_MATERIALIZE_CHUNK)
-            .map(|chunk| {
-                let mut out = MaterializedRawMftSummary::default();
-                for entry in chunk {
-                    accumulate_materialized_entry_summary(entry, &mut out);
-                }
-                out
-            })
-            .collect();
-
-        let total_materialized = materialized_summaries
-            .iter()
-            .map(|chunk| chunk.materialized_entries)
-            .sum();
-        let mut final_entries = Vec::with_capacity(total_materialized);
-        for chunk in materialized_summaries {
-            self.summary.entries_without_data_size += chunk.entries_without_data_size;
-            self.summary.files_without_data_size += chunk.files_without_data_size;
-            self.summary.dirs_without_data_size += chunk.dirs_without_data_size;
-            self.summary.multi_name_entries += chunk.multi_name_entries;
-            self.summary.extra_primary_names = self
-                .summary
-                .extra_primary_names
-                .saturating_add(chunk.extra_primary_names);
-            self.summary.extra_primary_name_logical_size = self
-                .summary
-                .extra_primary_name_logical_size
-                .saturating_add(chunk.extra_primary_name_logical_size);
-            self.summary.extra_primary_name_allocated_size = self
-                .summary
-                .extra_primary_name_allocated_size
-                .saturating_add(chunk.extra_primary_name_allocated_size);
+        // One name selection, not two: the counters come from what was actually
+        // emitted, so they cannot disagree with it.
+        let mut final_entries = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            materialize_raw_mft_entry(entry, &mut final_entries, &mut self.summary)?;
         }
 
-        for entry in self.entries.into_iter() {
-            let pushed = materialize_raw_mft_entry(entry, &mut final_entries, total_materialized);
-            debug_assert!(pushed <= total_materialized);
+        let mut root_entries = 0usize;
+        if rollup == SubtreeRollup::Skip {
+            return Ok(finish_summary(self.summary, final_entries, root_entries));
         }
 
         let mut canonical_parent_index = vec![INVALID_INDEX; record_index_len];
@@ -1452,12 +1611,11 @@ impl RawMftIndexBuild {
             let record_number = entry.record_number as usize;
             if entry.is_directory && canonical_parent_index[record_number] == INVALID_INDEX {
                 canonical_parent_index[record_number] =
-                    u32::try_from(idx).expect("raw MFT canonical parent index overflow");
+                    to_u32_index(idx, "canonical parent index")?;
             }
         }
         let mut parent_indices = vec![INVALID_INDEX; final_entries.len()];
         let mut pending_children = vec![0u32; final_entries.len()];
-        let mut root_entries = 0usize;
 
         for (idx, entry) in final_entries.iter().enumerate() {
             if entry.record_number == entry.parent_record_number {
@@ -1479,7 +1637,7 @@ impl RawMftIndexBuild {
         let mut ready = Vec::with_capacity(final_entries.len());
         for (idx, child_count) in pending_children.iter().enumerate() {
             if *child_count == 0 {
-                ready.push(u32::try_from(idx).expect("raw MFT ready index overflow"));
+                ready.push(to_u32_index(idx, "ready index")?);
             }
         }
 
@@ -1506,20 +1664,9 @@ impl RawMftIndexBuild {
 
             pending_children[parent_idx] -= 1;
             if pending_children[parent_idx] == 0 {
-                ready.push(u32::try_from(parent_idx).expect("raw MFT ready parent index overflow"));
+                ready.push(to_u32_index(parent_idx, "ready parent index")?);
             }
         }
-
-        self.summary.indexed_entries = final_entries.len();
-        self.summary.total_file_entries = final_entries
-            .iter()
-            .filter(|entry| !entry.is_directory)
-            .count();
-        self.summary.total_dir_entries = final_entries
-            .iter()
-            .filter(|entry| entry.is_directory)
-            .count();
-        self.summary.root_entries = root_entries;
 
         let root_entry = final_entries.iter().find(|entry| {
             entry.is_directory && u64::from(entry.record_number) == NTFS_VOLUME_ROOT_RECORD_NUMBER
@@ -1545,22 +1692,47 @@ impl RawMftIndexBuild {
                 .map(|(_, entry)| entry.subtree_allocated_size)
                 .sum()
         };
-        self.summary.sample_entries = final_entries.iter().take(SAMPLE_LIMIT).cloned().collect();
 
-        RawMftIndex {
-            summary: self.summary,
-            entries: final_entries,
-        }
+        Ok(finish_summary(self.summary, final_entries, root_entries))
     }
+}
+
+fn finish_summary(
+    mut summary: RawMftIndexSummary,
+    final_entries: Vec<RawMftIndexEntry>,
+    root_entries: usize,
+) -> RawMftIndex {
+    summary.indexed_entries = final_entries.len();
+    summary.total_file_entries = final_entries
+        .iter()
+        .filter(|entry| !entry.is_directory)
+        .count();
+    summary.total_dir_entries = final_entries
+        .iter()
+        .filter(|entry| entry.is_directory)
+        .count();
+    summary.root_entries = root_entries;
+    summary.sample_entries = final_entries.iter().take(SAMPLE_LIMIT).cloned().collect();
+
+    RawMftIndex {
+        summary,
+        entries: final_entries,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubtreeRollup {
+    Compute,
+    Skip,
 }
 
 fn materialize_raw_mft_entry(
     entry: RawMftIndexAggregate,
     out: &mut Vec<RawMftIndexEntry>,
-    total_materialized: usize,
-) -> usize {
+    summary: &mut RawMftIndexSummary,
+) -> io::Result<usize> {
     if entry.is_name_surrogate_reparse {
-        return 0;
+        return Ok(0);
     }
     let link_limit = if entry.is_directory {
         1
@@ -1569,28 +1741,43 @@ fn materialize_raw_mft_entry(
     };
     let file_names = materialized_file_names(entry.file_names, link_limit);
     if file_names.is_empty() {
-        return 0;
+        return Ok(0);
     }
-    if out.len().saturating_add(file_names.len()) > total_materialized {
-        panic!(
-            "raw MFT materialization overflow: len={} + pushed={} > total={} record={} link_limit={} dir={}",
-            out.len(),
-            file_names.len(),
-            total_materialized,
-            entry.record_number,
-            link_limit,
-            entry.is_directory
-        );
+
+    let count = file_names.len();
+    if count > 1 {
+        summary.multi_name_entries += 1;
+        let extra = (count - 1) as u64;
+        summary.extra_primary_names = summary.extra_primary_names.saturating_add(extra);
+        if !entry.is_directory {
+            summary.extra_primary_name_logical_size = summary
+                .extra_primary_name_logical_size
+                .saturating_add(extra.saturating_mul(entry.logical_size.unwrap_or(0)));
+            summary.extra_primary_name_allocated_size = summary
+                .extra_primary_name_allocated_size
+                .saturating_add(extra.saturating_mul(entry.allocated_size.unwrap_or(0)));
+        }
     }
+    if entry.logical_size.is_none() {
+        summary.entries_without_data_size += count;
+        if entry.is_directory {
+            summary.dirs_without_data_size += count;
+        } else {
+            summary.files_without_data_size += count;
+        }
+    }
+
+    let record_number = to_u32_record(entry.record_number, "record number")?;
     let logical_size = entry.logical_size.unwrap_or(0);
     let allocated_size = entry.allocated_size.unwrap_or(0);
     let pushed = file_names.len();
     for file_name in file_names {
         out.push(RawMftIndexEntry {
-            record_number: u32::try_from(entry.record_number)
-                .expect("raw MFT record number exceeds u32"),
-            parent_record_number: u32::try_from(file_name.parent_record_number)
-                .expect("raw MFT parent record number exceeds u32"),
+            record_number,
+            parent_record_number: to_u32_record(
+                file_name.parent_record_number,
+                "parent record number",
+            )?,
             attributes: file_name.attributes,
             name: file_name.name.into_boxed_str(),
             is_directory: entry.is_directory,
@@ -1600,72 +1787,25 @@ fn materialize_raw_mft_entry(
             subtree_dir_count: u32::from(entry.is_directory),
         });
     }
-    pushed
+    Ok(pushed)
 }
 
-fn accumulate_materialized_entry_summary(
-    entry: &RawMftIndexAggregate,
-    out: &mut MaterializedRawMftSummary,
-) {
-    if entry.is_name_surrogate_reparse {
-        return;
-    }
-    let link_limit = if entry.is_directory {
-        1
-    } else {
-        usize::from(entry.link_count.unwrap_or(1).max(1))
-    };
-    let materialized_count = materialized_file_name_count(&entry.file_names, link_limit);
-    if materialized_count == 0 {
-        return;
-    }
-
-    out.materialized_entries += materialized_count;
-    if materialized_count > 1 {
-        out.multi_name_entries += 1;
-        let extra_names = (materialized_count - 1) as u64;
-        out.extra_primary_names += extra_names;
-        if !entry.is_directory {
-            out.extra_primary_name_logical_size = out
-                .extra_primary_name_logical_size
-                .saturating_add(extra_names.saturating_mul(entry.logical_size.unwrap_or(0)));
-            out.extra_primary_name_allocated_size = out
-                .extra_primary_name_allocated_size
-                .saturating_add(extra_names.saturating_mul(entry.allocated_size.unwrap_or(0)));
-        }
-    }
-    if entry.logical_size.is_none() {
-        out.entries_without_data_size += materialized_count;
-        if entry.is_directory {
-            out.dirs_without_data_size += materialized_count;
-        } else {
-            out.files_without_data_size += materialized_count;
-        }
-    }
+fn to_u32_record(value: u64, what: &str) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("raw MFT {what} {value} exceeds u32"),
+        )
+    })
 }
 
-fn materialized_file_name_count(file_names: &[ParsedFileNameAttribute], max_names: usize) -> usize {
-    if max_names == 0 || file_names.is_empty() {
-        return 0;
-    }
-    if file_names.len() == 1 {
-        return 1;
-    }
-    if file_names.len() == 2 {
-        let a = &file_names[0];
-        let b = &file_names[1];
-        if a.parent_record_number == b.parent_record_number && a.name == b.name {
-            return 1;
-        }
-        let mut count = usize::from(a.namespace_rank > 1) + usize::from(b.namespace_rank > 1);
-        if count == 0 {
-            count = 1;
-        }
-        return count.min(max_names);
-    }
-
-    let cloned: ParsedFileNameList = file_names.iter().cloned().collect();
-    materialized_file_names(cloned, max_names).len()
+fn to_u32_index(value: usize, what: &str) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("raw MFT {what} {value} exceeds u32"),
+        )
+    })
 }
 
 fn parse_raw_mft_record(
@@ -1722,6 +1862,23 @@ fn parse_raw_mft_record_fragment(
         return Ok(None);
     }
 
+    // Every identity here is a record's position in the byte stream, so a short
+    // read or a bad runlist would silently renumber the rest of the volume.
+    // NTFS 3.1 stamps the number into the record, turning that into an error.
+    if record.len() >= FILE_RECORD_NUMBER_OFFSET + 4 {
+        let stamped = u32::from_le_bytes(
+            record[FILE_RECORD_NUMBER_OFFSET..FILE_RECORD_NUMBER_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if stamped != 0 && u64::from(stamped) != record_number {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MFT record number does not match its position",
+            ));
+        }
+    }
+
     let flags = u16::from_le_bytes(
         record[FILE_RECORD_FLAGS_OFFSET..FILE_RECORD_FLAGS_OFFSET + 2]
             .try_into()
@@ -1731,6 +1888,8 @@ fn parse_raw_mft_record_fragment(
         return Ok(None);
     }
 
+    // A file reference is a 48-bit record number plus a 16-bit sequence number;
+    // only the record number is kept, so a reused record is not detected.
     let base_record_number = u64::from_le_bytes(
         record[FILE_RECORD_BASE_RECORD_OFFSET..FILE_RECORD_BASE_RECORD_OFFSET + 8]
             .try_into()
@@ -1816,25 +1975,24 @@ fn materialized_file_names(
 
     let mut materialized: ParsedFileNameList = SmallVec::with_capacity(file_names.len());
     for candidate in file_names.into_iter() {
-        if let Some(existing) = materialized.last_mut() {
-            if existing.parent_record_number == candidate.parent_record_number
-                && existing.name == candidate.name
-            {
-                if candidate.namespace_rank > existing.namespace_rank {
-                    *existing = candidate;
-                }
-                continue;
+        if let Some(existing) = materialized.last_mut()
+            && existing.parent_record_number == candidate.parent_record_number
+            && existing.name == candidate.name
+        {
+            if candidate.namespace_rank > existing.namespace_rank {
+                *existing = candidate;
             }
+            continue;
         }
         if candidate.namespace_rank > 1 {
             materialized.push(candidate);
         }
     }
 
-    if materialized.is_empty() {
-        if let Some(best) = fallback_best {
-            materialized.push(best);
-        }
+    if materialized.is_empty()
+        && let Some(best) = fallback_best
+    {
+        materialized.push(best);
     }
 
     if materialized.len() > max_names {
@@ -2027,8 +2185,20 @@ fn scan_raw_mft_attributes(record: &[u8]) -> io::Result<ScannedRawMftAttributes>
                         record[offset + 0x10..offset + 0x18].try_into().unwrap(),
                     );
                     if lowest_vcn == 0 {
+                        let attr_flags = u16::from_le_bytes(
+                            record[offset + 0x0C..offset + 0x0E].try_into().unwrap(),
+                        );
+                        // Sparse/compressed: AllocatedSize counts holes, TotalAllocatedSize is the physical bytes.
+                        let allocated_offset =
+                            if attr_flags & (ATTR_FLAG_COMPRESSION_MASK | ATTR_FLAG_SPARSE) != 0 {
+                                0x40
+                            } else {
+                                0x28
+                            };
                         let allocated_size = u64::from_le_bytes(
-                            record[offset + 0x28..offset + 0x30].try_into().unwrap(),
+                            record[offset + allocated_offset..offset + allocated_offset + 8]
+                                .try_into()
+                                .unwrap(),
                         );
                         let logical_size = u64::from_le_bytes(
                             record[offset + 0x30..offset + 0x38].try_into().unwrap(),
@@ -2332,6 +2502,7 @@ fn probe_raw_mft_via_volume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_raw_mft_index_via_volume(
     volume_device: &str,
     volume_handle: HANDLE,
@@ -2342,6 +2513,7 @@ fn build_raw_mft_index_via_volume(
     valid_len: u64,
     build: &mut RawMftIndexBuild,
     timings: &mut RawMftBuildTimings,
+    progress: Option<&super::ScanProgress>,
 ) -> io::Result<()> {
     let mut output_buf = vec![
         0u8;
@@ -2432,6 +2604,20 @@ fn build_raw_mft_index_via_volume(
                 timings,
             );
 
+            if let Some(p) = progress {
+                if p.cancelled.load(Ordering::Relaxed) {
+                    // Drain the queued read so the kernel cannot write into a dropped buffer.
+                    if schedule_next {
+                        let _ = finish_overlapped_volume_read(&volume_file, &mut slots[next_slot]);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+                }
+                // Live ticker; hardlinks are deduplicated later, so this can run high.
+                p.file_count.store(build.running_files, Ordering::Relaxed);
+                p.total_size
+                    .store(build.running_allocated, Ordering::Relaxed);
+            }
+
             pending = schedule_next;
             pending_slot = next_slot;
         }
@@ -2451,6 +2637,7 @@ fn build_raw_mft_index_via_volume(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_raw_mft_index_read_chunk(
     buf: &mut [u8],
     read: usize,
@@ -2523,6 +2710,9 @@ fn process_raw_mft_records(
         let record_number = *next_record_number;
         *next_record_number += 1;
 
+        if is_uninitialized_record(record) {
+            continue;
+        }
         match apply_update_sequence_fixup(record, bytes_per_sector)
             .and_then(|fixed| parse_raw_mft_record(fixed, record_number))
         {
@@ -2552,6 +2742,9 @@ fn process_raw_mft_index_records(
         .enumerate()
         .map(|(idx, record)| {
             let record_number = base_record_number + idx as u64;
+            if is_uninitialized_record(record) {
+                return Ok(None);
+            }
             apply_update_sequence_fixup(record, bytes_per_sector)
                 .and_then(|fixed| parse_raw_mft_record_fragment(fixed, record_number))
         })
@@ -2559,14 +2752,19 @@ fn process_raw_mft_index_records(
     timings.parse_fixup += parse_start.elapsed();
 
     let merge_start = Instant::now();
-    for result in parsed {
+    for (idx, result) in parsed.into_iter().enumerate() {
         match result {
             Ok(Some(fragment)) => build.push_fragment(fragment),
             Ok(None) => {}
-            Err(_) => build.summary.parse_errors += 1,
+            Err(err) => build.record_parse_error(base_record_number + idx as u64, &err.to_string()),
         }
     }
     timings.merge += merge_start.elapsed();
+}
+
+/// A never-written record is all zeros: free space, not corruption.
+fn is_uninitialized_record(record: &[u8]) -> bool {
+    record.len() >= 8 && record[..8] == [0; 8]
 }
 
 fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io::Result<&[u8]> {
@@ -2576,6 +2774,8 @@ fn apply_update_sequence_fixup(record: &mut [u8], bytes_per_sector: usize) -> io
     apply_update_sequence_fixup_generic(record, bytes_per_sector)
 }
 
+/// NTFS overwrites the last two bytes of every sector with a marker; check it,
+/// then put the real trailers back from the update sequence array.
 fn apply_update_sequence_fixup_1k(record: &mut [u8]) -> io::Result<&[u8]> {
     let usa_offset = u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize;
     let usa_count = u16::from_le_bytes(record[6..8].try_into().unwrap()) as usize;
@@ -2753,6 +2953,7 @@ fn parse_data_runs(buf: &[u8]) -> io::Result<Vec<DataRun>> {
             break;
         }
 
+        // Low nibble sizes the run length, high nibble the signed LCN delta.
         let len_size = (header & 0x0F) as usize;
         let off_size = (header >> 4) as usize;
         if len_size == 0 || offset + len_size + off_size > buf.len() {
@@ -2827,11 +3028,11 @@ fn query_sizes_from_file_record(
     })
 }
 
-fn query_file_record_bytes<'a>(
+fn query_file_record_bytes(
     volume_handle: HANDLE,
     file_reference_number: i64,
-    output_buf: &'a mut [u8],
-) -> io::Result<&'a [u8]> {
+    output_buf: &mut [u8],
+) -> io::Result<&[u8]> {
     let mut input = NTFS_FILE_RECORD_INPUT_BUFFER {
         FileReferenceNumber: file_reference_number,
     };
@@ -3001,8 +3202,19 @@ fn parse_data_attribute_sizes(record: &[u8]) -> io::Result<(u64, u64, bool)> {
                     offset += attr_len;
                     continue;
                 }
-                let allocated_size =
-                    u64::from_le_bytes(record[offset + 0x28..offset + 0x30].try_into().unwrap());
+                let attr_flags =
+                    u16::from_le_bytes(record[offset + 0x0C..offset + 0x0E].try_into().unwrap());
+                let allocated_offset =
+                    if attr_flags & (ATTR_FLAG_COMPRESSION_MASK | ATTR_FLAG_SPARSE) != 0 {
+                        0x40
+                    } else {
+                        0x28
+                    };
+                let allocated_size = u64::from_le_bytes(
+                    record[offset + allocated_offset..offset + allocated_offset + 8]
+                        .try_into()
+                        .unwrap(),
+                );
                 let logical_size =
                     u64::from_le_bytes(record[offset + 0x30..offset + 0x38].try_into().unwrap());
                 return Ok((logical_size, allocated_size, false));
@@ -3027,7 +3239,7 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {
         value
     } else {
-        ((value + alignment - 1) / alignment) * alignment
+        value.div_ceil(alignment) * alignment
     }
 }
 
@@ -3086,7 +3298,7 @@ unsafe fn parse_v3_record(record: &[u8]) -> io::Result<ParsedRecord> {
 }
 
 fn wide_name_from_record(record: &[u8], offset: usize, len_bytes: usize) -> io::Result<String> {
-    if len_bytes % size_of::<u16>() != 0 || offset + len_bytes > record.len() {
+    if !len_bytes.is_multiple_of(size_of::<u16>()) || offset + len_bytes > record.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid USN filename range",
@@ -3097,19 +3309,19 @@ fn wide_name_from_record(record: &[u8], offset: usize, len_bytes: usize) -> io::
         return Ok(ascii);
     }
     let mut wide = Vec::with_capacity(len_bytes / size_of::<u16>());
-    for chunk in bytes.chunks_exact(size_of::<u16>()) {
-        wide.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for chunk in bytes.as_chunks::<2>().0 {
+        wide.push(u16::from_le_bytes(*chunk));
     }
     Ok(String::from_utf16_lossy(&wide))
 }
 
 fn wide_ascii_name_from_record(bytes: &[u8]) -> Option<String> {
     let mut ascii = Vec::with_capacity(bytes.len() / size_of::<u16>());
-    for chunk in bytes.chunks_exact(size_of::<u16>()) {
-        if chunk[1] != 0 || chunk[0] >= 0x80 {
+    for &[lo, hi] in bytes.as_chunks::<2>().0 {
+        if hi != 0 || lo >= 0x80 {
             return None;
         }
-        ascii.push(chunk[0]);
+        ascii.push(lo);
     }
     Some(unsafe { String::from_utf8_unchecked(ascii) })
 }
@@ -3198,9 +3410,582 @@ fn trim_wide_nul(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+/// Eligibility to scan `root` via the raw MFT, or `None` to use the walker.
+/// Sets `mft_elevation_hint` when admin rights are the only thing missing.
+pub fn should_use_mft_scan(root: &Path, progress: &super::ScanProgress) -> Option<NtfsEligibility> {
+    if mft_mode() == "off" {
+        return None;
+    }
+    let eligibility = ntfs_eligibility(root).ok()?;
+    if !eligibility.is_ntfs() || !eligibility.is_local_fixed_drive() {
+        return None;
+    }
+    // Only whole-volume scans: a subtree would read all of $MFT to keep a fraction.
+    let is_volume_root = match (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(&eligibility.volume_root),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !is_volume_root {
+        return None;
+    }
+    if eligibility.can_open_volume {
+        // A volume we cannot ask about keeps the walker.
+        return match mft_worth_it(&eligibility) {
+            Ok(true) => Some(eligibility),
+            _ => None,
+        };
+    }
+    if eligibility.needs_elevation() {
+        progress.mft_elevation_hint.store(true, Ordering::Relaxed);
+    }
+    None
+}
+
+/// Scan a whole NTFS volume via the raw MFT and build the scanner tree.
+pub fn scan_volume_tree(
+    root: &Path,
+    eligibility: &NtfsEligibility,
+    progress: &super::ScanProgress,
+) -> io::Result<FileNode> {
+    let index = build_raw_mft_index_for_scan(root, eligibility, progress)?;
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
+    if index.entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw MFT index is empty",
+        ));
+    }
+    // Dropped records orphan their subtrees, so report the count rather than a smaller drive.
+    if index.summary.parse_errors > 0 {
+        let kinds: Vec<String> = index
+            .summary
+            .parse_error_kinds
+            .iter()
+            .map(|kind| {
+                format!(
+                    "{}x {} (first at record {})",
+                    kind.count, kind.message, kind.first_record
+                )
+            })
+            .collect();
+        progress.record_windows_mft_parse_errors(
+            index.summary.parse_errors,
+            root,
+            &io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} MFT records failed to parse; anything under them is missing: {}",
+                    index.summary.parse_errors,
+                    kinds.join("; ")
+                ),
+            ),
+        );
+    }
+    // Suspend SeBackupPrivilege so the root listing matches an ordinary one.
+    let visibility = {
+        let _backup_privilege = suspend_backup_privilege()?;
+        collect_win32_root_visibility(root)?
+    };
+    let tree = build_tree_from_index(&index, root, &visibility, progress);
+    // Cancelling mid-build leaves arbitrary subtrees empty, so discard the partial tree.
+    if progress.cancelled.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+    }
+    Ok(tree)
+}
+
+const ENTRY_HARD_LINK: u8 = 1;
+const ENTRY_OWNS_SIZE: u8 = 2;
+
+/// Volume-relative path of one entry, or `None` if it does not reach the root.
+fn entry_path(
+    entries: &[RawMftIndexEntry],
+    dir_of_record: &[u32],
+    root_record: u32,
+    idx: usize,
+) -> Option<String> {
+    let mut parts = vec![&*entries[idx].name];
+    let mut parent = entries[idx].parent_record_number;
+    // Bounded by the directory depth; a cycle exits on the repeat check below.
+    for _ in 0..4096 {
+        if parent == root_record {
+            parts.reverse();
+            return Some(parts.join("\\"));
+        }
+        let dir = *dir_of_record.get(parent as usize)?;
+        if dir == u32::MAX {
+            return None;
+        }
+        let entry = &entries[dir as usize];
+        if entry.parent_record_number == parent {
+            return None;
+        }
+        parts.push(&entry.name);
+        parent = entry.parent_record_number;
+    }
+    None
+}
+
+/// Which name of a hard-linked record is charged its bytes. Whichever parallel
+/// task arrived first would otherwise take them, moving directory sizes between
+/// runs. Prefers a name the tree will actually reach, so the bytes are not lost
+/// to a name hidden at the root.
+fn hardlink_size_owner(
+    entries: &[RawMftIndexEntry],
+    dir_of_record: &[u32],
+    visibility: &HashMap<String, RootVisibilityEntry>,
+    root_record: u32,
+    from: usize,
+    to: usize,
+) -> usize {
+    let mut best: Option<(bool, String, usize)> = None;
+    for idx in from..to {
+        let Some(path) = entry_path(entries, dir_of_record, root_record, idx) else {
+            continue;
+        };
+        let top = path.split('\\').next().unwrap_or_default().to_lowercase();
+        let reachable = visibility.get(&top).is_some_and(|vis| vis.can_recurse)
+            || (!path.contains('\\') && visibility.contains_key(&top));
+        let candidate = (!reachable, path, idx);
+        if best.as_ref().is_none_or(|b| candidate < *b) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, idx)| idx).unwrap_or(from)
+}
+
+/// CSR child index: avoids hashing and one allocation per directory.
+struct ChildIndex {
+    starts: Vec<u32>,
+    children: Vec<u32>,
+}
+
+impl ChildIndex {
+    fn build(entries: &[RawMftIndexEntry], max_record: usize, root_record: u32) -> Self {
+        // The root's own entry parents itself; excluding it stops the walk re-entering it.
+        let counted = |entry: &RawMftIndexEntry| entry.record_number != root_record;
+
+        let mut starts = vec![0u32; max_record + 2];
+        for entry in entries.iter().filter(|e| counted(e)) {
+            starts[entry.parent_record_number as usize + 1] += 1;
+        }
+        for i in 1..starts.len() {
+            starts[i] += starts[i - 1];
+        }
+
+        let mut children = vec![0u32; starts[starts.len() - 1] as usize];
+        let mut cursor = starts.clone();
+        for (idx, entry) in entries.iter().enumerate() {
+            if !counted(entry) {
+                continue;
+            }
+            let slot = &mut cursor[entry.parent_record_number as usize];
+            children[*slot as usize] = idx as u32;
+            *slot += 1;
+        }
+
+        Self { starts, children }
+    }
+
+    fn of(&self, record: u32) -> &[u32] {
+        let lo = self.starts[record as usize] as usize;
+        let hi = self.starts[record as usize + 1] as usize;
+        &self.children[lo..hi]
+    }
+}
+
+fn build_tree_from_index(
+    index: &RawMftIndex,
+    root: &Path,
+    visibility: &HashMap<String, RootVisibilityEntry>,
+    progress: &super::ScanProgress,
+) -> FileNode {
+    let entries = &index.entries;
+
+    let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+    let max_record = entries
+        .iter()
+        .flat_map(|e| [e.record_number, e.parent_record_number])
+        .max()
+        .unwrap_or(0)
+        .max(root_record) as usize;
+
+    // First directory entry per record, so a name can be walked up to the root.
+    let mut dir_of_record = vec![u32::MAX; max_record + 1];
+    for (idx, entry) in entries.iter().enumerate() {
+        let slot = &mut dir_of_record[entry.record_number as usize];
+        if entry.is_directory && *slot == u32::MAX {
+            *slot = idx as u32;
+        }
+    }
+
+    let mut flags = vec![0u8; entries.len()];
+    let mut i = 0;
+    while i < entries.len() {
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].record_number == entries[i].record_number {
+            j += 1;
+        }
+        if j - i > 1 && !entries[i].is_directory {
+            flags[i..j].fill(ENTRY_HARD_LINK);
+            let owner = hardlink_size_owner(entries, &dir_of_record, visibility, root_record, i, j);
+            flags[owner] |= ENTRY_OWNS_SIZE;
+        }
+        i = j;
+    }
+
+    let children = ChildIndex::build(entries, max_record, root_record);
+
+    // The visited bitmap terminates parent cycles; atomic so parallel builds share it.
+    let visited: Vec<std::sync::atomic::AtomicBool> = (0..=max_record)
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
+    visited[root_record as usize].store(true, Ordering::Relaxed);
+
+    let cancelled = &progress.cancelled;
+    let root_children: Vec<FileNode> = children
+        .of(root_record)
+        .par_iter()
+        .filter_map(|&idx| {
+            let entry = &entries[idx as usize];
+            // Mirror the Win32 root listing: skip metafiles and anything it does not show.
+            let vis = visibility.get(&entry.name.to_lowercase())?;
+            // Directories the listing shows but cannot open stay size 0, matching the walker.
+            if entry.is_directory && !vis.can_recurse {
+                progress.record_windows_mft_blocked_dir(&root.join(&*entry.name));
+                return Some(FileNode::Dir(Box::new(DirNode {
+                    name: entry.name.clone(),
+                    size: 0,
+                    children: Vec::new(),
+                    expanded: false,
+                    hidden: entry.name.starts_with('.')
+                        || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0,
+                })));
+            }
+            Some(build_tree_node(
+                entries, &children, &flags, idx, &visited, cancelled,
+            ))
+        })
+        .collect();
+
+    let size = root_children.iter().map(|c| c.size()).sum();
+    let file_count: u64 = root_children.iter().map(count_files).sum();
+    progress.file_count.store(file_count, Ordering::Relaxed);
+    progress.total_size.store(size, Ordering::Relaxed);
+
+    FileNode::Dir(Box::new(DirNode {
+        name: root.to_string_lossy().into_owned().into_boxed_str(),
+        size,
+        children: root_children,
+        expanded: false,
+        hidden: false,
+    }))
+}
+
+const TREE_PAR_THRESHOLD: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+fn build_tree_node(
+    entries: &[RawMftIndexEntry],
+    children_map: &ChildIndex,
+    flags: &[u8],
+    idx: u32,
+    visited: &[std::sync::atomic::AtomicBool],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> FileNode {
+    let entry = &entries[idx as usize];
+    let hidden = entry.name.starts_with('.') || entry.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+
+    if !entry.is_directory {
+        let flag = flags[idx as usize];
+        let hard_link = flag & ENTRY_HARD_LINK != 0;
+        // Allocated (on-disk) size, matching the directory walkers (#99).
+        let counts_size = !hard_link || flag & ENTRY_OWNS_SIZE != 0;
+        let size = if counts_size {
+            entry.subtree_allocated_size
+        } else {
+            0
+        };
+        let mut leaf = FileLeaf::new(entry.name.clone(), size, hidden);
+        leaf.set_hard_link(hard_link);
+        return FileNode::File(leaf);
+    }
+
+    let first_visit = !visited[entry.record_number as usize].swap(true, Ordering::Relaxed)
+        && !cancelled.load(Ordering::Relaxed);
+    let kids = if first_visit {
+        children_map.of(entry.record_number)
+    } else {
+        &[]
+    };
+    let build = |&k: &u32| build_tree_node(entries, children_map, flags, k, visited, cancelled);
+    let child_nodes: Vec<FileNode> = if kids.len() >= TREE_PAR_THRESHOLD {
+        kids.par_iter().map(build).collect()
+    } else {
+        kids.iter().map(build).collect()
+    };
+    let size = child_nodes.iter().map(|c| c.size()).sum();
+
+    FileNode::Dir(Box::new(DirNode {
+        name: entry.name.clone(),
+        size,
+        children: child_nodes,
+        expanded: false,
+        hidden,
+    }))
+}
+
+fn count_files(node: &FileNode) -> u64 {
+    match node {
+        FileNode::File(_) => 1,
+        FileNode::Dir(d) => d.children.iter().map(count_files).sum(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry(
+        record: u32,
+        parent: u32,
+        name: &str,
+        is_directory: bool,
+        allocated: u64,
+    ) -> RawMftIndexEntry {
+        RawMftIndexEntry {
+            record_number: record,
+            parent_record_number: parent,
+            attributes: 0,
+            name: name.into(),
+            is_directory,
+            subtree_logical_size: allocated,
+            subtree_allocated_size: allocated,
+            subtree_file_count: u32::from(!is_directory),
+            subtree_dir_count: u32::from(is_directory),
+        }
+    }
+
+    fn test_progress() -> super::super::ScanProgress {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        super::super::ScanProgress {
+            file_count: AtomicU64::new(0),
+            total_size: AtomicU64::new(0),
+            fallback_count: AtomicU64::new(0),
+            access_denied_fallback_count: AtomicU64::new(0),
+            bulk_scan_fallback_count: AtomicU64::new(0),
+            fallback_details: std::sync::Mutex::new(Vec::new()),
+            cancelled: AtomicBool::new(false),
+            seen_inodes: Default::default(),
+            mft_used: AtomicBool::new(false),
+            mft_elevation_hint: AtomicBool::new(false),
+        }
+    }
+
+    fn count_marked(node: &FileNode) -> usize {
+        usize::from(node.is_hard_link()) + node.children().iter().map(count_marked).sum::<usize>()
+    }
+
+    #[test]
+    fn tree_from_index_dedups_hardlinks_and_filters_root() {
+        let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+        let entries = vec![
+            test_entry(40, root_record, "a", true, 0),
+            test_entry(41, 40, "f1", false, 100),
+            test_entry(42, root_record, "h1", false, 50),
+            test_entry(42, 40, "h2", false, 50),
+            test_entry(43, root_record, "$secret", false, 999),
+            test_entry(44, root_record, "blocked", true, 0),
+            test_entry(45, 44, "protected.bin", false, 777),
+        ];
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries,
+        };
+        let mut visibility = HashMap::new();
+        visibility.insert("a".to_string(), RootVisibilityEntry { can_recurse: true });
+        visibility.insert("h1".to_string(), RootVisibilityEntry { can_recurse: false });
+        visibility.insert(
+            "blocked".to_string(),
+            RootVisibilityEntry { can_recurse: false },
+        );
+
+        let progress = test_progress();
+        let tree = build_tree_from_index(&index, Path::new(r"C:\"), &visibility, &progress);
+
+        assert_eq!(tree.size(), 150, "100 (f1) + 50 (hardlink once)");
+        assert_eq!(count_marked(&tree), 2, "both hardlink names marked");
+        assert_eq!(
+            progress
+                .file_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "f1 + two hardlink names; $secret filtered"
+        );
+        assert_eq!(
+            progress
+                .total_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            150
+        );
+
+        let a = tree
+            .children()
+            .iter()
+            .find(|c| c.name() == "a")
+            .expect("dir a present");
+        assert_eq!(a.children().len(), 2);
+        assert!(tree.children().iter().any(|c| c.name() == "h1"));
+        assert!(!tree.children().iter().any(|c| c.name() == "$secret"));
+
+        let blocked = tree
+            .children()
+            .iter()
+            .find(|c| c.name() == "blocked")
+            .expect("blocked dir present");
+        assert_eq!(blocked.size(), 0);
+        assert!(blocked.children().is_empty());
+
+        assert_eq!(
+            progress
+                .access_denied_fallback_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the blocked root dir counts as an access-denied fallback"
+        );
+        let details = progress.fallback_details_snapshot();
+        assert_eq!(details.len(), 1);
+        assert!(details[0].path.ends_with("blocked"));
+    }
+
+    #[test]
+    fn hardlink_size_survives_an_unreachable_first_name() {
+        let root_record = NTFS_VOLUME_ROOT_RECORD_NUMBER as u32;
+        let entries = vec![
+            test_entry(40, root_record, "a", true, 0),
+            test_entry(42, root_record, "hidden-link", false, 50),
+            test_entry(42, 40, "h2", false, 50),
+        ];
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries,
+        };
+        let mut visibility = HashMap::new();
+        visibility.insert("a".to_string(), RootVisibilityEntry { can_recurse: true });
+
+        let progress = test_progress();
+        let tree = build_tree_from_index(&index, Path::new(r"C:\"), &visibility, &progress);
+
+        assert_eq!(tree.size(), 50, "size follows the reachable name");
+        assert_eq!(count_marked(&tree), 1);
+    }
+
+    #[test]
+    fn raw_mft_index_accepts_references_past_the_read_limit() {
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            16,
+            1024,
+        );
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 10,
+            owner_record_number: 10,
+            file_names: vec![file_name(500, "deep.txt", 3)].into(),
+            is_directory: false,
+            logical_size: Some(7),
+            allocated_size: Some(8),
+            link_count: Some(1),
+            is_name_surrogate_reparse: false,
+        });
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
+        assert_eq!(index.summary.parse_errors, 0);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].parent_record_number, 500);
+    }
+
+    #[test]
+    fn tree_from_empty_index_does_not_panic() {
+        let index = RawMftIndex {
+            summary: RawMftIndexSummary::default(),
+            entries: Vec::new(),
+        };
+        let progress = test_progress();
+        let tree = build_tree_from_index(&index, Path::new(r"C:\"), &HashMap::new(), &progress);
+        assert!(tree.children().is_empty());
+        assert_eq!(tree.size(), 0);
+    }
+
+    #[test]
+    fn raw_mft_index_classifies_parse_errors_and_skips_zeroed_records() {
+        const RECORD: usize = 1024;
+        let mut buf = vec![0u8; RECORD * 3];
+        // Record 0: all zeros — allocated but never written, not an error.
+        // Record 1: garbage header, no update sequence array.
+        buf[RECORD..RECORD + 4].copy_from_slice(&[1, 2, 3, 4]);
+        // Record 2: FILE signature whose sector tails don't match the USA.
+        let r2 = &mut buf[RECORD * 2..];
+        r2[..4].copy_from_slice(b"FILE");
+        r2[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        r2[6..8].copy_from_slice(&3u16.to_le_bytes());
+        r2[0x30..0x32].copy_from_slice(&[0xAA, 0xBB]);
+
+        let mut build =
+            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 16, 16);
+        let mut next = 0u64;
+        let mut timings = RawMftBuildTimings::default();
+        process_raw_mft_index_records(&mut buf, RECORD, 512, &mut next, &mut build, &mut timings);
+
+        assert_eq!(build.summary.records_scanned, 3);
+        assert_eq!(build.summary.parse_errors, 2);
+        let kinds = &build.summary.parse_error_kinds;
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(&*kinds[0].message, "invalid NTFS USA count");
+        assert_eq!(kinds[0].first_record, 1);
+        assert_eq!(&*kinds[1].message, "NTFS update sequence mismatch");
+        assert_eq!(kinds[1].first_record, 2);
+    }
+
+    #[test]
+    fn raw_mft_index_rejects_out_of_range_references() {
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 10,
+            owner_record_number: 1 << 40,
+            file_names: vec![file_name(5, "ext.txt", 3)].into(),
+            is_directory: false,
+            logical_size: Some(1),
+            allocated_size: Some(1),
+            link_count: Some(1),
+            is_name_surrogate_reparse: false,
+        });
+        build.push_fragment(RawMftRecordFragment {
+            record_number: 11,
+            owner_record_number: 11,
+            file_names: vec![file_name(1 << 40, "bad", 3), file_name(5, "good.txt", 3)].into(),
+            is_directory: false,
+            logical_size: Some(2),
+            allocated_size: Some(2),
+            link_count: Some(2),
+            is_name_surrogate_reparse: false,
+        });
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
+        assert_eq!(index.summary.parse_errors, 2);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(&*index.entries[0].name, "good.txt");
+    }
 
     fn file_name(
         parent_record_number: u64,
@@ -3231,10 +4016,55 @@ mod tests {
         );
     }
 
+    fn record_with_data_attribute(attr_flags: u16) -> Vec<u8> {
+        const ATTR: usize = FILE_RECORD_HEADER_SIZE;
+        const ATTR_LEN: usize = 0x50;
+        let mut record = vec![0u8; 1024];
+        record[FILE_RECORD_ATTR_OFFSET..FILE_RECORD_ATTR_OFFSET + 2]
+            .copy_from_slice(&(ATTR as u16).to_le_bytes());
+        record[ATTR..ATTR + 4].copy_from_slice(&ATTR_TYPE_DATA.to_le_bytes());
+        record[ATTR + 4..ATTR + 8].copy_from_slice(&(ATTR_LEN as u32).to_le_bytes());
+        record[ATTR + 8] = 1; // non-resident
+        record[ATTR + 9] = 0; // unnamed
+        record[ATTR + 0x0C..ATTR + 0x0E].copy_from_slice(&attr_flags.to_le_bytes());
+        record[ATTR + 0x10..ATTR + 0x18].copy_from_slice(&0u64.to_le_bytes()); // lowest VCN
+        record[ATTR + 0x28..ATTR + 0x30].copy_from_slice(&1_000_000u64.to_le_bytes());
+        record[ATTR + 0x30..ATTR + 0x38].copy_from_slice(&900_000u64.to_le_bytes());
+        record[ATTR + 0x40..ATTR + 0x48].copy_from_slice(&100_000u64.to_le_bytes());
+        let end = ATTR + ATTR_LEN;
+        record[end..end + 4].copy_from_slice(&ATTR_TYPE_END.to_le_bytes());
+        record
+    }
+
+    #[test]
+    fn plain_data_attribute_uses_allocated_size() {
+        let record = record_with_data_attribute(0);
+        let scanned = scan_raw_mft_attributes(&record).unwrap();
+        assert_eq!(scanned.data_sizes, Some((900_000, 1_000_000, false)));
+    }
+
+    #[test]
+    fn sparse_and_compressed_data_use_total_allocated_size() {
+        for flags in [ATTR_FLAG_SPARSE, 0x0001, ATTR_FLAG_SPARSE | 0x0004] {
+            let record = record_with_data_attribute(flags);
+            let scanned = scan_raw_mft_attributes(&record).unwrap();
+            assert_eq!(
+                scanned.data_sizes,
+                Some((900_000, 100_000, false)),
+                "flags {flags:#06x}"
+            );
+        }
+    }
+
     #[test]
     fn raw_mft_index_merges_extension_record_sizes_into_base() {
-        let mut build =
-            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
         build.push_fragment(RawMftRecordFragment {
             record_number: 42,
             owner_record_number: 42,
@@ -3256,7 +4086,7 @@ mod tests {
             is_name_surrogate_reparse: false,
         });
 
-        let index = build.finish();
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
         assert_eq!(index.entries.len(), 1);
         let entry = &index.entries[0];
         assert_eq!(entry.record_number, 42);
@@ -3268,8 +4098,13 @@ mod tests {
 
     #[test]
     fn raw_mft_index_uses_extension_name_when_base_record_has_none() {
-        let mut build =
-            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
         build.push_fragment(RawMftRecordFragment {
             record_number: 77,
             owner_record_number: 77,
@@ -3291,7 +4126,7 @@ mod tests {
             is_name_surrogate_reparse: false,
         });
 
-        let index = build.finish();
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
         assert_eq!(index.entries.len(), 1);
         let entry = &index.entries[0];
         assert_eq!(entry.record_number, 77);
@@ -3302,8 +4137,13 @@ mod tests {
 
     #[test]
     fn raw_mft_index_materializes_multiple_primary_names() {
-        let mut build =
-            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
         build.push_fragment(RawMftRecordFragment {
             record_number: 99,
             owner_record_number: 99,
@@ -3315,7 +4155,7 @@ mod tests {
             is_name_surrogate_reparse: false,
         });
 
-        let index = build.finish();
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
         assert_eq!(index.entries.len(), 2);
         assert_eq!(index.summary.total_file_entries, 2);
         assert_eq!(index.summary.extra_primary_names, 1);
@@ -3324,8 +4164,13 @@ mod tests {
 
     #[test]
     fn raw_mft_index_skips_name_surrogate_reparse_entries() {
-        let mut build =
-            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
         build.push_fragment(RawMftRecordFragment {
             record_number: 120,
             owner_record_number: 120,
@@ -3337,14 +4182,19 @@ mod tests {
             is_name_surrogate_reparse: true,
         });
 
-        let index = build.finish();
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
         assert!(index.entries.is_empty());
     }
 
     #[test]
     fn raw_mft_index_limits_materialized_names_to_link_count() {
-        let mut build =
-            RawMftIndexBuild::new(PathBuf::from(r"C:\"), String::from(r"\\.\C:"), 1024, 1024);
+        let mut build = RawMftIndexBuild::new(
+            PathBuf::from(r"C:\"),
+            String::from(r"\\.\C:"),
+            1024,
+            1024,
+            1024,
+        );
         build.push_fragment(RawMftRecordFragment {
             record_number: 140,
             owner_record_number: 140,
@@ -3361,7 +4211,7 @@ mod tests {
             is_name_surrogate_reparse: false,
         });
 
-        let index = build.finish();
+        let index = build.finish(SubtreeRollup::Compute).unwrap();
         assert_eq!(index.entries.len(), 2);
         assert_eq!(index.summary.total_file_entries, 2);
     }

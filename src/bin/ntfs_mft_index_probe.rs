@@ -87,6 +87,12 @@ fn main() {
     println!("Records scanned      : {}", summary.records_scanned);
     println!("In-use records       : {}", summary.in_use_records);
     println!("Parse errors         : {}", summary.parse_errors);
+    for kind in &summary.parse_error_kinds {
+        println!(
+            "  {:>8}x {} (first at record {})",
+            kind.count, kind.message, kind.first_record
+        );
+    }
     println!("Indexed entries      : {}", summary.indexed_entries);
     println!("Root entries         : {}", summary.root_entries);
     println!("Directories          : {}", summary.total_dir_entries);

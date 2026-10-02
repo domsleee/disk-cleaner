@@ -83,7 +83,7 @@ function Invoke-Scan {
         $p.Dispose()
     }
 
-    $m = [regex]::Match($out, '(?m)^BENCH scan_ms=([0-9]+(?:\.[0-9]+)?) drop_ms=([0-9]+(?:\.[0-9]+)?) files=([0-9]+) bytes=([0-9]+)\r?$')
+    $m = [regex]::Match($out, '(?m)^BENCH scan_ms=([0-9]+(?:\.[0-9]+)?) drop_ms=([0-9]+(?:\.[0-9]+)?) files=([0-9]+) bytes=([0-9]+)(?: scanner=(\w+))?\r?$')
     if (-not $m.Success) {
         throw "Failed to parse BENCH line from ${Exe}: $out $err"
     }
@@ -94,8 +94,9 @@ function Invoke-Scan {
     if ($scanMs -le 0 -or [double]::IsInfinity($scanMs) -or [double]::IsInfinity($dropMs)) {
         throw "Invalid BENCH timing from ${Exe}: scan_ms=$scanMs drop_ms=$dropMs"
     }
+    $scanner = if ($m.Groups[5].Success) { $m.Groups[5].Value } else { 'unknown' }
     [pscustomobject]@{
-        ScanMs = $scanMs; DropMs = $dropMs; Files = $files; Bytes = $bytes
+        ScanMs = $scanMs; DropMs = $dropMs; Files = $files; Bytes = $bytes; Scanner = $scanner
         ProcMs = $sw.Elapsed.TotalMilliseconds
     }
 }

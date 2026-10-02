@@ -67,6 +67,8 @@ fn bench_startup() {
             fallback_details: std::sync::Mutex::new(Vec::new()),
             cancelled: AtomicBool::new(false),
             seen_inodes: Default::default(),
+            mft_used: AtomicBool::new(false),
+            mft_elevation_hint: AtomicBool::new(false),
         });
 
         let elapsed = start.elapsed();
@@ -106,6 +108,8 @@ fn bench_frame_time(scan_path: &Path) {
         fallback_details: std::sync::Mutex::new(Vec::new()),
         cancelled: AtomicBool::new(false),
         seen_inodes: Default::default(),
+        mft_used: AtomicBool::new(false),
+        mft_elevation_hint: AtomicBool::new(false),
     });
 
     let (tx, rx) = mpsc::channel();

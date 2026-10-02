@@ -13,7 +13,8 @@ Also tracks memory per node.
 
 ```sh
 cargo bench --bench scan_bench
-MEMORY_REPORT=1 cargo bench --bench scan_bench   # also print memory breakdowns
+MEMORY_REPORT=1 cargo bench --bench scan_bench     # also print synthetic memory breakdowns
+MEMORY_REPORT=real cargo bench --bench scan_bench  # ...and rescan ~/git and ~ for real ones
 ```
 
 ### Tree view (`tree_bench`)
@@ -137,8 +138,8 @@ pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
 ## Comparing branches
 
 ```sh
-cargo bench -- --save-baseline main   # on main
-cargo bench -- --baseline main        # on your branch
+cargo bench --benches -- --save-baseline main   # on main
+cargo bench --benches -- --baseline main        # on your branch
 ```
 
 ## Competitive benchmarks

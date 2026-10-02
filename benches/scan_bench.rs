@@ -5,7 +5,8 @@
 //!
 //! ```sh
 //! cargo bench --bench scan_bench
-//! MEMORY_REPORT=1 cargo bench --bench scan_bench   # also print memory breakdowns
+//! MEMORY_REPORT=1 cargo bench --bench scan_bench     # also print synthetic memory breakdowns
+//! MEMORY_REPORT=real cargo bench --bench scan_bench  # ...and rescan ~/git and ~ for real ones
 //! ```
 
 #[path = "common/alloc.rs"]
@@ -404,7 +405,7 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
 
     group.finish();
 
-    if memory_report_enabled() {
+    if std::env::var_os("MEMORY_REPORT").is_some_and(|v| v == "real") {
         eprintln!("\n=== Real Scan Memory Breakdown ===");
         for (label, path) in [
             (

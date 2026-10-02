@@ -1,7 +1,7 @@
-//! Tree view benchmarks — per-frame hot path, tree walks, selection, filtering.
+//! Tree view benchmarks — per-frame hot path, tree walks, filtering.
 //!
 //! Covers: collect_cached_rows, node_matches, tree walks (find/toggle/expand/remove),
-//! selection ops, filter caches, category matching, auto_expand, compute_stats.
+//! filter caches, category matching, auto_expand, compute_stats.
 //!
 //! ```sh
 //! cargo bench --bench tree_bench
@@ -11,7 +11,6 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use disk_cleaner::categories;
 use disk_cleaner::tree::{self, DirNode, FileLeaf, FileNode};
 use disk_cleaner::ui;
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[global_allocator]
@@ -122,42 +121,6 @@ fn count_nodes(node: &FileNode) -> usize {
     1 + node.children().iter().map(count_nodes).sum::<usize>()
 }
 
-/// Walk tree and count how many node paths are in `selected`.
-fn count_selected(node: &FileNode, prefix: &mut PathBuf, selected: &HashSet<PathBuf>) -> usize {
-    prefix.push(node.name());
-    let mut total = if selected.contains(prefix.as_path()) {
-        1
-    } else {
-        0
-    };
-    for child in node.children() {
-        total += count_selected(child, prefix, selected);
-    }
-    prefix.pop();
-    total
-}
-
-/// Collect all paths in the tree (for building a selection set).
-fn collect_paths(node: &FileNode, prefix: &mut PathBuf, out: &mut Vec<PathBuf>) {
-    prefix.push(node.name());
-    out.push(prefix.clone());
-    for child in node.children() {
-        collect_paths(child, prefix, out);
-    }
-    prefix.pop();
-}
-
-fn build_unsorted_children(n: usize) -> Vec<FileNode> {
-    (0..n)
-        .map(|i| {
-            make_leaf(
-                &format!("f_{i}.dat"),
-                ((n - i) as u64) * 1024 + (i as u64 % 7),
-            )
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // node_matches — recursive text search
 // ---------------------------------------------------------------------------
@@ -186,80 +149,6 @@ fn bench_node_matches(c: &mut Criterion) {
             tree,
             |b, t| b.iter(|| ui::node_matches(t, "nonexistent_zzz")),
         );
-    }
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// count_selected — selection counting during tree walk
-// ---------------------------------------------------------------------------
-
-fn bench_count_selected(c: &mut Criterion) {
-    let mut group = c.benchmark_group("count_selected");
-    group.sample_size(20);
-
-    let cases: Vec<(&str, FileNode)> = vec![
-        ("wide_10k", build_wide_tree(500, 20)),
-        ("wide_100k", build_wide_tree(5_000, 20)),
-        ("wide_1m", build_wide_tree(50_000, 20)),
-        ("deep_10k", build_deep_tree(1_000, 10)),
-    ];
-
-    for (label, tree) in &cases {
-        let n = count_nodes(tree);
-
-        let mut all_paths = Vec::new();
-        collect_paths(tree, &mut PathBuf::new(), &mut all_paths);
-        let selected: HashSet<PathBuf> = all_paths.iter().step_by(10).cloned().collect();
-
-        let sel_count = selected.len();
-        group.bench_with_input(
-            BenchmarkId::new("10pct", format!("{label}_{n}_sel{sel_count}")),
-            &(tree, selected),
-            |b, (t, sel)| {
-                b.iter(|| {
-                    let mut prefix = PathBuf::new();
-                    count_selected(t, &mut prefix, sel)
-                })
-            },
-        );
-
-        let empty: HashSet<PathBuf> = HashSet::new();
-        group.bench_with_input(
-            BenchmarkId::new("empty", format!("{label}_{n}")),
-            &(tree, empty),
-            |b, (t, sel)| {
-                b.iter(|| {
-                    let mut prefix = PathBuf::new();
-                    count_selected(t, &mut prefix, sel)
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// sort_by_size — child sorting
-// ---------------------------------------------------------------------------
-
-fn bench_sort_by_size(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sort_by_size");
-    group.sample_size(30);
-
-    for &n in &[1_000usize, 10_000, 100_000] {
-        group.bench_function(BenchmarkId::new("children", n), |b| {
-            b.iter_batched(
-                || build_unsorted_children(n),
-                |mut v| {
-                    v.sort_by_key(|a| std::cmp::Reverse(a.size()));
-                    v
-                },
-                criterion::BatchSize::LargeInput,
-            )
-        });
     }
 
     group.finish();
@@ -390,58 +279,6 @@ fn bench_tree_walks(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// selection_ops — shift-click range, contains, clear
-// ---------------------------------------------------------------------------
-
-fn bench_selection_ops(c: &mut Criterion) {
-    let mut group = c.benchmark_group("selection_ops");
-    group.sample_size(20);
-
-    for &(n_dirs, files_per_dir) in &[(500, 20), (5_000, 20)] {
-        let tree = build_wide_tree(n_dirs, files_per_dir);
-        let n = count_nodes(&tree);
-
-        let mut all_paths = Vec::new();
-        collect_paths(&tree, &mut PathBuf::new(), &mut all_paths);
-
-        let range_size = all_paths.len().min(1000);
-        group.bench_function(
-            BenchmarkId::new("build_range_selection", format!("{n}_range{range_size}")),
-            |b| {
-                b.iter(|| {
-                    let sel: HashSet<PathBuf> = all_paths[..range_size].iter().cloned().collect();
-                    sel
-                })
-            },
-        );
-
-        let large_sel: HashSet<PathBuf> = all_paths.iter().step_by(10).cloned().collect();
-        let sel_size = large_sel.len();
-        let lookup_target = all_paths[all_paths.len() / 2].clone();
-        group.bench_function(
-            BenchmarkId::new("selection_contains", format!("{n}_sel{sel_size}")),
-            |b| b.iter(|| large_sel.contains(&lookup_target)),
-        );
-
-        group.bench_function(
-            BenchmarkId::new("selection_clear", format!("{n}_sel{sel_size}")),
-            |b| {
-                b.iter_batched(
-                    || large_sel.clone(),
-                    |mut sel| {
-                        sel.clear();
-                        sel
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
-    }
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // collect_cached_rows — frame hot path proxy
 // ---------------------------------------------------------------------------
 
@@ -450,7 +287,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
     group.sample_size(20);
 
     // All expanded — worst case for tree view rendering
-    for &(n_dirs, files_per_dir) in &[(100, 10), (500, 20), (2000, 20)] {
+    for &(n_dirs, files_per_dir) in &[(100, 10), (500, 20), (2000, 20), (5000, 20)] {
         let tree = build_expanded_tree(n_dirs, files_per_dir);
         let n = count_nodes(&tree);
 
@@ -460,7 +297,7 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
     }
 
     // Root only expanded (default after scan) — best case
-    for &(n_dirs, files_per_dir) in &[(500, 20), (2000, 20)] {
+    for &(n_dirs, files_per_dir) in &[(500, 20), (2000, 20), (5000, 20)] {
         let mut tree = build_categorized_tree(n_dirs, files_per_dir);
         tree.set_expanded(true);
         let n = count_nodes(&tree);
@@ -741,48 +578,6 @@ fn bench_full_filter_pipeline(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// collect_cached_rows at larger scale (100K+ nodes)
-// ---------------------------------------------------------------------------
-
-fn bench_collect_rows_large(c: &mut Criterion) {
-    let mut group = c.benchmark_group("collect_cached_rows_large");
-    group.sample_size(10);
-
-    {
-        let tree = build_expanded_tree(5000, 20);
-        let n = count_nodes(&tree);
-
-        group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
-        });
-    }
-
-    {
-        let mut tree = build_categorized_tree(5000, 20);
-        tree.set_expanded(true);
-        let n = count_nodes(&tree);
-
-        group.bench_with_input(BenchmarkId::new("root_only", n), &tree, |b, t| {
-            b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
-        });
-    }
-
-    {
-        let tree = build_expanded_tree(5000, 20);
-        let n = count_nodes(&tree);
-        let text_cache = ui::build_text_match_cache(&tree, "file_5");
-
-        group.bench_with_input(BenchmarkId::new("filter_cached", n), &tree, |b, t| {
-            b.iter(|| {
-                ui::collect_cached_rows(t, "file_5", None, true, Some(&text_cache), None, None)
-            })
-        });
-    }
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // Criterion groups
 // ---------------------------------------------------------------------------
 
@@ -790,16 +585,10 @@ criterion_group!(
     benches,
     // Node matching / search
     bench_node_matches,
-    bench_count_selected,
-    // Sorting
-    bench_sort_by_size,
     // Tree walks
     bench_tree_walks,
-    // Selection
-    bench_selection_ops,
     // Frame hot path
     bench_collect_visible_paths,
-    bench_collect_rows_large,
     // Filtering
     bench_build_filter_caches,
     bench_full_filter_pipeline,

@@ -141,7 +141,7 @@ fn bench_tree_navigation(c: &mut Criterion) {
     let n = count_nodes(&tree);
 
     group.bench_with_input(BenchmarkId::new("find_node", n), &tree, |b, t| {
-        b.iter(|| treemap::find_node(t, &zoom))
+        b.iter(|| t.find(&zoom))
     });
 
     group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
@@ -197,19 +197,19 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
         // Shallow zoom (top-level dir)
         let shallow = std::path::PathBuf::from("/Applications/App_000.app");
         group.bench_with_input(BenchmarkId::new("find_node_shallow", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &shallow))
+            b.iter(|| t.find(&shallow))
         });
 
         // Deep zoom (near end — worst case traversal)
         let deep = std::path::PathBuf::from(format!("/Applications/App_{:03}.app", n_apps - 1));
         group.bench_with_input(BenchmarkId::new("find_node_deep", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &deep))
+            b.iter(|| t.find(&deep))
         });
 
         // Miss (nonexistent path)
         let miss = std::path::PathBuf::from("/Applications/NotAnApp.app");
         group.bench_with_input(BenchmarkId::new("find_node_miss", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &miss))
+            b.iter(|| t.find(&miss))
         });
 
         // Breadcrumbs at scale

@@ -8,51 +8,9 @@ use std::path::{Path, PathBuf};
 /// Returns a fill color based on file extension category.
 pub fn extension_color(name: &str, is_dir: bool) -> egui::Color32 {
     if is_dir {
-        return egui::Color32::from_rgb(70, 75, 85);
-    }
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext.to_ascii_lowercase().as_str() {
-        // Video — red
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" => {
-            egui::Color32::from_rgb(192, 57, 43)
-        }
-        // Image — green
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "svg" | "webp" | "tiff" | "ico" | "heic" => {
-            egui::Color32::from_rgb(39, 174, 96)
-        }
-        // Audio — purple
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus" => {
-            egui::Color32::from_rgb(142, 68, 173)
-        }
-        // Documents — blue
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "rtf" | "csv"
-        | "pages" | "numbers" | "key" => egui::Color32::from_rgb(41, 128, 185),
-        // Archives — orange
-        "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" | "xz" | "tgz" | "zst" | "dmg" | "iso" => {
-            egui::Color32::from_rgb(211, 84, 0)
-        }
-        // Source code — teal
-        "rs" | "js" | "ts" | "py" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "rb" | "swift"
-        | "kt" | "cs" | "jsx" | "tsx" | "vue" | "svelte" => egui::Color32::from_rgb(22, 160, 133),
-        // Config/data — dark blue-gray
-        "json" | "yaml" | "yml" | "toml" | "xml" | "ini" | "cfg" | "conf" | "lock" => {
-            egui::Color32::from_rgb(44, 62, 80)
-        }
-        // Web/markup — light teal
-        "html" | "htm" | "css" | "scss" | "sass" | "less" | "md" | "mdx" => {
-            egui::Color32::from_rgb(26, 188, 156)
-        }
-        // Build artifacts — dark red
-        "o" | "obj" | "a" | "lib" | "rlib" | "d" | "rmeta" | "wasm" | "class" => {
-            egui::Color32::from_rgb(146, 43, 33)
-        }
-        // Executables — bright orange
-        "exe" | "dll" | "so" | "dylib" | "app" | "bin" | "msi" | "deb" | "rpm" => {
-            egui::Color32::from_rgb(230, 126, 34)
-        }
-        // Temp/logs — gray
-        "log" | "tmp" | "cache" | "bak" | "swp" | "swo" => egui::Color32::from_rgb(127, 140, 141),
-        _ => egui::Color32::from_rgb(93, 109, 126),
+        egui::Color32::from_rgb(70, 75, 85)
+    } else {
+        crate::categories::categorize(name).color()
     }
 }
 
@@ -64,10 +22,8 @@ fn darken(c: egui::Color32, amount: u8) -> egui::Color32 {
     )
 }
 
-/// A faded white tile border. `from_white_alpha` is already premultiplied, so
-/// it must not be passed through `apply_alpha` (that would premultiply again
-/// and darken it, then snap back at alpha=1). Fades with alpha² so the border
-/// trails the fill during the zoom transition instead of popping ahead of it.
+/// A faded white tile border. Fades with alpha² so the border trails the fill
+/// during the zoom transition instead of popping ahead of it.
 fn border_color(base: u8, alpha: f32) -> egui::Color32 {
     egui::Color32::from_white_alpha((base as f32 * alpha * alpha) as u8)
 }
@@ -206,35 +162,6 @@ fn squarify_impl(
 
 // ─── Tree navigation helpers ────────────────────────────────────
 
-/// Find a node by path in the file tree.
-pub fn find_node<'a>(node: &'a FileNode, target: &Path) -> Option<&'a FileNode> {
-    let mut buf = PathBuf::from(node.name());
-    find_node_inner(node, target, &mut buf)
-}
-
-fn find_node_inner<'a>(
-    node: &'a FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-) -> Option<&'a FileNode> {
-    if buf.as_path() == target {
-        return Some(node);
-    }
-    for child in node.children() {
-        buf.push(child.name());
-        // Only the subtree whose path prefixes `target` can contain it — prune
-        // the rest so this is O(depth × siblings) instead of a full-tree walk.
-        if target.starts_with(&*buf)
-            && let Some(found) = find_node_inner(child, target, buf)
-        {
-            buf.pop();
-            return Some(found);
-        }
-        buf.pop();
-    }
-    None
-}
-
 /// Build breadcrumb trail from root to `target`.
 pub fn breadcrumbs(root: &FileNode, target: &Path) -> Vec<(String, PathBuf)> {
     let root_path = PathBuf::from(root.name());
@@ -287,7 +214,6 @@ pub struct TreemapCache {
     pub tiles: Vec<TreemapTile>,
     pub other: Option<OtherBucket>,
     pub breadcrumbs: Vec<(String, PathBuf)>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub view_size: u64,
     /// Pre-formatted view size string for breadcrumb display.
     pub view_size_label: Box<str>,
@@ -303,8 +229,6 @@ pub struct TreemapTile {
     pub color: egui::Color32,
     pub child_count: Option<usize>,
     pub nested: Vec<NestedTile>,
-    /// Pre-formatted short label (name only).
-    pub label_short: Box<str>,
     /// Pre-formatted tall label (name + size).
     pub label_tall: Box<str>,
     /// Pre-computed text color for this tile's background.
@@ -319,15 +243,11 @@ pub struct NestedTile {
     pub rect: egui::Rect,
     pub path: PathBuf,
     pub name: Box<str>,
-    #[allow(dead_code)]
-    pub is_dir: bool,
     pub color: egui::Color32,
 }
 
 pub struct OtherBucket {
     pub rect: egui::Rect,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub count: usize,
     pub size: u64,
     /// Pre-formatted short label.
     pub label_short: Box<str>,
@@ -349,35 +269,24 @@ pub fn build_treemap_cache(
     let root_path = PathBuf::from(root.name());
 
     // Resolve the node we're viewing and its full path
-    let (view_node, view_path) = if let Some(zp) = zoom_path {
-        match find_node(root, zp) {
-            Some(n) => (n, zp.clone()),
-            None => (root, root_path.clone()),
-        }
-    } else {
-        (root, root_path.clone())
-    };
+    let (view_node, view_path) = zoom_path
+        .as_ref()
+        .and_then(|zp| Some((root.find(zp)?, zp.clone())))
+        .unwrap_or((root, root_path.clone()));
 
     let view_size = view_node.size();
-    let view_size_label: Box<str> = format!("  ({})", ByteSize::b(view_size)).into();
-
-    // Cache breadcrumbs (avoids O(N) tree walk every frame)
-    let cached_breadcrumbs = zoom_path
-        .as_ref()
-        .map(|p| breadcrumbs(root, p))
-        .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
-
-    // Empty directory — return empty cache
-    if view_node.children().is_empty() {
-        return TreemapCache {
-            tiles: vec![],
-            other: None,
-            breadcrumbs: cached_breadcrumbs,
-            view_size,
-            view_size_label: view_size_label.clone(),
-            layout_size: (full_rect.width(), full_rect.height()),
-        };
-    }
+    let mut cache = TreemapCache {
+        tiles: vec![],
+        other: None,
+        // Cache breadcrumbs (avoids O(N) tree walk every frame)
+        breadcrumbs: zoom_path
+            .as_ref()
+            .map(|p| breadcrumbs(root, p))
+            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]),
+        view_size,
+        view_size_label: format!("  ({})", ByteSize::b(view_size)).into(),
+        layout_size: (full_rect.width(), full_rect.height()),
+    };
 
     // Filter children by size, hidden status, and optional category
     let all_children: Vec<&FileNode> = view_node
@@ -391,14 +300,7 @@ pub fn build_treemap_cache(
         .collect();
 
     if all_children.is_empty() {
-        return TreemapCache {
-            tiles: vec![],
-            other: None,
-            breadcrumbs: cached_breadcrumbs,
-            view_size,
-            view_size_label: view_size_label.clone(),
-            layout_size: (full_rect.width(), full_rect.height()),
-        };
+        return cache;
     }
 
     // Collapse tiny files into an "Other" bucket to reduce visual noise.
@@ -428,18 +330,6 @@ pub fn build_treemap_cache(
     }
 
     let has_other = other_count > 0 && other_size > 0;
-    let entry_count = children.len() + if has_other { 1 } else { 0 };
-
-    if entry_count == 0 {
-        return TreemapCache {
-            tiles: vec![],
-            other: None,
-            breadcrumbs: cached_breadcrumbs,
-            view_size,
-            view_size_label: view_size_label.clone(),
-            layout_size: (full_rect.width(), full_rect.height()),
-        };
-    }
 
     // Compute squarified layout
     let mut sizes: Vec<f64> = children.iter().map(|c| c.size() as f64).collect();
@@ -455,7 +345,7 @@ pub fn build_treemap_cache(
     );
 
     // Build tiles for real children, tracking global nested budget
-    let mut tiles: Vec<TreemapTile> = Vec::with_capacity(children.len());
+    cache.tiles.reserve(children.len());
     let mut nested_budget = MAX_TOTAL_NESTED;
     for (i, child) in children.iter().enumerate() {
         let r = rects[i].shrink(GAP);
@@ -488,7 +378,6 @@ pub fn build_treemap_cache(
         let size = child.size();
         let size_str = ByteSize::b(size).to_string();
         let header_color = darken(color, 15);
-        let label_short: Box<str> = name.clone();
         let label_tall: Box<str> = if is_dir {
             // For dirs: "name (size)" used in header
             format!("{} ({})", name, size_str).into()
@@ -497,10 +386,9 @@ pub fn build_treemap_cache(
             format!("{}\n{}", name, size_str).into()
         };
 
-        tiles.push(TreemapTile {
+        cache.tiles.push(TreemapTile {
             rect: r,
             path: child_path,
-            label_short,
             label_tall,
             text_color: text_color_for_bg(color),
             header_color,
@@ -514,30 +402,16 @@ pub fn build_treemap_cache(
         });
     }
 
-    // Build Other bucket if needed
-    let other = if has_other {
-        let other_idx = children.len();
-        let r = rects[other_idx].shrink(GAP);
-        Some(OtherBucket {
-            rect: r,
-            count: other_count,
+    if has_other {
+        cache.other = Some(OtherBucket {
+            rect: rects[children.len()].shrink(GAP),
             size: other_size,
             label_short: format!("Other ({})", other_count).into(),
             label_tall: format!("Other ({} files)\n{}", other_count, ByteSize::b(other_size))
                 .into(),
-        })
-    } else {
-        None
-    };
-
-    TreemapCache {
-        tiles,
-        other,
-        breadcrumbs: cached_breadcrumbs,
-        view_size,
-        view_size_label,
-        layout_size: (full_rect.width(), full_rect.height()),
+        });
     }
+    cache
 }
 
 /// Build nested sub-tiles for the children of a directory tile.
@@ -583,15 +457,11 @@ fn build_nested_tiles(
         if cr.width() <= 0.0 || cr.height() <= 0.0 || cr.area() < MIN_PAINT_AREA {
             continue;
         }
-        let child_path = node_path.join(child.name());
-        let is_dir = child.is_dir();
-        let color = extension_color(child.name(), is_dir);
         result.push(NestedTile {
             rect: cr,
-            path: child_path,
+            path: node_path.join(child.name()),
             name: child.name().into(),
-            is_dir,
-            color,
+            color: extension_color(child.name(), child.is_dir()),
         });
     }
     result
@@ -634,35 +504,14 @@ pub fn render_treemap(
     show_hidden: bool,
 ) -> Vec<TreemapAction> {
     let mut actions = Vec::new();
-    let root_path = PathBuf::from(root.name());
+    let build =
+        |rect: egui::Rect| build_treemap_cache(root, zoom_path, category_filter, show_hidden, rect);
 
     // ── Breadcrumb bar ──
-    // Use cached breadcrumbs when available to avoid O(N) tree walk every frame.
-    // On first frame (cache not yet built), compute inline.
-    let have_cached_crumbs = cache.is_some();
-    let inline_crumbs;
-    let crumbs: &[(String, PathBuf)] = if have_cached_crumbs {
-        &cache.as_ref().unwrap().breadcrumbs
-    } else {
-        inline_crumbs = zoom_path
-            .as_ref()
-            .map(|p| breadcrumbs(root, p))
-            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
-        &inline_crumbs
-    };
-    let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
-    let inline_size_label;
-    let size_label = if let Some(l) = view_size_label {
-        l
-    } else {
-        let view_size = if let Some(zp) = zoom_path {
-            find_node(root, zp).map_or(root.size(), |n| n.size())
-        } else {
-            root.size()
-        };
-        inline_size_label = format!("  ({})", ByteSize::b(view_size));
-        &inline_size_label
-    };
+    // The first frame builds at the full size; the size check below redoes it.
+    let cached = cache.get_or_insert_with(|| build(ui.available_rect_before_wrap()));
+    let crumbs = &cached.breadcrumbs;
+    let size_label = &*cached.view_size_label;
 
     ui.horizontal(|ui| {
         if crumbs.len() > 1 {
@@ -710,19 +559,12 @@ pub fn render_treemap(
 
     // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
     let needs_rebuild = *cache_dirty
-        || cache.is_none()
         || cache.as_ref().is_some_and(|c| {
             (c.layout_size.0 - full_rect.width()).abs() > 1.0
                 || (c.layout_size.1 - full_rect.height()).abs() > 1.0
         });
     if needs_rebuild {
-        *cache = Some(build_treemap_cache(
-            root,
-            zoom_path,
-            category_filter,
-            show_hidden,
-            full_rect,
-        ));
+        *cache = Some(build(full_rect));
         *cache_dirty = false;
     }
     let cache = cache.as_ref().unwrap();
@@ -749,18 +591,17 @@ pub fn render_treemap(
     let font_leaf = egui::FontId::proportional(11.0);
     let font_dir_header = egui::FontId::proportional(13.0);
     let font_nested = egui::FontId::proportional(10.0);
-    let has_focus = focused_path.is_some();
 
     // Paint tiles
     for (idx, tile) in cache.tiles.iter().enumerate() {
-        let is_focused = has_focus && focused_path.as_ref().is_some_and(|fp| *fp == tile.path);
+        let is_focused = focused_path.as_ref() == Some(&tile.path);
 
         if tile.is_dir {
             paint_cached_directory(
                 &painter,
                 tile,
                 is_focused,
-                if has_focus { focused_path } else { &None },
+                focused_path,
                 alpha,
                 &font_dir_header,
                 &font_nested,
@@ -789,20 +630,36 @@ pub fn render_treemap(
     // Hover tooltip. Structured: bold name, one metrics line (size · share of
     // the current view · item count), then a dim path — rather than four
     // equal-weight lines.
-    if let Some(idx) = hovered_tile {
+    let tip = if let Some(idx) = hovered_tile {
         let tile = &cache.tiles[idx];
+        Some((
+            &*tile.name,
+            tile.size,
+            tile.child_count,
+            tile.path.display().to_string(),
+        ))
+    } else if hovered_other && let Some(ref other) = cache.other {
+        Some((
+            &*other.label_short,
+            other.size,
+            None,
+            "Small files collapsed into one block".to_string(),
+        ))
+    } else {
+        None
+    };
+    if let Some((title, size, items, footer)) = tip {
         let pct = if cache.view_size > 0 {
-            tile.size as f64 / cache.view_size as f64 * 100.0
+            size as f64 / cache.view_size as f64 * 100.0
         } else {
             0.0
         };
-        let pct_str = if pct > 0.0 && pct < 1.0 {
-            "<1%".to_string()
-        } else {
-            format!("{pct:.0}%")
-        };
-        let mut meta = format!("{} · {} of view", ByteSize::b(tile.size), pct_str);
-        if let Some(count) = tile.child_count {
+        let mut meta = format!(
+            "{} · {} of view",
+            ByteSize::b(size),
+            crate::ui::fmt_pct(pct)
+        );
+        if let Some(count) = items {
             meta.push_str(&format!(" · {count} items"));
         }
         egui::Tooltip::always_open(
@@ -814,41 +671,9 @@ pub fn render_treemap(
         .gap(12.0)
         .show(|ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(egui::RichText::new(tile.name.as_ref()).strong());
-            ui.label(meta.as_str());
-            ui.label(
-                egui::RichText::new(tile.path.display().to_string())
-                    .weak()
-                    .small(),
-            );
-        });
-    } else if hovered_other && let Some(ref other) = cache.other {
-        egui::Tooltip::always_open(
-            ui.ctx().clone(),
-            ui.layer_id(),
-            ui.id().with("treemap_tip"),
-            egui::PopupAnchor::Pointer,
-        )
-        .gap(12.0)
-        .show(|ui| {
-            let pct = if cache.view_size > 0 {
-                other.size as f64 / cache.view_size as f64 * 100.0
-            } else {
-                0.0
-            };
-            let pct_str = if pct > 0.0 && pct < 1.0 {
-                "<1%".to_string()
-            } else {
-                format!("{pct:.0}%")
-            };
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(egui::RichText::new(other.label_short.as_ref()).strong());
-            ui.label(format!("{} · {} of view", ByteSize::b(other.size), pct_str));
-            ui.label(
-                egui::RichText::new("Small files collapsed into one block")
-                    .weak()
-                    .small(),
-            );
+            ui.label(egui::RichText::new(title).strong());
+            ui.label(meta);
+            ui.label(egui::RichText::new(footer).weak().small());
         });
     }
 
@@ -868,13 +693,6 @@ pub fn render_treemap(
 
 // ─── Painting helpers ───────────────────────────────────────────
 
-fn apply_alpha(c: egui::Color32, alpha: f32) -> egui::Color32 {
-    if alpha >= 1.0 {
-        return c;
-    }
-    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * alpha) as u8)
-}
-
 fn paint_cached_leaf(
     painter: &egui::Painter,
     tile: &TreemapTile,
@@ -882,7 +700,7 @@ fn paint_cached_leaf(
     alpha: f32,
     font: &egui::FontId,
 ) {
-    let color = apply_alpha(tile.color, alpha);
+    let color = tile.color.gamma_multiply(alpha);
     painter.rect_filled(tile.rect, 2.0, color);
     // Subtle border so adjacent same-colored tiles stay visually distinct.
     painter.rect_stroke(
@@ -906,11 +724,11 @@ fn paint_cached_leaf(
     // Label if large enough — clip to tile rect, use pre-computed strings
     if tile.rect.width() > MIN_LABEL_W && tile.rect.height() > 14.0 {
         let clipped = painter.with_clip_rect(tile.rect);
-        let tc = apply_alpha(tile.text_color, alpha);
+        let tc = tile.text_color.gamma_multiply(alpha);
         let text: &str = if tile.rect.height() > 30.0 {
             &tile.label_tall
         } else {
-            &tile.label_short
+            &tile.name
         };
         clipped.text(
             tile.rect.center(),
@@ -929,7 +747,7 @@ fn paint_other_bucket(
     font: &egui::FontId,
 ) {
     let rect = other.rect;
-    let bg = apply_alpha(egui::Color32::from_rgb(80, 80, 80), alpha);
+    let bg = egui::Color32::from_rgb(80, 80, 80).gamma_multiply(alpha);
     painter.rect_filled(rect, 2.0, bg);
 
     // Dashed-style border to distinguish from real blocks
@@ -938,14 +756,14 @@ fn paint_other_bucket(
         2.0,
         egui::Stroke::new(
             1.0_f32,
-            apply_alpha(egui::Color32::from_rgb(120, 120, 120), alpha),
+            egui::Color32::from_rgb(120, 120, 120).gamma_multiply(alpha),
         ),
         egui::StrokeKind::Inside,
     );
 
     if rect.width() > MIN_LABEL_W && rect.height() > 14.0 {
         let clipped = painter.with_clip_rect(rect);
-        let tc = apply_alpha(egui::Color32::from_rgb(200, 200, 200), alpha);
+        let tc = egui::Color32::from_rgb(200, 200, 200).gamma_multiply(alpha);
         let text: &str = if rect.height() > 30.0 {
             &other.label_tall
         } else {
@@ -971,8 +789,8 @@ fn paint_cached_directory(
     font_nested: &egui::FontId,
 ) {
     let rect = tile.rect;
-    let bg = apply_alpha(tile.color, alpha);
-    let header_bg = apply_alpha(tile.header_color, alpha);
+    let bg = tile.color.gamma_multiply(alpha);
+    let header_bg = tile.header_color.gamma_multiply(alpha);
 
     // Background
     painter.rect_filled(rect, 2.0, bg);
@@ -984,7 +802,7 @@ fn paint_cached_directory(
     // Header text — clip to header rect, use pre-computed label
     if rect.width() > MIN_LABEL_W {
         let clipped = painter.with_clip_rect(header_rect);
-        let tc = apply_alpha(tile.header_text_color, alpha);
+        let tc = tile.header_text_color.gamma_multiply(alpha);
         clipped.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -997,10 +815,9 @@ fn paint_cached_directory(
     // Nested children (pre-computed in cache) — single clip group for entire tile
     if !tile.nested.is_empty() {
         let tile_painter = painter.with_clip_rect(rect);
-        let has_focus = focused_path.is_some();
         for nested in &tile.nested {
             let cr = nested.rect;
-            let color = apply_alpha(nested.color, alpha);
+            let color = nested.color.gamma_multiply(alpha);
             tile_painter.rect_filled(cr, 1.0, color);
             tile_painter.rect_stroke(
                 cr,
@@ -1009,21 +826,18 @@ fn paint_cached_directory(
                 egui::StrokeKind::Inside,
             );
 
-            if has_focus {
-                let child_focused = focused_path.as_ref().is_some_and(|fp| *fp == nested.path);
-                if child_focused {
-                    tile_painter.rect_stroke(
-                        cr,
-                        1.0,
-                        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+            if focused_path.as_ref() == Some(&nested.path) {
+                tile_painter.rect_stroke(
+                    cr,
+                    1.0,
+                    egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
             }
 
             // Label only for tiles large enough to be readable.
             if cr.width() > 60.0 && cr.height() > 16.0 {
-                let tc = apply_alpha(text_color_for_bg(nested.color), alpha);
+                let tc = text_color_for_bg(nested.color).gamma_multiply(alpha);
                 tile_painter.text(
                     cr.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1129,30 +943,6 @@ mod tests {
     }
 
     #[test]
-    fn find_node_root() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
-        assert!(find_node(&tree, Path::new("root")).is_some());
-    }
-
-    #[test]
-    fn find_node_child() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
-        assert!(find_node(&tree, Path::new("root/a.txt")).is_some());
-    }
-
-    #[test]
-    fn find_node_missing() {
-        let tree = dir("root", vec![leaf("a.txt", 10)]);
-        assert!(find_node(&tree, Path::new("missing")).is_none());
-    }
-
-    #[test]
-    fn find_node_nested() {
-        let tree = dir("root", vec![dir("sub", vec![leaf("deep.txt", 5)])]);
-        assert!(find_node(&tree, Path::new("root/sub/deep.txt")).is_some());
-    }
-
-    #[test]
     fn breadcrumbs_root() {
         let tree = dir("root", vec![]);
         let bc = breadcrumbs(&tree, Path::new("root"));
@@ -1185,12 +975,6 @@ mod tests {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
         let bc = breadcrumbs(&tree, Path::new("missing"));
         assert_eq!(bc.len(), 1);
-    }
-
-    #[test]
-    fn extension_color_video() {
-        let c = extension_color("movie.mp4", false);
-        assert_eq!(c, egui::Color32::from_rgb(192, 57, 43));
     }
 
     #[test]
@@ -1376,7 +1160,7 @@ mod tests {
         assert!(a0 / total_area > 0.99);
     }
 
-    // ── darken / apply_alpha tests ──
+    // ── darken tests ──
 
     #[test]
     fn darken_reduces_rgb() {
@@ -1392,98 +1176,7 @@ mod tests {
         assert_eq!(d, egui::Color32::from_rgb(0, 0, 0));
     }
 
-    #[test]
-    fn apply_alpha_full() {
-        let c = egui::Color32::from_rgb(100, 150, 200);
-        let result = apply_alpha(c, 1.0);
-        assert_eq!(result, c);
-    }
-
-    #[test]
-    fn apply_alpha_half() {
-        let c = egui::Color32::from_rgb(100, 150, 200);
-        let result = apply_alpha(c, 0.5);
-        // Alpha should be halved (255 * 0.5 ≈ 127)
-        assert!((result.a() as f32 - 127.0).abs() < 2.0);
-        // RGB premultiplied, so values are halved too
-        assert!((result.r() as f32 - 50.0).abs() < 2.0);
-    }
-
-    // ── extension_color category coverage ──
-
-    #[test]
-    fn extension_color_categories() {
-        // Audio
-        assert_eq!(
-            extension_color("song.mp3", false),
-            egui::Color32::from_rgb(142, 68, 173)
-        );
-        // Image
-        assert_eq!(
-            extension_color("photo.png", false),
-            egui::Color32::from_rgb(39, 174, 96)
-        );
-        // Archive
-        assert_eq!(
-            extension_color("backup.zip", false),
-            egui::Color32::from_rgb(211, 84, 0)
-        );
-        // Source code
-        assert_eq!(
-            extension_color("main.rs", false),
-            egui::Color32::from_rgb(22, 160, 133)
-        );
-        // Document
-        assert_eq!(
-            extension_color("report.pdf", false),
-            egui::Color32::from_rgb(41, 128, 185)
-        );
-        // Config
-        assert_eq!(
-            extension_color("config.json", false),
-            egui::Color32::from_rgb(44, 62, 80)
-        );
-        // Build artifact
-        assert_eq!(
-            extension_color("module.o", false),
-            egui::Color32::from_rgb(146, 43, 33)
-        );
-        // Unknown → default gray
-        assert_eq!(
-            extension_color("random.xyz", false),
-            egui::Color32::from_rgb(93, 109, 126)
-        );
-    }
-
-    // ── find_node / breadcrumbs with deeper trees ──
-
-    #[test]
-    fn find_node_deeply_nested() {
-        let tree = dir(
-            "root",
-            vec![dir(
-                "a",
-                vec![dir("b", vec![dir("c", vec![leaf("deep.txt", 1)])])],
-            )],
-        );
-        assert!(find_node(&tree, Path::new("root/a/b/c/deep.txt")).is_some());
-        assert!(find_node(&tree, Path::new("root/a/b/c")).is_some());
-        assert!(find_node(&tree, Path::new("root/a/b/c/nope")).is_none());
-    }
-
-    #[test]
-    fn find_node_among_siblings() {
-        let tree = dir(
-            "root",
-            vec![
-                leaf("a.txt", 10),
-                leaf("b.txt", 20),
-                dir("sub", vec![leaf("c.txt", 5)]),
-            ],
-        );
-        assert!(find_node(&tree, Path::new("root/b.txt")).is_some());
-        assert!(find_node(&tree, Path::new("root/sub/c.txt")).is_some());
-    }
+    // ── breadcrumbs with deeper trees ──
 
     #[test]
     fn breadcrumbs_deep_path() {
@@ -1557,7 +1250,7 @@ mod tests {
         assert_eq!(cache.tiles.len(), 1);
         assert!(cache.other.is_some());
         let other = cache.other.as_ref().unwrap();
-        assert_eq!(other.count, 20);
+        assert_eq!(&*other.label_short, "Other (20)");
         assert_eq!(other.size, 20);
     }
 

@@ -12,39 +12,19 @@ use std::thread;
 /// Result of background deletion: list of (path, optional error message).
 pub type DeleteResults = Vec<(PathBuf, Option<String>)>;
 
-/// Outcome from [`BackgroundDeleter::poll`].
-pub enum PollResult {
-    /// Deletion still running (or nothing was started).
-    Pending,
-    /// Deletion finished — contains per-path results.
-    Done(DeleteResults),
-}
-
 /// Manages background deletion jobs with a queue for concurrent requests.
+#[derive(Default)]
 pub struct BackgroundDeleter {
-    active: bool,
     progress: Arc<AtomicUsize>,
     total: usize,
     receiver: Option<mpsc::Receiver<DeleteResults>>,
     pending: VecDeque<(Vec<PathBuf>, bool)>,
 }
 
-impl Default for BackgroundDeleter {
-    fn default() -> Self {
-        Self {
-            active: false,
-            progress: Arc::new(AtomicUsize::new(0)),
-            total: 0,
-            receiver: None,
-            pending: VecDeque::new(),
-        }
-    }
-}
-
 impl BackgroundDeleter {
     /// Whether a deletion job is currently running.
     pub fn is_active(&self) -> bool {
-        self.active
+        self.receiver.is_some()
     }
 
     /// Number of items processed so far (atomically updated by worker thread).
@@ -66,7 +46,7 @@ impl BackgroundDeleter {
         if paths.is_empty() {
             return;
         }
-        if self.active {
+        if self.is_active() {
             self.pending.push_back((paths, use_trash));
             return;
         }
@@ -97,32 +77,23 @@ impl BackgroundDeleter {
             let _ = tx.send(results);
         });
 
-        self.active = true;
         self.progress = progress;
         self.total = total;
         self.receiver = Some(rx);
     }
 
-    /// Non-blocking poll. Returns [`PollResult::Done`] exactly once per job.
+    /// Non-blocking poll. Returns the per-path results exactly once per job.
     ///
     /// When a job finishes and there are queued requests, the next job starts
-    /// automatically before returning [`PollResult::Done`].
-    pub fn poll(&mut self) -> PollResult {
-        if !self.active {
-            return PollResult::Pending;
+    /// automatically before returning.
+    pub fn poll(&mut self) -> Option<DeleteResults> {
+        let results = self.receiver.as_ref()?.try_recv().ok()?;
+        self.receiver = None;
+        // Kick off the next queued job, if any.
+        if let Some((paths, use_trash)) = self.pending.pop_front() {
+            self.start_now(paths, use_trash);
         }
-        if let Some(ref rx) = self.receiver
-            && let Ok(results) = rx.try_recv()
-        {
-            self.active = false;
-            self.receiver = None;
-            // Kick off the next queued job, if any.
-            if let Some((paths, use_trash)) = self.pending.pop_front() {
-                self.start_now(paths, use_trash);
-            }
-            return PollResult::Done(results);
-        }
-        PollResult::Pending
+        Some(results)
     }
 
     /// Whether there are queued deletion requests waiting behind the active job.
@@ -157,16 +128,14 @@ mod tests {
     fn poll_until_done(deleter: &mut BackgroundDeleter) -> DeleteResults {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match deleter.poll() {
-                PollResult::Done(results) => return results,
-                PollResult::Pending => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "deletion timed out after 5s"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
+            if let Some(results) = deleter.poll() {
+                return results;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deletion timed out after 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -368,7 +337,7 @@ mod tests {
     #[test]
     fn poll_returns_pending_when_idle() {
         let mut d = BackgroundDeleter::default();
-        assert!(matches!(d.poll(), PollResult::Pending));
+        assert!(d.poll().is_none());
     }
 
     #[test]
@@ -383,6 +352,6 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         // Second poll should be Pending (results already consumed)
-        assert!(matches!(d.poll(), PollResult::Pending));
+        assert!(d.poll().is_none());
     }
 }

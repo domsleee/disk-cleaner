@@ -5,8 +5,14 @@
 //!
 //! ```sh
 //! cargo bench --bench scan_bench
+//! MEMORY_REPORT=1 cargo bench --bench scan_bench     # also print synthetic memory breakdowns
+//! MEMORY_REPORT=real cargo bench --bench scan_bench  # ...and rescan ~/git and ~ for real ones
 //! ```
 
+#[path = "common/alloc.rs"]
+mod alloc;
+
+use alloc::{ALLOCATED, PEAK, reset_tracking};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use disk_cleaner::categories;
 use disk_cleaner::scanner::{self, ScanProgress};
@@ -14,66 +20,11 @@ use disk_cleaner::tree::FileNode;
 use disk_cleaner::treemap;
 use disk_cleaner::ui;
 use eframe::egui;
-use mimalloc::MiMalloc;
-use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-
-// ---------------------------------------------------------------------------
-// Tracking allocator (for memory benchmarks)
-// ---------------------------------------------------------------------------
-
-struct TrackingAllocator;
-
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for TrackingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { MiMalloc.alloc(layout) };
-        if !ptr.is_null() {
-            let current = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(current, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.dealloc(ptr, layout) };
-    }
-
-    // Without this override the default realloc is alloc+copy+dealloc, which
-    // both changes the program's allocation behavior vs. the real app and
-    // double-counts every Vec/HashSet growth in the peak numbers.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            if new_size >= layout.size() {
-                let grow = new_size - layout.size();
-                let current = ALLOCATED.fetch_add(grow, Ordering::Relaxed) + grow;
-                PEAK.fetch_max(current, Ordering::Relaxed);
-            } else {
-                ALLOCATED.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-            }
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOC: TrackingAllocator = TrackingAllocator;
-
-/// Reset the peak to the current live level. `ALLOCATED` is never zeroed:
-/// it tracks live bytes process-wide, and zeroing it while allocations made
-/// before the reset are still live would underflow (wrap) when they free.
-/// Callers measure deltas against a `before` snapshot instead.
-fn reset_tracking() {
-    PEAK.store(ALLOCATED.load(Ordering::SeqCst), Ordering::SeqCst);
-}
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -366,103 +317,6 @@ fn print_real_scan_breakdown(label: &str, path: &std::path::Path) {
     std::hint::black_box((tree, stats));
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct CriterionCli {
-    filter: Option<String>,
-    exact: bool,
-    suppress_side_reports: bool,
-}
-
-fn criterion_option_takes_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-c" | "--color"
-            | "-s"
-            | "--save-baseline"
-            | "-b"
-            | "--baseline"
-            | "--baseline-lenient"
-            | "--format"
-            | "--profile-time"
-            | "--load-baseline"
-            | "--sample-size"
-            | "--warm-up-time"
-            | "--measurement-time"
-            | "--nresamples"
-            | "--noise-threshold"
-            | "--confidence-level"
-            | "--significance-level"
-            | "--plotting-backend"
-            | "--output-format"
-    )
-}
-
-fn parse_criterion_cli<I, S>(args: I) -> CriterionCli
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut cli = CriterionCli::default();
-    let mut skip_next = false;
-
-    for arg in args.into_iter().skip(1) {
-        let arg = arg.as_ref();
-
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        match arg {
-            "--exact" => {
-                cli.exact = true;
-                continue;
-            }
-            "--list" | "--ignored" | "-h" | "--help" => {
-                cli.suppress_side_reports = true;
-                continue;
-            }
-            _ => {}
-        }
-
-        if let Some((flag, _)) = arg.split_once('=')
-            && criterion_option_takes_value(flag)
-        {
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            if criterion_option_takes_value(arg) {
-                skip_next = true;
-            }
-            continue;
-        }
-
-        if cli.filter.is_none() {
-            cli.filter = Some(arg.to_owned());
-        }
-    }
-
-    cli
-}
-
-fn criterion_cli() -> &'static CriterionCli {
-    static CLI: OnceLock<CriterionCli> = OnceLock::new();
-    CLI.get_or_init(|| parse_criterion_cli(std::env::args()))
-}
-
-fn cli_matches_bench_id(cli: &CriterionCli, bench_id: &str) -> bool {
-    match cli.filter.as_deref() {
-        None => true,
-        Some(filter) if cli.exact => bench_id == filter,
-        Some(filter) => bench_id.contains(filter),
-    }
-}
-
-fn should_emit_side_reports() -> bool {
-    !criterion_cli().suppress_side_reports
-}
-
 // ---------------------------------------------------------------------------
 // Synthetic scan benchmarks
 // ---------------------------------------------------------------------------
@@ -508,13 +362,6 @@ fn bench_scan_20k_files(c: &mut Criterion) {
     });
 }
 
-/// Check if a benchmark ID matches the active Criterion filter.
-/// Criterion treats the first non-option argument as the filter, with
-/// `--exact` switching from substring to exact matching.
-fn bench_filter_matches(bench_id: &str) -> bool {
-    cli_matches_bench_id(criterion_cli(), bench_id)
-}
-
 // ---------------------------------------------------------------------------
 // Real directory scan benchmarks
 // ---------------------------------------------------------------------------
@@ -558,26 +405,17 @@ fn bench_scan_real_dirs(c: &mut Criterion) {
 
     group.finish();
 
-    // One-time memory report for each real directory (only when selected).
-    if should_emit_side_reports() {
+    if std::env::var_os("MEMORY_REPORT").is_some_and(|v| v == "real") {
         eprintln!("\n=== Real Scan Memory Breakdown ===");
-        for (label, id, path) in [
+        for (label, path) in [
             (
                 "~/git",
-                "scan_real/home_git",
                 dirs::home_dir()
                     .map(|h| h.join("git"))
                     .filter(|p| p.is_dir()),
             ),
-            (
-                "~",
-                "scan_real/home",
-                dirs::home_dir().filter(|p| p.is_dir()),
-            ),
+            ("~", dirs::home_dir().filter(|p| p.is_dir())),
         ] {
-            if !bench_filter_matches(id) {
-                continue;
-            }
             if let Some(ref p) = path {
                 print_real_scan_breakdown(label, p);
             }
@@ -636,36 +474,7 @@ fn bench_memory_synthetic(c: &mut Criterion) {
         })
     });
 
-    // Print a one-time memory report (only when this bench is selected)
-    if should_emit_side_reports() && bench_filter_matches("memory_1000_files_100_dirs") {
-        reset_tracking();
-        let progress = new_progress();
-        let before = ALLOCATED.load(Ordering::SeqCst);
-        let tree = scanner::scan_directory(tmp.path(), progress.clone());
-        let after = ALLOCATED.load(Ordering::SeqCst);
-        let nodes = count_nodes(&tree);
-        let files = progress.file_count.load(Ordering::Relaxed);
-        eprintln!("\n=== Memory Report: 1000 files / 100 dirs ===");
-        eprintln!("Nodes: {nodes}");
-        eprintln!("Files scanned: {files}");
-        eprintln!(
-            "Memory delta: {} bytes ({:.1} KB)",
-            after.saturating_sub(before),
-            after.saturating_sub(before) as f64 / 1024.0
-        );
-        eprintln!(
-            "Bytes per node: {:.0}",
-            after.saturating_sub(before) as f64 / nodes as f64
-        );
-        let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
-        eprintln!(
-            "Peak allocation: {} bytes ({:.1} KB)",
-            peak,
-            peak as f64 / 1024.0
-        );
-        eprintln!("=============================================\n");
-        std::hint::black_box(tree);
-    }
+    print_synthetic_memory_report("1000 files / 100 dirs", tmp.path());
 }
 
 /// Memory benchmark for a large synthetic tree (10,000 files / 500 dirs)
@@ -686,36 +495,39 @@ fn bench_memory_large_synthetic(c: &mut Criterion) {
         })
     });
 
-    // Print memory report for large tree (only when this bench is selected)
-    if should_emit_side_reports() && bench_filter_matches("memory_10000_files_500_dirs") {
-        reset_tracking();
-        let progress = new_progress();
-        let before = ALLOCATED.load(Ordering::SeqCst);
-        let tree = scanner::scan_directory(tmp.path(), progress.clone());
-        let after = ALLOCATED.load(Ordering::SeqCst);
-        let nodes = count_nodes(&tree);
-        let files = progress.file_count.load(Ordering::Relaxed);
-        eprintln!("\n=== Memory Report: 10,000 files / 500 dirs ===");
-        eprintln!("Nodes: {nodes}");
-        eprintln!("Files scanned: {files}");
-        eprintln!(
-            "Memory delta: {} bytes ({:.1} KB)",
-            after.saturating_sub(before),
-            after.saturating_sub(before) as f64 / 1024.0
-        );
-        eprintln!(
-            "Bytes per node: {:.0}",
-            after.saturating_sub(before) as f64 / nodes as f64
-        );
-        let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
-        eprintln!(
-            "Peak allocation: {} bytes ({:.1} KB)",
-            peak,
-            peak as f64 / 1024.0
-        );
-        eprintln!("================================================\n");
-        std::hint::black_box(tree);
+    print_synthetic_memory_report("10,000 files / 500 dirs", tmp.path());
+}
+
+fn memory_report_enabled() -> bool {
+    std::env::var_os("MEMORY_REPORT").is_some()
+}
+
+fn print_synthetic_memory_report(label: &str, path: &std::path::Path) {
+    if !memory_report_enabled() {
+        return;
     }
+    reset_tracking();
+    let progress = new_progress();
+    let before = ALLOCATED.load(Ordering::SeqCst);
+    let tree = scanner::scan_directory(path, progress.clone());
+    let delta = ALLOCATED.load(Ordering::SeqCst).saturating_sub(before);
+    let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
+    let nodes = count_nodes(&tree);
+    let files = progress.file_count.load(Ordering::Relaxed);
+    eprintln!("\n=== Memory Report: {label} ===");
+    eprintln!("Nodes: {nodes}");
+    eprintln!("Files scanned: {files}");
+    eprintln!(
+        "Memory delta: {delta} bytes ({:.1} KB)",
+        delta as f64 / 1024.0
+    );
+    eprintln!("Bytes per node: {:.0}", delta as f64 / nodes as f64);
+    eprintln!(
+        "Peak allocation: {peak} bytes ({:.1} KB)",
+        peak as f64 / 1024.0
+    );
+    eprintln!("=============================================\n");
+    std::hint::black_box(tree);
 }
 
 // ---------------------------------------------------------------------------
@@ -736,44 +548,3 @@ criterion_group!(
     bench_memory_large_synthetic,
 );
 criterion_main!(benches);
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parses_plain_filter() {
-        let cli = super::parse_criterion_cli(["scan_bench", "scan_real/home_git"]);
-        assert_eq!(cli.filter.as_deref(), Some("scan_real/home_git"));
-        assert!(!cli.exact);
-        assert!(!cli.suppress_side_reports);
-    }
-
-    #[test]
-    fn parses_filter_after_flags_and_values() {
-        let cli = super::parse_criterion_cli([
-            "scan_bench",
-            "--color=always",
-            "--sample-size",
-            "25",
-            "--exact",
-            "scan_real/home_git",
-        ]);
-        assert_eq!(cli.filter.as_deref(), Some("scan_real/home_git"));
-        assert!(cli.exact);
-    }
-
-    #[test]
-    fn suppresses_side_reports_for_list_and_ignored_modes() {
-        let list_cli = super::parse_criterion_cli(["scan_bench", "--list"]);
-        assert!(list_cli.suppress_side_reports);
-
-        let ignored_cli = super::parse_criterion_cli(["scan_bench", "--ignored"]);
-        assert!(ignored_cli.suppress_side_reports);
-    }
-
-    #[test]
-    fn matches_exact_filters_exactly() {
-        let cli = super::parse_criterion_cli(["scan_bench", "--exact", "scan_real/home"]);
-        assert!(super::cli_matches_bench_id(&cli, "scan_real/home"));
-        assert!(!super::cli_matches_bench_id(&cli, "scan_real/home_git"));
-    }
-}

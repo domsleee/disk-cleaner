@@ -89,100 +89,6 @@ fn bench_build_cache(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-frame label formatting (the cost we moved from per-frame to cache-build)
-// ---------------------------------------------------------------------------
-
-fn bench_label_formatting(c: &mut Criterion) {
-    let mut group = c.benchmark_group("treemap_label_format");
-
-    // Simulate what the old code did every frame: format! per tile
-    let names: Vec<String> = (0..200).map(|i| format!("file_{i:03}.rs")).collect();
-    let sizes: Vec<u64> = (0..200).map(|i| (i + 1) * 4096).collect();
-
-    group.bench_function("200_tiles_format_per_frame", |b| {
-        b.iter(|| {
-            let mut labels = Vec::with_capacity(200);
-            for i in 0..200 {
-                labels.push(format!("{}\n{}", names[i], bytesize::ByteSize::b(sizes[i])));
-            }
-            labels
-        })
-    });
-
-    group.bench_function("200_tiles_precomputed_ref", |b| {
-        // Pre-compute once (like our cache does)
-        let precomputed: Vec<String> = (0..200)
-            .map(|i| format!("{}\n{}", names[i], bytesize::ByteSize::b(sizes[i])))
-            .collect();
-        b.iter(|| {
-            // Per-frame: just reference the pre-computed strings
-            let mut refs: Vec<&str> = Vec::with_capacity(200);
-            for label in &precomputed {
-                refs.push(label.as_str());
-            }
-            refs
-        })
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// find_node + breadcrumbs (moved from per-frame to cache-build)
-// ---------------------------------------------------------------------------
-
-fn bench_tree_navigation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("treemap_navigation");
-    group.sample_size(20);
-
-    // Deep zoom path
-    let tree = build_applications_like(200, 100);
-    let zoom = std::path::PathBuf::from("/Applications/App_150.app");
-    let n = count_nodes(&tree);
-
-    group.bench_with_input(BenchmarkId::new("find_node", n), &tree, |b, t| {
-        b.iter(|| treemap::find_node(t, &zoom))
-    });
-
-    group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
-        b.iter(|| treemap::breadcrumbs(t, &zoom))
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// FontId allocation overhead
-// ---------------------------------------------------------------------------
-
-fn bench_fontid_alloc(c: &mut Criterion) {
-    let mut group = c.benchmark_group("treemap_fontid");
-
-    group.bench_function("create_200_fontids", |b| {
-        b.iter(|| {
-            let mut fonts = Vec::with_capacity(200);
-            for _ in 0..200 {
-                fonts.push(egui::FontId::proportional(11.0));
-            }
-            fonts
-        })
-    });
-
-    group.bench_function("clone_1_fontid_200x", |b| {
-        let font = egui::FontId::proportional(11.0);
-        b.iter(|| {
-            let mut fonts = Vec::with_capacity(200);
-            for _ in 0..200 {
-                fonts.push(font.clone());
-            }
-            fonts
-        })
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // find_node + breadcrumbs at scale (tree_memory.rs only tests 1.1K nodes)
 // ---------------------------------------------------------------------------
 
@@ -245,9 +151,6 @@ fn bench_squarify(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_build_cache,
-    bench_label_formatting,
-    bench_tree_navigation,
-    bench_fontid_alloc,
     bench_navigation_at_scale,
     bench_squarify,
 );

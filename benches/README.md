@@ -1,7 +1,7 @@
 # Benchmarks
 
 Benchmarks cover scanning, tree view, and treemap rendering, with additional
-suites for regression checks and scan comparisons.
+suites for scan comparisons.
 
 ## Categories
 
@@ -13,12 +13,14 @@ Also tracks memory per node.
 
 ```sh
 cargo bench --bench scan_bench
+MEMORY_REPORT=1 cargo bench --bench scan_bench     # also print synthetic memory breakdowns
+MEMORY_REPORT=real cargo bench --bench scan_bench  # ...and rescan ~/git and ~ for real ones
 ```
 
 ### Tree view (`tree_bench`)
 
 Measures the per-frame hot path: `collect_cached_rows`, `node_matches`,
-find/toggle/expand/remove tree walks, selection operations, filter caches,
+find/toggle/expand/remove tree walks, filter caches,
 category matching, `auto_expand`, and `compute_stats`.
 
 ```sh
@@ -27,23 +29,14 @@ cargo bench --bench tree_bench
 
 ### Treemap (`treemap_bench`)
 
-Measures `build_treemap_cache`, `squarify` layout, `find_node`/`breadcrumbs`
-navigation, label formatting, and `FontId` allocation.
+Measures `build_treemap_cache`, `squarify` layout, and `find_node`/`breadcrumbs`
+navigation.
 
 ```sh
 cargo bench --bench treemap_bench
 ```
 
 ## Special-purpose suites
-
-### Regression gate (`regression_bench`)
-
-Checks bytes/node and scan time against hard thresholds using a fixed
-50K-file CI fixture. Use `scan_bench` for iteration.
-
-```sh
-cargo bench --bench regression_bench
-```
 
 ### Statistical scan (`stat_bench`)
 
@@ -145,20 +138,12 @@ pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
 ## Comparing branches
 
 ```sh
-# Save a baseline on main
-./benches/baseline.sh save
-
-# Switch to your branch and compare
-./benches/baseline.sh compare
-
-# Or compare two refs directly
-./benches/ab.sh main my-feature-branch
+cargo bench --benches -- --save-baseline main   # on main
+cargo bench --benches -- --baseline main        # on your branch
 ```
 
 ## Competitive benchmarks
 
 ```sh
-./benches/vs_dust.sh [PATH]   # disk-cleaner vs dust
 ./benches/vs_all.sh [PATH]    # disk-cleaner vs du, dust, ncdu (requires hyperfine)
-./benches/fullscan.sh [PATH]  # wall-clock + peak RSS for a single scan
 ```

@@ -1,8 +1,6 @@
 //! Statistical benchmark for measuring scan performance on real directories.
 //!
-//! Unlike the regression benchmark (which uses a synthetic fixture for CI
-//! reproducibility), this benchmark scans a real directory to capture
-//! real-world memory and speed characteristics.
+//! Scans a real directory to capture real-world memory and speed characteristics.
 //!
 //! # Running
 //!
@@ -22,43 +20,15 @@
 //!
 //! Compare branches by running on each and comparing the summary lines.
 
+#[path = "common/alloc.rs"]
+mod alloc;
+
+use alloc::{ALLOCATED, PEAK, reset_tracking};
 use disk_cleaner::scanner::{self, ScanProgress};
 use disk_cleaner::tree::FileNode;
-use mimalloc::MiMalloc;
-use std::alloc::{GlobalAlloc, Layout};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-
-// ── Tracking allocator ───────────────────────────────────────────────
-
-struct TrackingAllocator;
-
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for TrackingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { MiMalloc.alloc(layout) };
-        if !ptr.is_null() {
-            let current = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(current, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { MiMalloc.dealloc(ptr, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOC: TrackingAllocator = TrackingAllocator;
-
-fn reset_peak() {
-    PEAK.store(ALLOCATED.load(Ordering::SeqCst), Ordering::SeqCst);
-}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -150,7 +120,7 @@ fn main() {
     let mut file_count_last = 0u64;
 
     for i in 0..runs {
-        reset_peak();
+        reset_tracking();
         let before = ALLOCATED.load(Ordering::SeqCst);
         let progress = new_progress();
         let start = Instant::now();

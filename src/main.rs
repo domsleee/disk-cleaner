@@ -3,7 +3,7 @@
 mod background_query;
 mod deleter;
 
-use disk_cleaner::{app_icon, categories, category_worker, icons, scanner, tree, treemap, ui};
+use disk_cleaner::{categories, category_worker, icons, scanner, tree, treemap, ui};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -405,7 +405,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(win_size)
             .with_min_inner_size([720.0, 480.0])
-            .with_icon(app_icon::generate())
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/app_icon.png"))
+                    .expect("embedded app icon is a valid PNG"),
+            )
             .with_visible(false), // hidden until first frame renders (avoids white flash)
         ..Default::default()
     };
@@ -1050,20 +1053,14 @@ fn save_screenshot_png(
     color_image: &egui::ColorImage,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rgba = Vec::with_capacity(color_image.pixels.len() * 4);
-    for pixel in &color_image.pixels {
-        rgba.push(pixel.r());
-        rgba.push(pixel.g());
-        rgba.push(pixel.b());
-        rgba.push(pixel.a());
+    use eframe::icon_data::IconDataExt as _;
+    let png = egui::IconData {
+        rgba: color_image.as_raw().to_vec(),
+        width: color_image.width() as u32,
+        height: color_image.height() as u32,
     }
-    image::save_buffer(
-        path,
-        &rgba,
-        color_image.width() as u32,
-        color_image.height() as u32,
-        image::ColorType::Rgba8,
-    )?;
+    .to_png_bytes()?;
+    std::fs::write(path, png)?;
     eprintln!("[screenshot] saved: {path}");
     Ok(())
 }

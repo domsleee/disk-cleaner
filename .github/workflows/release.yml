@@ -58,18 +58,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
           path: artifacts
 
-      - name: Generate app icon
+      - name: Build app icon
         run: |
-          cargo build --bin gen_icon --release --features internal-tools
-          ./target/release/gen_icon icon_1024.png
+          cp assets/app_icon.png icon_1024.png
 
           # Create iconset with all required sizes
           mkdir AppIcon.iconset

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background_query;
 mod deleter;
 
 use disk_cleaner::{app_icon, categories, category_worker, icons, scanner, tree, treemap, ui};
@@ -50,6 +51,58 @@ fn middle_truncate(s: &str, max: usize) -> String {
     let head_s: String = chars[..head].iter().collect();
     let tail_s: String = chars[chars.len() - tail..].iter().collect();
     format!("{head_s}\u{2026}{tail_s}")
+}
+
+/// Split a trailing drive letter off a volume name so it survives truncation.
+fn split_drive_letter(name: &str) -> (&str, &str) {
+    if name.ends_with(":)")
+        && let Some(open) = name.rfind(" (")
+        && name.len() - open == 5
+        && name.as_bytes()[open + 2].is_ascii_alphabetic()
+    {
+        return (&name[..open], &name[open + 1..]);
+    }
+    (name, "")
+}
+
+/// Paint the title bar dark before the window is ever shown.
+///
+/// `ViewportCommand::SetTheme` only reaches the decorations at the end of the
+/// first frame, by which point the window is visible, so DWM animates the
+/// caption from light to dark in front of the user. Setting the attribute on
+/// the raw handle during setup wins that race.
+#[cfg(target_os = "windows")]
+fn set_dark_titlebar(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as *mut core::ffi::c_void;
+    let enabled: i32 = 1;
+    // Attribute 20 arrived in Windows 10 build 18985. Builds between 17763 and
+    // 18984 took the same value under the undocumented 19, so try that before
+    // giving up; older builds have no dark caption at all.
+    for attribute in [DWMWA_USE_IMMERSIVE_DARK_MODE as u32, 19] {
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                (&raw const enabled).cast(),
+                size_of::<i32>() as u32,
+            )
+        };
+        if hr >= 0 {
+            return;
+        }
+    }
+    if debug_enabled() {
+        eprintln!("[titlebar] the dark caption attribute was rejected");
+    }
 }
 
 /// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
@@ -365,6 +418,8 @@ fn main() -> eframe::Result {
             // Tell the OS to use dark window decorations (title bar on Windows).
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+            #[cfg(target_os = "windows")]
+            set_dark_titlebar(cc);
             let mut app = App {
                 process_start: Some(process_start),
                 screenshot_prefix: screenshot_prefix.clone(),
@@ -448,7 +503,12 @@ struct App {
     treemap_zoom: Option<PathBuf>,
     treemap_zoom_anim: Option<f64>,
     volumes: Vec<scanner::VolumeInfo>,
+    volumes_query: background_query::BackgroundQuery<Vec<scanner::VolumeInfo>>,
     volumes_last_refresh: Option<std::time::Instant>,
+    /// Last frame's drive-list height, so a short list can keep the actions
+    /// under it rather than at the bottom of the window.
+    volumes_list_height: f32,
+    disk_space_query: background_query::BackgroundQuery<Option<(u64, u64)>>,
     scan_disk_info: Option<(u64, u64)>, // (total, available) for scan path
     scan_is_volume: bool,               // true when scanning a volume root
     category_filter: Option<categories::FileCategory>,
@@ -538,8 +598,15 @@ impl Default for App {
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
-            volumes: scanner::list_volumes(),
-            volumes_last_refresh: Some(std::time::Instant::now()),
+            volumes: Vec::new(),
+            volumes_query: {
+                let mut query = background_query::BackgroundQuery::default();
+                query.request(scanner::list_volumes);
+                query
+            },
+            volumes_last_refresh: None,
+            volumes_list_height: 0.0,
+            disk_space_query: Default::default(),
             scan_disk_info: None,
             scan_is_volume: false,
             category_filter: None,
@@ -605,6 +672,7 @@ impl App {
     }
 
     fn cancel_scan(&mut self) {
+        self.disk_space_query.cancel();
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
         self.scanning = false;
         self.receiver = None;
@@ -646,7 +714,8 @@ impl App {
         self.selected_paths.clear();
         self.selection_anchor = None;
         self.scan_path = Some(path.clone());
-        self.scan_disk_info = scanner::disk_space(&path);
+        self.scan_disk_info = None;
+        self.refresh_disk_info();
         self.scan_is_volume = self.volumes.iter().any(|v| v.path == path);
 
         let progress = Arc::new(ScanProgress {
@@ -892,8 +961,25 @@ impl App {
 
     /// Re-query disk space so the status bar reflects freed space after deletions.
     fn refresh_disk_info(&mut self) {
-        if let Some(ref path) = self.scan_path {
-            self.scan_disk_info = scanner::disk_space(path);
+        if let Some(path) = self.scan_path.clone() {
+            self.disk_space_query
+                .request(move || scanner::disk_space(&path));
+        }
+    }
+
+    fn poll_disk_queries(&mut self, ctx: &egui::Context) {
+        if let Some(volumes) = self.volumes_query.poll(ctx) {
+            self.volumes = volumes;
+            self.volumes_last_refresh = Some(Instant::now());
+            self.scan_is_volume = self
+                .scan_path
+                .as_ref()
+                .is_some_and(|path| self.volumes.iter().any(|volume| volume.path == *path));
+            ctx.request_repaint();
+        }
+        if let Some(info) = self.disk_space_query.poll(ctx) {
+            self.scan_disk_info = info;
+            ctx.request_repaint();
         }
     }
 }
@@ -1146,7 +1232,9 @@ impl eframe::App for App {
 
             match self.screenshot_state {
                 ScreenshotState::WaitingForView => {
-                    if !self.scanning {
+                    // Home screenshots should include the asynchronously loaded
+                    // drive cards, rather than racing the first discovery query.
+                    if !self.scanning && (self.tree.is_some() || !self.volumes_query.is_active()) {
                         // Expand all file groups so individual files (e.g. hard
                         // links) are visible instead of a collapsed "[N files]".
                         if let Some(tree) = &self.tree {
@@ -1945,197 +2033,351 @@ impl eframe::App for App {
 
             if self.tree.is_none() {
                 // Refresh volume list every 5 seconds
-                let should_refresh = self
-                    .volumes_last_refresh
-                    .is_none_or(|t| t.elapsed().as_secs() >= 5);
+                let should_refresh = !self.volumes_query.is_active()
+                    && self
+                        .volumes_last_refresh
+                        .is_none_or(|t| t.elapsed().as_secs() >= 5);
                 if should_refresh {
-                    self.volumes = scanner::list_volumes();
-                    self.volumes_last_refresh = Some(std::time::Instant::now());
+                    self.volumes_query.request(scanner::list_volumes);
                 }
+                if !self.volumes_query.is_active() {
+                    ctx.request_repaint_after(Duration::from_secs(5));
+                }
+                let foreground = egui::Color32::from_rgb(238, 240, 244);
+                let secondary = egui::Color32::from_rgb(177, 185, 198);
+                let short = ui.available_height() < 500.0;
+                let width = 540.0_f32.min(ui.available_width() - 32.0);
+                let rescan_path = self
+                    .last_scan_path
+                    .as_ref()
+                    .filter(|last| !self.volumes.iter().any(|volume| volume.path == **last))
+                    .cloned();
+                let mut scan_path = None;
+                let mut measured_list_height = 0.0_f32;
+                let mut pick_folder = false;
+                let discovering = self.volumes.is_empty() && self.volumes_query.is_active();
 
-                let avail = ui.available_height();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.set_min_height(avail);
-                    ui.vertical_centered(|ui| {
-                        // Center the content when it fits; the ScrollArea keeps the
-                        // buttons reachable when it doesn't. Estimate height from the
-                        // volume list (each card ~90px, plus the "Volumes" header).
-                        let est_content = 150.0
-                            + if self.volumes.is_empty() {
-                                0.0
-                            } else {
-                                30.0 + self.volumes.len() as f32 * 90.0
-                            };
-                        ui.add_space(((avail - est_content) * 0.5).max(24.0));
-                        // App name lives in the window title bar — lead with the
-                        // instruction here instead of repeating it.
-                        ui.heading("Select a volume to scan");
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Reclaim disk space by finding what's using it")
-                                .weak()
-                                .size(13.0),
-                        );
-                        ui.add_space(20.0);
-
-                        // Volume list
-                        if !self.volumes.is_empty() {
-                            ui.label(egui::RichText::new("Volumes").strong().size(14.0));
-                            ui.add_space(8.0);
-
-                            let mut scan_path: Option<PathBuf> = None;
-                            for vol in &self.volumes {
-                                let used = vol.total_bytes.saturating_sub(vol.available_bytes);
-                                let fraction = if vol.total_bytes > 0 {
-                                    used as f32 / vol.total_bytes as f32
-                                } else {
-                                    0.0
-                                };
-
-                                let card_response = egui::Frame::group(ui.style())
-                                    .inner_margin(12.0)
-                                    .show(ui, |ui| {
-                                        ui.set_width(400.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("\u{1F4BD}").size(16.0));
-                                            ui.strong(&vol.name);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(format!(
-                                                        "{} used of {}",
-                                                        bytesize::ByteSize::b(used),
-                                                        bytesize::ByteSize::b(vol.total_bytes),
-                                                    ));
-                                                },
-                                            );
-                                        });
-
-                                        // Capacity bar
-                                        let bar_height = 14.0;
-                                        let (bar_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(ui.available_width(), bar_height),
-                                            egui::Sense::hover(),
-                                        );
-                                        let painter = ui.painter();
-                                        painter.rect_filled(
-                                            bar_rect,
-                                            3.0,
-                                            ui.visuals().extreme_bg_color,
-                                        );
-                                        let fill_w =
-                                            (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(1.0);
-                                        let fill_rect = egui::Rect::from_min_size(
-                                            bar_rect.min,
-                                            egui::vec2(fill_w, bar_height),
-                                        );
-                                        let fill_color = if fraction > 0.9 {
-                                            egui::Color32::from_rgb(220, 60, 60)
-                                        } else if fraction > 0.7 {
-                                            egui::Color32::from_rgb(220, 150, 50)
+                ui.vertical_centered(|ui| {
+                    ui.visuals_mut().override_text_color = Some(foreground);
+                    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                    ui.add_space(if short { 12.0 } else { 24.0 });
+                    ui.label(
+                        egui::RichText::new("Choose a drive to scan")
+                            .size(if short { 22.0 } else { 26.0 })
+                            .strong(),
+                    );
+                    ui.add_space(if short { 12.0 } else { 26.0 });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 22.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(egui::RichText::new("Drives").size(15.0).strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(if discovering {
+                                            "Finding drives…".to_owned()
                                         } else {
-                                            egui::Color32::from_rgb(52, 152, 219)
-                                        };
-                                        painter.rect_filled(fill_rect, 3.0, fill_color);
-
-                                        ui.label(format!(
-                                            "{:.0}% used \u{2014} {} free",
-                                            fraction * 100.0,
-                                            bytesize::ByteSize::b(vol.available_bytes)
-                                        ));
-                                    });
-
-                                // Make entire card clickable
-                                let card_rect = card_response.response.rect;
-                                let card_id = egui::Id::new(("vol_card", &vol.path));
-                                let card_interact = ui
-                                    .interact(card_rect, card_id, egui::Sense::click())
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                // Highlight border on hover — a clickable card needs
-                                // more feedback than just a cursor change.
-                                if card_interact.hovered() {
-                                    ui.painter().rect_stroke(
-                                        card_rect,
-                                        6.0,
-                                        egui::Stroke::new(
-                                            1.5_f32,
-                                            egui::Color32::from_rgb(52, 152, 219),
-                                        ),
-                                        egui::StrokeKind::Inside,
+                                            format!(
+                                                "{} {} · Select to scan",
+                                                self.volumes.len(),
+                                                if self.volumes.len() == 1 { "drive" } else { "drives" }
+                                            )
+                                        })
+                                        .size(12.0)
+                                        .color(secondary),
                                     );
-                                }
-                                if card_interact.clicked() {
-                                    scan_path = Some(vol.path.clone());
-                                }
+                                },
+                            );
+                        },
+                    );
+                    ui.add_space(8.0);
 
-                                ui.add_space(4.0);
-                            }
-
-                            if let Some(path) = scan_path {
-                                self.start_scan(path);
-                            }
-
-                            ui.add_space(12.0);
-                        }
-
-                        // Primary and secondary actions share a footprint so they
-                        // stack as an even column — hierarchy comes from the fill,
-                        // not from shrinking the secondary.
-                        let btn_size = egui::vec2(200.0, 34.0);
-
-                        // Primary action — pick any folder to scan.
-                        let scan_btn = egui::Button::new(
-                            egui::RichText::new("Scan a Folder...")
-                                .size(14.0)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(37, 99, 235))
-                        .min_size(btn_size);
-                        if ui.add(scan_btn).clicked()
-                            && let Some(path) = rfd::FileDialog::new().pick_folder()
-                        {
-                            self.start_scan(path);
-                        }
-
-                        // Rescan the last location — same size as the primary but a
-                        // muted secondary style; only when that path isn't already a
-                        // volume card above (that would just duplicate the card).
-                        if let Some(ref last) = self.last_scan_path.clone() {
-                            let is_listed_volume = self.volumes.iter().any(|v| v.path == *last);
-                            if !is_listed_volume {
+                    // Reserve room for actions and errors outside the scrolling list.
+                    let footer_height = if self.error.is_some() { 95.0 } else { 64.0 };
+                    let available = (ui.available_height() - footer_height).max(0.0);
+                    // Size the list to the drives it drew last frame, so a short
+                    // list keeps the actions under it rather than at the bottom.
+                    let list_height = if self.volumes_list_height > 0.0 {
+                        self.volumes_list_height.min(available)
+                    } else {
+                        available
+                    };
+                    let list_content = ui.allocate_ui_with_layout(
+                        egui::vec2(width + 12.0, list_height),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("home_drives")
+                                .max_height(list_height)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if self.volumes.is_empty() {
+                                        ui.add_space(24.0);
+                                        ui.label(
+                                            egui::RichText::new(if discovering {
+                                                "Finding drives. You can also choose a folder to scan."
+                                            } else {
+                                                "No drives available. Choose a folder to scan."
+                                            })
+                                            .size(14.0)
+                                            .color(secondary),
+                                        );
+                                    }
+                                    for vol in &self.volumes {
+                                        let used =
+                                            vol.total_bytes.saturating_sub(vol.available_bytes);
+                                        let fraction = if vol.total_bytes > 0 {
+                                            used as f32 / vol.total_bytes as f32
+                                        } else {
+                                            0.0
+                                        };
+                                        let mut truncated = false;
+                                        let card = egui::Frame::new()
+                                            .fill(egui::Color32::from_rgb(34, 37, 43))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgb(60, 65, 76),
+                                            ))
+                                            .corner_radius(7.0)
+                                            .inner_margin(10.0)
+                                            .show(ui, |ui| {
+                                                ui.set_width(width - 30.0);
+                                                ui.horizontal(|ui| {
+                                                    let bar_width =
+                                                        if short { 80.0 } else { 160.0 };
+                                                    let bar_height = if short { 6.0 } else { 7.0 };
+                                                    // Room for "<free> free of <total>" at 13pt.
+                                                    let label_width =
+                                                        if short { 185.0 } else { 198.0 };
+                                                    let (label, drive) =
+                                                        split_drive_letter(&vol.name);
+                                                    let drive_width =
+                                                        if drive.is_empty() { 0.0 } else { 38.0 };
+                                                    let name_width = (ui.available_width()
+                                                        - bar_width
+                                                        - label_width
+                                                        - drive_width)
+                                                        .max(0.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        egui::vec2(name_width + drive_width, 20.0),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.set_min_width(
+                                                                name_width + drive_width,
+                                                            );
+                                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                                            truncated = ui
+                                                                .painter()
+                                                                .layout_no_wrap(
+                                                                    label.to_owned(),
+                                                                    egui::FontId::proportional(
+                                                                        15.0,
+                                                                    ),
+                                                                    foreground,
+                                                                )
+                                                                .size()
+                                                                .x
+                                                                > name_width;
+                                                            // Cap the label so a long one cannot
+                                                            // eat the drive letter's room, while
+                                                            // a short one still sits against it.
+                                                            ui.scope(|ui| {
+                                                                ui.set_max_width(name_width);
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(label)
+                                                                            .size(15.0)
+                                                                            .strong(),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            });
+                                                            if !drive.is_empty() {
+                                                                ui.label(
+                                                                    egui::RichText::new(drive)
+                                                                        .size(15.0)
+                                                                        .strong(),
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                    let (bar, _) = ui.allocate_exact_size(
+                                                        egui::vec2(bar_width, bar_height),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(
+                                                        bar,
+                                                        3.0,
+                                                        egui::Color32::from_rgb(40, 45, 54),
+                                                    );
+                                                    let color = if fraction > 0.9 {
+                                                        egui::Color32::from_rgb(239, 106, 108)
+                                                    } else if fraction > 0.7 {
+                                                        egui::Color32::from_rgb(230, 176, 78)
+                                                    } else {
+                                                        egui::Color32::from_rgb(83, 164, 233)
+                                                    };
+                                                    ui.painter().rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            bar.min,
+                                                            egui::vec2(
+                                                                (bar.width()
+                                                                    * fraction.clamp(0.0, 1.0))
+                                                                .max(1.0),
+                                                                bar.height(),
+                                                            ),
+                                                        ),
+                                                        3.0,
+                                                        color,
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "of {}",
+                                                                    bytesize::ByteSize::b(
+                                                                        vol.total_bytes
+                                                                    )
+                                                                ))
+                                                                .size(13.0)
+                                                                .color(egui::Color32::from_rgb(
+                                                                    134, 143, 157,
+                                                                )),
+                                                            );
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "{} free",
+                                                                    bytesize::ByteSize::b(
+                                                                        vol.available_bytes
+                                                                    )
+                                                                ))
+                                                                .size(13.0)
+                                                                .color(foreground),
+                                                            );
+                                                        },
+                                                    );
+                                                });
+                                            });
+                                        let response = ui
+                                            .interact(
+                                                card.response.rect,
+                                                egui::Id::new(("vol_card", &vol.path)),
+                                                egui::Sense::click(),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        // The row already says the rest; only the
+                                        // clipped-off name is worth a tooltip.
+                                        let response = if truncated {
+                                            response.on_hover_text(&vol.name)
+                                        } else {
+                                            response
+                                        };
+                                        if response.hovered() || response.has_focus() {
+                                            ui.painter().rect_stroke(
+                                                card.response.rect,
+                                                7.0,
+                                                egui::Stroke::new(
+                                                    1.5_f32,
+                                                    egui::Color32::from_rgb(83, 164, 233),
+                                                ),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                        if response.clicked() {
+                                            scan_path = Some(vol.path.clone());
+                                        }
+                                        ui.add_space(8.0);
+                                    }
+                                })
+                                .content_size
+                                .y
+                        },
+                    );
+                    measured_list_height = list_content.inner;
+                    ui.add_space(14.0);
+                    let button_width = (width - ui.spacing().item_spacing.x) / 2.0;
+                    let actions_width = if rescan_path.is_some() {
+                        width
+                    } else {
+                        button_width
+                    };
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(actions_width, 44.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            pick_folder = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Scan a Folder…")
+                                            .size(14.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(egui::Color32::from_rgb(37, 99, 235))
+                                    .corner_radius(6.0)
+                                    .min_size(egui::vec2(button_width, 40.0)),
+                                )
+                                .clicked();
+                            if let Some(last) = &rescan_path {
                                 let full = last.display().to_string();
                                 let name = last
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| full.clone());
-                                ui.add_space(8.0);
-                                // Truncate short enough that "Rescan <name>" fits
-                                // within the shared 200px width (min_size only sets
-                                // a floor — a long name would grow past the primary).
-                                let rescan_btn = egui::Button::new(
-                                    egui::RichText::new(format!(
-                                        "Rescan {}",
-                                        middle_truncate(&name, 16)
-                                    ))
-                                    .size(14.0),
-                                )
-                                .min_size(btn_size);
                                 if ui
-                                    .add(rescan_btn)
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(format!(
+                                                "Rescan {}",
+                                                middle_truncate(&name, 20)
+                                            ))
+                                            .size(14.0)
+                                            .color(foreground),
+                                        )
+                                        .truncate()
+                                        .fill(egui::Color32::from_rgb(44, 48, 56))
+                                        .corner_radius(6.0)
+                                        .min_size(egui::vec2(button_width, 40.0)),
+                                    )
                                     .on_hover_text(format!("{full}\nStarts a fresh scan"))
                                     .clicked()
                                 {
-                                    self.start_scan(last.clone());
+                                    scan_path = Some(last.clone());
                                 }
                             }
-                        }
-
-                        if let Some(ref err) = self.error {
-                            ui.add_space(12.0);
-                            ui.colored_label(egui::Color32::RED, err);
-                        }
-                    });
+                        },
+                    );
+                    if let Some(err) = &self.error {
+                        ui.add_space(8.0);
+                        ui.add_sized(
+                            egui::vec2(width, 20.0),
+                            egui::Label::new(
+                                egui::RichText::new(err)
+                                    .color(egui::Color32::from_rgb(239, 106, 108)),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(err);
+                    }
                 });
+                // The new height only takes effect next frame, so ask for one.
+                if (self.volumes_list_height - measured_list_height).abs() > 0.5 {
+                    ctx.request_repaint();
+                }
+                self.volumes_list_height = measured_list_height;
+                if pick_folder {
+                    scan_path = rfd::FileDialog::new().pick_folder();
+                }
+                if let Some(path) = scan_path {
+                    self.start_scan(path);
+                }
                 return;
             }
 
@@ -2388,6 +2630,9 @@ impl eframe::App for App {
                 });
         }
 
+        // Start requests queued by this frame's actions and apply completed
+        // results. A slow device never blocks rendering or scan cancellation.
+        self.poll_disk_queries(ctx);
         self.start_categories();
         if self.category_worker.is_active() || !self.pending_tree_edits.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -2402,6 +2647,25 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_drive_letter_keeps_the_letter() {
+        assert_eq!(split_drive_letter("Windows (C:)"), ("Windows", "(C:)"));
+        assert_eq!(
+            split_drive_letter("Backup and archived files (E:)"),
+            ("Backup and archived files", "(E:)")
+        );
+    }
+
+    #[test]
+    fn split_drive_letter_leaves_other_names_alone() {
+        assert_eq!(split_drive_letter("Macintosh HD"), ("Macintosh HD", ""));
+        assert_eq!(split_drive_letter("Photos (2024)"), ("Photos (2024)", ""));
+        assert_eq!(split_drive_letter("(C:)"), ("(C:)", ""));
+        // A Unix volume that merely looks like one keeps its whole name.
+        assert_eq!(split_drive_letter("Backup (1:)"), ("Backup (1:)", ""));
+        assert_eq!(split_drive_letter("資料 (é:)"), ("資料 (é:)", ""));
+    }
+
     use super::*;
     use disk_cleaner::tree::{DirNode, FileLeaf, FileNode};
 

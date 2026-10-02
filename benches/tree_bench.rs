@@ -285,7 +285,7 @@ fn bench_tree_walks(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("find_node_info_shallow", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| ui::find_node_info(t, &shallow_target)),
+            |b, t| b.iter(|| t.find(&shallow_target).is_some()),
         );
 
         let last_dir = format!("dir_{:05}", tree.children().len().saturating_sub(1));
@@ -293,20 +293,14 @@ fn bench_tree_walks(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("find_node_info_deep", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| ui::find_node_info(t, &deep_target)),
+            |b, t| b.iter(|| t.find(&deep_target).is_some()),
         );
 
         let miss_target = PathBuf::from("root/nope/nada");
         group.bench_with_input(
             BenchmarkId::new("find_node_info_miss", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| ui::find_node_info(t, &miss_target)),
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("find_parent_path", format!("{label}_{n}")),
-            tree,
-            |b, t| b.iter(|| ui::find_parent_path(t, &deep_target)),
+            |b, t| b.iter(|| t.find(&miss_target).is_some()),
         );
     }
 
@@ -319,7 +313,9 @@ fn bench_tree_walks(c: &mut Criterion) {
             b.iter_batched(
                 || build_wide_tree(n_dirs, files_per_dir),
                 |mut t| {
-                    ui::toggle_expand(&mut t, &target);
+                    if let Some(node) = t.find_mut(&target) {
+                        node.set_expanded(!node.expanded());
+                    }
                     t
                 },
                 criterion::BatchSize::LargeInput,
@@ -336,7 +332,9 @@ fn bench_tree_walks(c: &mut Criterion) {
             b.iter_batched(
                 || build_wide_tree(n_dirs, files_per_dir),
                 |mut t| {
-                    ui::set_expanded(&mut t, &target, true);
+                    if let Some(node) = t.find_mut(&target) {
+                        node.set_expanded(true);
+                    }
                     t
                 },
                 criterion::BatchSize::LargeInput,

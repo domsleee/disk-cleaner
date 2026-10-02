@@ -3,6 +3,8 @@
 //! by joining ancestor names.  The root node's name is the absolute scan
 //! path so that reconstruction produces correct absolute paths.
 
+use std::path::Path;
+
 use rayon::prelude::{IntoParallelRefMutIterator, ParallelIterator};
 
 /// Bit 63 of the size field stores the hidden flag; bit 62 marks a hard link
@@ -131,6 +133,30 @@ impl FileNode {
             FileNode::File(_) => None,
         }
     }
+
+    /// The node at `path`, where `path` starts with this node's name.
+    pub fn find(&self, path: &Path) -> Option<&FileNode> {
+        let mut node = self;
+        for name in path.strip_prefix(self.name()).ok()?.components() {
+            let name = name.as_os_str().to_str()?;
+            node = node.children().iter().find(|c| c.name() == name)?;
+        }
+        Some(node)
+    }
+
+    pub fn find_mut(&mut self, path: &Path) -> Option<&mut FileNode> {
+        let rest = path.strip_prefix(self.name()).ok()?;
+        let mut node = self;
+        for name in rest.components() {
+            let name = name.as_os_str().to_str()?;
+            node = node
+                .as_dir_mut()?
+                .children
+                .iter_mut()
+                .find(|c| c.name() == name)?;
+        }
+        Some(node)
+    }
 }
 
 /// Sort children of every directory by descending size. Called once after
@@ -186,6 +212,29 @@ pub fn dir(name: &str, children: Vec<FileNode>) -> FileNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_walks_the_path() {
+        let tree = dir(
+            "root",
+            vec![leaf("a.txt", 10), dir("sub", vec![leaf("deep.txt", 5)])],
+        );
+        assert_eq!(tree.find(Path::new("root")).unwrap().name(), "root");
+        assert_eq!(tree.find(Path::new("root/a.txt")).unwrap().size(), 10);
+        assert_eq!(tree.find(Path::new("root/sub/deep.txt")).unwrap().size(), 5);
+        assert!(tree.find(Path::new("root/sub/nope")).is_none());
+        assert!(tree.find(Path::new("root/a.txt/x")).is_none());
+        assert!(tree.find(Path::new("missing")).is_none());
+    }
+
+    #[test]
+    fn find_mut_toggles_expansion() {
+        let mut tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 1)])]);
+        let sub = tree.find_mut(Path::new("root/sub")).unwrap();
+        sub.set_expanded(!sub.expanded());
+        assert!(tree.children()[0].expanded());
+        assert!(tree.find_mut(Path::new("nope")).is_none());
+    }
 
     #[test]
     fn auto_expand_expands_large_children() {

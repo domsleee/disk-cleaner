@@ -331,7 +331,8 @@ fn toggle_expand_reveals_children_in_visible_paths() {
     );
 
     // Expand the folder
-    ui::toggle_expand(&mut tree, &root.join("folder"));
+    let folder = tree.find_mut(&root.join("folder")).unwrap();
+    folder.set_expanded(!folder.expanded());
 
     let rows = ui::collect_cached_rows(&tree, "", None, true, None, None, None);
     let paths: Vec<_> = rows.iter().map(|r| &r.path).collect();
@@ -523,7 +524,8 @@ fn disclosure_triangle_click_clears_selection() {
     focused_path = Some(triangle_path.clone());
 
     // ToggleExpand action (processed in the second loop)
-    ui::toggle_expand(&mut tree, &triangle_path);
+    let folder = tree.find_mut(&triangle_path).unwrap();
+    folder.set_expanded(!folder.expanded());
     selected_paths.clear(); // <-- the fix under test
 
     // --- Assertions ---

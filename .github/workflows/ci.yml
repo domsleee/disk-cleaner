@@ -11,6 +11,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
       - '*.rs'
   pull_request:
     paths:
@@ -20,6 +21,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
       - '*.rs'
 
 # Cancel in-progress runs on the same branch to avoid wasting CI minutes
@@ -122,7 +124,7 @@ jobs:
 
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Linux cfgs out the NTFS scanner; internal-tools also adds the probe bins.
+  # Linux cfgs out the NTFS scanner; internal-tools also adds the tool bins.
   clippy-windows:
     runs-on: windows-latest
     steps:

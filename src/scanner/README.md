@@ -69,7 +69,7 @@ no gate. Prediction must avoid trial reads that consume the alternative scanner'
 ## Reading and validating records
 
 The reader queries sector, cluster, and record sizes plus `$MFT` valid data length to bound reads and
-calculate positions. The production builder prefers raw-volume reads: record 0's unnamed `$DATA`
+calculate positions. The builder reads the raw volume: record 0's unnamed `$DATA`
 runlist maps virtual cluster numbers (VCNs), positions within the stream, to logical cluster numbers
 (LCNs), positions on the volume, using run lengths and signed LCN deltas.
 
@@ -77,10 +77,9 @@ Record 0's runs must cover the entire valid data length. A fragmented `$MFT` may
 extension records referenced by an attribute list; bootstrap does not follow that list. Insufficient
 coverage is rejected for walker fallback rather than silently losing all later records.
 
-Raw reads use two overlapped slots with 16 MiB buffers; an alternative file-handle path uses 8 MiB
-chunks and a bounded channel of depth 2. Partial records carry across volume-read boundaries.
+Raw reads use two overlapped slots with 16 MiB buffers. Partial records carry across read boundaries.
 Windows can keep writing after `ReadFile` returns, so buffers, slots, and `OVERLAPPED` state remain alive
-until completion. Cancellation and record-limit exits drain queued reads before releasing storage.
+until completion. Cancellation drains queued reads before releasing storage.
 
 An update sequence array (USA) detects inconsistent multi-sector writes. NTFS saves each sector's final
 two bytes and replaces them with a shared marker. Before decoding attributes, the parser checks those
@@ -111,9 +110,7 @@ resolution. Detection covers resident attributes only. A compact child index gro
 contiguously by parent, avoiding per-directory hash lookups and allocations. The root is excluded from
 its own children; a shared atomic visited bitmap prevents recurring directory cycles.
 
-The application skips the diagnostic index's preliminary subtree rollup because `FileNode` computes
-totals itself. Diagnostic and final totals represent different accounting stages, especially before
-hardlink deduplication. Displayed file sizes use **allocation**, matching the walker and #99, rather than
+`FileNode` computes directory totals itself. Displayed file sizes use **allocation**, matching the walker and #99, rather than
 logical length; allocation granularity, sparse holes, and compression can make those quantities differ.
 
 Sparse and compressed `$DATA` spans its whole VCN range. Its `AllocatedSize` counts holes as written,
@@ -122,13 +119,11 @@ so the parser uses `TotalAllocatedSize` for physical storage instead:
 | Field or check | Meaning in this parser |
 |---|---|
 | `AllocatedSize`, `0x28` | Allocation used for ordinary non-resident data. |
-| Logical size, `0x30` | Logical length of the non-resident stream. |
 | `TotalAllocatedSize`, `0x40` | Physical allocation used for sparse or compressed data. |
 | `attr_len >= 0x48` | Required non-resident attribute length, including the eight-byte field at `0x40`. |
 
 These are attribute offsets, unlike record-header offset `0x2C`. Sizes come from the unnamed `$DATA`
-extent with lowest VCN zero. Resident data uses value length for logical size, rounded to an eight-byte
-boundary for allocation. This convention excludes some filesystem overhead: directory totals sum
+extent with lowest VCN zero. Resident data uses its value length rounded up to an eight-byte boundary. This convention excludes some filesystem overhead: directory totals sum
 descendant allocation, not the directories' own metadata storage.
 
 ### Hardlink attribution is a policy
@@ -183,6 +178,3 @@ badge, error counts, and sampled error kinds expose failures but neither recover
 
 **Hidden attributes can be stale.** NTFS does not keep the `$FILE_NAME` hidden-bit copy current.
 Treating dot-prefixed names as hidden is an application convention and does not repair stale attribute data.
-
-**Probes can diverge.** Probe binaries duplicate raw reading and attribute decoding and have already diverged once.
-Decoder changes need review in both implementations; successful probes do not replace direct production comparisons.

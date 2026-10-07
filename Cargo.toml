@@ -95,30 +95,6 @@ bench = false
 required-features = ["internal-tools"]
 
 [[bin]]
-name = "ntfs_probe"
-path = "src/bin/ntfs_probe.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
-name = "ntfs_size_probe"
-path = "src/bin/ntfs_size_probe.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
-name = "ntfs_mft_probe"
-path = "src/bin/ntfs_mft_probe.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
-name = "ntfs_mft_index_probe"
-path = "src/bin/ntfs_mft_index_probe.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
 name = "mft_diff"
 path = "src/bin/mft_diff.rs"
 bench = false

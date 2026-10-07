@@ -122,7 +122,7 @@ jobs:
 
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Linux cfgs out the NTFS scanner; internal-tools also adds the probe bins.
+  # Linux cfgs out the NTFS scanner; internal-tools also adds the tool bins.
   clippy-windows:
     runs-on: windows-latest
     steps:

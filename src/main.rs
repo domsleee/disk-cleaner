@@ -210,26 +210,38 @@ enum ViewMode {
     Treemap,
 }
 
-/// Line 1 is `show_hidden`; the rest is the last scanned path.
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("disk-cleaner").join("settings.txt"))
+    dirs::config_dir().map(|d| d.join("disk-cleaner").join("config.json"))
 }
 
 fn load_config() -> (Option<PathBuf>, bool) {
-    let text = config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    let (show_hidden, last) = text.split_once('\n').unwrap_or((&text, ""));
-    let last = (!last.is_empty()).then(|| PathBuf::from(last));
-    (last, show_hidden == "true")
+    let path = match config_path() {
+        Some(p) => p,
+        None => return (None, false),
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return (None, false),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(_) => return (None, false),
+    };
+    let last = json["last_path"].as_str().map(PathBuf::from);
+    let show_hidden = json["show_hidden"].as_bool().unwrap_or(false);
+    (last, show_hidden)
 }
 
-fn save_config(last_path: &Path, show_hidden: bool) {
+fn save_config(last_path: &std::path::Path, show_hidden: bool) {
     if let Some(config) = config_path() {
         if let Some(parent) = config.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(config, format!("{show_hidden}\n{}", last_path.display()));
+        let json = serde_json::json!({
+            "last_path": last_path.to_string_lossy(),
+            "show_hidden": show_hidden,
+        });
+        let _ = std::fs::write(config, json.to_string());
     }
 }
 
@@ -1381,15 +1393,53 @@ impl eframe::App for App {
                             self.start_scan(path);
                         }
 
-                        if ui.button("Rescan").clicked()
+                        if self.tree.is_some()
+                            && ui.button("Rescan").clicked()
                             && let Some(path) = self.scan_path.clone()
                         {
                             self.start_scan(path);
                         }
 
-                        ui.separator();
-                        ui.selectable_value(&mut self.view_mode, ViewMode::Tree, "Tree");
-                        ui.selectable_value(&mut self.view_mode, ViewMode::Treemap, "Treemap");
+                        // View mode toggle
+                        if self.tree.is_some() {
+                            ui.separator();
+                            for (label, mode) in
+                                [("Tree", ViewMode::Tree), ("Treemap", ViewMode::Treemap)]
+                            {
+                                let is_active = self.view_mode == mode;
+                                let text = if is_active {
+                                    egui::RichText::new(label).strong().size(14.0)
+                                } else {
+                                    egui::RichText::new(label)
+                                        .size(14.0)
+                                        .color(ui.visuals().weak_text_color())
+                                };
+
+                                let btn = egui::Button::new(text)
+                                    .frame(false)
+                                    .min_size(egui::vec2(0.0, 24.0));
+                                let response = ui.add(btn);
+
+                                // Draw underline for active tab
+                                if is_active {
+                                    let rect = response.rect;
+                                    let painter = ui.painter();
+                                    let accent = egui::Color32::from_rgb(100, 180, 255);
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                            egui::vec2(rect.width(), 2.0),
+                                        ),
+                                        0.0,
+                                        accent,
+                                    );
+                                }
+
+                                if response.clicked() {
+                                    self.view_mode = mode;
+                                }
+                            }
+                        }
 
                         // Search/filter bar — hidden: filter feature crashes (DIS-253)
                         // if self.tree.is_some() {
@@ -1515,12 +1565,19 @@ impl eframe::App for App {
                                 .response;
 
                             // Size bar under the label
-                            ui.add(
-                                egui::ProgressBar::new(fraction)
-                                    .desired_height(4.0)
-                                    .corner_radius(1.0)
-                                    .fill(cat.color()),
+                            let bar_height = 4.0;
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), bar_height),
+                                egui::Sense::hover(),
                             );
+                            let painter = ui.painter();
+                            painter.rect_filled(bar_rect, 1.0, ui.visuals().extreme_bg_color);
+                            let fill_w = (bar_rect.width() * fraction.clamp(0.0, 1.0)).max(1.0);
+                            let fill_rect = egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(fill_w, bar_height),
+                            );
+                            painter.rect_filled(fill_rect, 1.0, cat.color());
 
                             ui.horizontal(|ui| {
                                 ui.small(format!(
@@ -1751,25 +1808,43 @@ impl eframe::App for App {
                         });
 
                         // Progress bar (volume scans estimate against used space).
-                        // A small corner radius, like the volume capacity bars — the
-                        // default fully rounded cap reads as a slider thumb.
+                        // Painted flat like the volume capacity bars — the default
+                        // ProgressBar's rounded cap reads as a slider thumb.
                         if self.scan_is_volume
                             && let Some((total, available)) = self.scan_disk_info
                         {
                             let used = total.saturating_sub(available);
                             if used > 0 {
                                 let fraction = (size as f32 / used as f32).clamp(0.0, 1.0);
-                                let pct_str = ui::fmt_pct((fraction * 100.0).into());
+                                let pct = fraction * 100.0;
+                                // "<1%" instead of a flat "0%" while size-based
+                                // progress rounds down but files are streaming in.
+                                let pct_str = if fraction > 0.0 && pct < 1.0 {
+                                    "<1%".to_string()
+                                } else {
+                                    format!("{pct:.0}%")
+                                };
                                 ui.add_space(14.0);
                                 ui.label(egui::RichText::new(pct_str).weak().size(12.0));
                                 ui.add_space(4.0);
-                                ui.add(
-                                    egui::ProgressBar::new(fraction)
-                                        .desired_width(360.0)
-                                        .desired_height(8.0)
-                                        .corner_radius(3.0)
-                                        .fill(egui::Color32::from_rgb(37, 99, 235)),
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(360.0, 8.0),
+                                    egui::Sense::hover(),
                                 );
+                                let painter = ui.painter();
+                                painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+                                let fill_w = rect.width() * fraction;
+                                if fill_w > 0.5 {
+                                    let fill = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(fill_w.max(3.0), 8.0),
+                                    );
+                                    painter.rect_filled(
+                                        fill,
+                                        3.0,
+                                        egui::Color32::from_rgb(37, 99, 235),
+                                    );
+                                }
                             }
                         }
 
@@ -1959,6 +2034,15 @@ impl eframe::App for App {
                                                             }
                                                         },
                                                     );
+                                                    let (bar, _) = ui.allocate_exact_size(
+                                                        egui::vec2(bar_width, bar_height),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(
+                                                        bar,
+                                                        3.0,
+                                                        egui::Color32::from_rgb(40, 45, 54),
+                                                    );
                                                     let color = if fraction > 0.9 {
                                                         egui::Color32::from_rgb(239, 106, 108)
                                                     } else if fraction > 0.7 {
@@ -1966,17 +2050,19 @@ impl eframe::App for App {
                                                     } else {
                                                         egui::Color32::from_rgb(83, 164, 233)
                                                     };
-                                                    ui.scope(|ui| {
-                                                        ui.visuals_mut().extreme_bg_color =
-                                                            egui::Color32::from_rgb(40, 45, 54);
-                                                        ui.add(
-                                                            egui::ProgressBar::new(fraction)
-                                                                .desired_width(bar_width)
-                                                                .desired_height(bar_height)
-                                                                .corner_radius(3.0)
-                                                                .fill(color),
-                                                        );
-                                                    });
+                                                    ui.painter().rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            bar.min,
+                                                            egui::vec2(
+                                                                (bar.width()
+                                                                    * fraction.clamp(0.0, 1.0))
+                                                                .max(1.0),
+                                                                bar.height(),
+                                                            ),
+                                                        ),
+                                                        3.0,
+                                                        color,
+                                                    );
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(
                                                             egui::Align::Center,

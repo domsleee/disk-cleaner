@@ -8,9 +8,51 @@ use std::path::{Path, PathBuf};
 /// Returns a fill color based on file extension category.
 pub fn extension_color(name: &str, is_dir: bool) -> egui::Color32 {
     if is_dir {
-        egui::Color32::from_rgb(70, 75, 85)
-    } else {
-        crate::categories::categorize(name).color()
+        return egui::Color32::from_rgb(70, 75, 85);
+    }
+    let ext = name.rsplit('.').next().unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        // Video — red
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" => {
+            egui::Color32::from_rgb(192, 57, 43)
+        }
+        // Image — green
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "svg" | "webp" | "tiff" | "ico" | "heic" => {
+            egui::Color32::from_rgb(39, 174, 96)
+        }
+        // Audio — purple
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" | "opus" => {
+            egui::Color32::from_rgb(142, 68, 173)
+        }
+        // Documents — blue
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "rtf" | "csv"
+        | "pages" | "numbers" | "key" => egui::Color32::from_rgb(41, 128, 185),
+        // Archives — orange
+        "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" | "xz" | "tgz" | "zst" | "dmg" | "iso" => {
+            egui::Color32::from_rgb(211, 84, 0)
+        }
+        // Source code — teal
+        "rs" | "js" | "ts" | "py" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "rb" | "swift"
+        | "kt" | "cs" | "jsx" | "tsx" | "vue" | "svelte" => egui::Color32::from_rgb(22, 160, 133),
+        // Config/data — dark blue-gray
+        "json" | "yaml" | "yml" | "toml" | "xml" | "ini" | "cfg" | "conf" | "lock" => {
+            egui::Color32::from_rgb(44, 62, 80)
+        }
+        // Web/markup — light teal
+        "html" | "htm" | "css" | "scss" | "sass" | "less" | "md" | "mdx" => {
+            egui::Color32::from_rgb(26, 188, 156)
+        }
+        // Build artifacts — dark red
+        "o" | "obj" | "a" | "lib" | "rlib" | "d" | "rmeta" | "wasm" | "class" => {
+            egui::Color32::from_rgb(146, 43, 33)
+        }
+        // Executables — bright orange
+        "exe" | "dll" | "so" | "dylib" | "app" | "bin" | "msi" | "deb" | "rpm" => {
+            egui::Color32::from_rgb(230, 126, 34)
+        }
+        // Temp/logs — gray
+        "log" | "tmp" | "cache" | "bak" | "swp" | "swo" => egui::Color32::from_rgb(127, 140, 141),
+        _ => egui::Color32::from_rgb(93, 109, 126),
     }
 }
 
@@ -507,11 +549,35 @@ pub fn render_treemap(
     let build =
         |rect: egui::Rect| build_treemap_cache(root, zoom_path, category_filter, show_hidden, rect);
 
+    let root_path = PathBuf::from(root.name());
+
     // ── Breadcrumb bar ──
-    // The first frame builds at the full size; the size check below redoes it.
-    let cached = cache.get_or_insert_with(|| build(ui.available_rect_before_wrap()));
-    let crumbs = &cached.breadcrumbs;
-    let size_label = &*cached.view_size_label;
+    // Use cached breadcrumbs when available to avoid O(N) tree walk every frame.
+    // On first frame (cache not yet built), compute inline.
+    let have_cached_crumbs = cache.is_some();
+    let inline_crumbs;
+    let crumbs: &[(String, PathBuf)] = if have_cached_crumbs {
+        &cache.as_ref().unwrap().breadcrumbs
+    } else {
+        inline_crumbs = zoom_path
+            .as_ref()
+            .map(|p| breadcrumbs(root, p))
+            .unwrap_or_else(|| vec![(root.name().to_string(), root_path)]);
+        &inline_crumbs
+    };
+    let view_size_label: Option<&str> = cache.as_ref().map(|c| c.view_size_label.as_ref());
+    let inline_size_label;
+    let size_label = if let Some(l) = view_size_label {
+        l
+    } else {
+        let view_size = if let Some(zp) = zoom_path {
+            root.find(zp).map_or(root.size(), |n| n.size())
+        } else {
+            root.size()
+        };
+        inline_size_label = format!("  ({})", ByteSize::b(view_size));
+        &inline_size_label
+    };
 
     ui.horizontal(|ui| {
         if crumbs.len() > 1 {
@@ -559,6 +625,7 @@ pub fn render_treemap(
 
     // ── Rebuild cache if needed (AFTER breadcrumbs so full_rect is correct) ──
     let needs_rebuild = *cache_dirty
+        || cache.is_none()
         || cache.as_ref().is_some_and(|c| {
             (c.layout_size.0 - full_rect.width()).abs() > 1.0
                 || (c.layout_size.1 - full_rect.height()).abs() > 1.0
@@ -975,6 +1042,56 @@ mod tests {
         let tree = dir("root", vec![leaf("a.txt", 10)]);
         let bc = breadcrumbs(&tree, Path::new("missing"));
         assert_eq!(bc.len(), 1);
+    }
+
+    #[test]
+    fn extension_color_video() {
+        let c = extension_color("movie.mp4", false);
+        assert_eq!(c, egui::Color32::from_rgb(192, 57, 43));
+    }
+
+    #[test]
+    fn extension_color_categories() {
+        // Audio
+        assert_eq!(
+            extension_color("song.mp3", false),
+            egui::Color32::from_rgb(142, 68, 173)
+        );
+        // Image
+        assert_eq!(
+            extension_color("photo.png", false),
+            egui::Color32::from_rgb(39, 174, 96)
+        );
+        // Archive
+        assert_eq!(
+            extension_color("backup.zip", false),
+            egui::Color32::from_rgb(211, 84, 0)
+        );
+        // Source code
+        assert_eq!(
+            extension_color("main.rs", false),
+            egui::Color32::from_rgb(22, 160, 133)
+        );
+        // Document
+        assert_eq!(
+            extension_color("report.pdf", false),
+            egui::Color32::from_rgb(41, 128, 185)
+        );
+        // Config
+        assert_eq!(
+            extension_color("config.json", false),
+            egui::Color32::from_rgb(44, 62, 80)
+        );
+        // Build artifact
+        assert_eq!(
+            extension_color("module.o", false),
+            egui::Color32::from_rgb(146, 43, 33)
+        );
+        // Unknown → default gray
+        assert_eq!(
+            extension_color("random.xyz", false),
+            egui::Color32::from_rgb(93, 109, 126)
+        );
     }
 
     #[test]

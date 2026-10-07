@@ -584,6 +584,7 @@ dependencies = [
  "raw-window-handle",
  "rayon",
  "rfd",
+ "serde_json",
  "smallvec",
  "tempfile",
  "trash",

@@ -33,9 +33,9 @@ mod embedded {
         name: &str,
         png_bytes: &[u8],
     ) -> Option<egui::TextureHandle> {
-        let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+        let icon = eframe::icon_data::from_png_bytes(png_bytes).ok()?;
+        let size = [icon.width as usize, icon.height as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &icon.rgba);
         Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
     }
 

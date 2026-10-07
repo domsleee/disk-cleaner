@@ -17,7 +17,6 @@ dirs = "7"
 serde_json = "1"
 libc = "0.2"
 rayon = "1.11.0"
-image = { version = "0.25", default-features = false, features = ["png"] }
 mimalloc = "0.1.52"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -79,12 +78,6 @@ bench = false
 [[bin]]
 name = "scan_only"
 path = "src/bin/scan_only.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
-name = "gen_icon"
-path = "src/bin/gen_icon.rs"
 bench = false
 required-features = ["internal-tools"]
 

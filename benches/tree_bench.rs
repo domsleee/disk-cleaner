@@ -285,7 +285,12 @@ fn bench_tree_walks(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("find_node_info_shallow", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| t.find(&shallow_target).is_some()),
+            |b, t| {
+                b.iter(|| {
+                    t.find(&shallow_target)
+                        .map(|node| (node.is_dir(), node.expanded(), !node.children().is_empty()))
+                })
+            },
         );
 
         let last_dir = format!("dir_{:05}", tree.children().len().saturating_sub(1));
@@ -293,14 +298,24 @@ fn bench_tree_walks(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("find_node_info_deep", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| t.find(&deep_target).is_some()),
+            |b, t| {
+                b.iter(|| {
+                    t.find(&deep_target)
+                        .map(|node| (node.is_dir(), node.expanded(), !node.children().is_empty()))
+                })
+            },
         );
 
         let miss_target = PathBuf::from("root/nope/nada");
         group.bench_with_input(
             BenchmarkId::new("find_node_info_miss", format!("{label}_{n}")),
             tree,
-            |b, t| b.iter(|| t.find(&miss_target).is_some()),
+            |b, t| {
+                b.iter(|| {
+                    t.find(&miss_target)
+                        .map(|node| (node.is_dir(), node.expanded(), !node.children().is_empty()))
+                })
+            },
         );
     }
 
@@ -455,6 +470,24 @@ fn bench_collect_visible_paths(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("all_expanded", n), &tree, |b, t| {
             b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, None))
         });
+    }
+
+    // Expanded loose-file groups exercise the row collector's separate file path.
+    for &(n_dirs, files_per_dir) in &[(500, 20), (5000, 20)] {
+        let tree = build_expanded_tree(n_dirs, files_per_dir);
+        let expanded: HashSet<PathBuf> = tree
+            .children()
+            .iter()
+            .map(|child| PathBuf::from(tree.name()).join(child.name()))
+            .collect();
+        let n = count_nodes(&tree);
+        group.bench_with_input(
+            BenchmarkId::new("file_groups_expanded", n),
+            &tree,
+            |b, t| {
+                b.iter(|| ui::collect_cached_rows(t, "", None, true, None, None, Some(&expanded)))
+            },
+        );
     }
 
     // Root only expanded (default after scan) — best case

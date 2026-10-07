@@ -20,6 +20,7 @@ A fast, native cross-platform desktop app to visualize disk usage and clean up l
 - Treemap visualization
 - Trash or delete files directly from the UI
 - Resume previous scans
+- macOS native file icons
 
 ## Install
 

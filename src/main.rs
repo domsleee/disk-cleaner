@@ -20,12 +20,6 @@ use std::time::{Duration, Instant};
 
 use scanner::ScanProgress;
 
-fn debug_enabled() -> bool {
-    use std::sync::OnceLock;
-    static DEBUG: OnceLock<bool> = OnceLock::new();
-    *DEBUG.get_or_init(|| std::env::var("DISK_CLEANER_DEBUG").is_ok_and(|v| v == "1"))
-}
-
 fn format_elapsed(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs >= 3600 {
@@ -100,9 +94,6 @@ fn set_dark_titlebar(cc: &eframe::CreationContext<'_>) {
             return;
         }
     }
-    if debug_enabled() {
-        eprintln!("[titlebar] the dark caption attribute was rejected");
-    }
 }
 
 /// Group an integer with thousands separators, e.g. `13544` -> `13,544`.
@@ -120,13 +111,11 @@ fn group_thousands(n: u64) -> String {
 }
 
 fn write_fallback_report(
-    scan_path: Option<&std::path::Path>,
+    scan_path: Option<&Path>,
     duration: Option<Duration>,
-    total: u64,
-    access_denied: u64,
-    bulk_scan: u64,
-    details: &[scanner::ScanFallbackDetail],
+    progress: &ScanProgress,
 ) -> std::io::Result<PathBuf> {
+    let details = progress.fallback_details_snapshot();
     let report_dir = std::env::temp_dir().join("disk-cleaner");
     std::fs::create_dir_all(&report_dir)?;
     let stamp = std::time::SystemTime::now()
@@ -144,7 +133,7 @@ fn write_fallback_report(
     if let Some(duration) = duration {
         text.push_str(&format!("Scan duration: {}\n", format_elapsed(duration)));
     }
-    if let Some(summary) = scanner::format_fallback_summary(total, access_denied, bulk_scan) {
+    if let Some(summary) = fallback_summary(progress) {
         text.push_str(&format!("Summary: {summary}\n"));
     }
     text.push_str(&format!("Captured entries: {}\n\n", details.len()));
@@ -168,59 +157,48 @@ fn write_fallback_report(
     Ok(report_path)
 }
 
-fn open_text_report(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("notepad").arg(path).spawn()?;
-        Ok(())
-    }
+/// `None` when the scan needed no fallbacks.
+fn fallback_summary(progress: &ScanProgress) -> Option<String> {
+    scanner::format_fallback_summary(
+        progress.fallback_count.load(Ordering::Relaxed),
+        progress
+            .access_denied_fallback_count
+            .load(Ordering::Relaxed),
+        progress.bulk_scan_fallback_count.load(Ordering::Relaxed),
+    )
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(path).spawn()?;
-        Ok(())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open").arg(path).spawn()?;
-        Ok(())
-    }
+fn open_text_report(path: &Path) -> std::io::Result<()> {
+    let program = if cfg!(windows) {
+        "notepad"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(program).arg(path).spawn().map(drop)
 }
 
 /// Reveal a path in the OS file manager, selecting/highlighting it where the
 /// platform supports it.
-fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let (program, args): (&str, Vec<std::ffi::OsString>) = if cfg!(windows) {
         // explorer.exe expects `/select,<path>` as a single argument and
         // wants Windows-style separators.
-        Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn()?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg("-R").arg(path).spawn()?;
-        Ok(())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
+        (
+            "explorer",
+            vec![format!("/select,{}", path.display()).into()],
+        )
+    } else if cfg!(target_os = "macos") {
+        ("open", vec!["-R".into(), path.into()])
+    } else {
         // No portable "select" on Linux file managers, so open the
         // containing folder instead.
-        let target = path.parent().unwrap_or(path);
-        Command::new("xdg-open").arg(target).spawn()?;
-        Ok(())
-    }
+        ("xdg-open", vec![path.parent().unwrap_or(path).into()])
+    };
+    Command::new(program).args(args).spawn().map(drop)
 }
 
-/// Publish the tree as soon as scanning finishes; category totals follow separately.
-struct ScanResult {
-    tree: tree::FileNode,
-}
 use tree::FileNode;
 use treemap::TreemapAction;
 
@@ -291,7 +269,8 @@ fn print_help() {
     eprintln!("  -h, --help             Print this help message");
 }
 
-/// `scan_path` as its argument, so a whole-drive scan can take the raw NTFS
+/// Relaunch this executable elevated (UAC) with `scan_path` as its argument,
+/// so a whole-drive scan can take the raw NTFS MFT path.
 #[cfg(target_os = "windows")]
 fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -322,7 +301,8 @@ fn relaunch_elevated(scan_path: &std::path::Path) -> Result<(), String> {
             SW_SHOWNORMAL,
         )
     } as usize;
-    // Documented as "greater than 32 on success"; 5 is the UAC prompt being
+    // Documented as "greater than 32 on success"; 5 is SE_ERR_ACCESSDENIED,
+    // i.e. the UAC prompt being declined.
     match rc {
         code if code > 32 => Ok(()),
         5 => Err("permission was declined".to_string()),
@@ -336,8 +316,6 @@ fn relaunch_elevated(_scan_path: &std::path::Path) -> Result<(), String> {
 }
 
 fn main() -> eframe::Result {
-    let process_start = Instant::now();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_path: Option<PathBuf> = None;
     let mut screenshot_prefix: Option<String> = None;
@@ -424,7 +402,7 @@ fn main() -> eframe::Result {
             #[cfg(target_os = "windows")]
             set_dark_titlebar(cc);
             let mut app = App {
-                process_start: Some(process_start),
+                show_window: true,
                 screenshot_prefix: screenshot_prefix.clone(),
                 screenshot_state: if screenshot_prefix.is_some() {
                     ScreenshotState::WaitingForView
@@ -491,7 +469,7 @@ struct App {
     scanning: bool,
     scan_path: Option<PathBuf>,
     scan_progress: Arc<ScanProgress>,
-    receiver: Option<mpsc::Receiver<ScanResult>>,
+    receiver: Option<mpsc::Receiver<FileNode>>,
     error: Option<String>,
     confirm_delete: Option<PendingDelete>,
     confirm_batch_delete: Option<PendingBatchDelete>,
@@ -501,7 +479,6 @@ struct App {
     /// When the search text last changed (for debouncing).
     search_changed_at: Option<Instant>,
     focused_path: Option<PathBuf>,
-    last_scan_path: Option<PathBuf>,
     view_mode: ViewMode,
     treemap_zoom: Option<PathBuf>,
     treemap_zoom_anim: Option<f64>,
@@ -518,13 +495,7 @@ struct App {
     category_stats: Option<categories::CategoryStats>,
     show_hidden: bool,
     icon_cache: Option<icons::IconCache>,
-    last_scan_file_count: u64,
-    last_scan_total_size: u64,
     last_scan_duration: Option<Duration>,
-    last_scan_fallback_count: u64,
-    last_scan_access_denied_fallback_count: u64,
-    last_scan_bulk_scan_fallback_count: u64,
-    last_scan_fallback_details: Vec<scanner::ScanFallbackDetail>,
     show_categories: bool,
     tree_scroll_to_focus: bool,
     /// Cached visible row list for rendering; rebuilt when dirty.
@@ -545,10 +516,8 @@ struct App {
     selection_anchor: Option<PathBuf>,
     /// Tracks which file groups in the tree view are expanded.
     expanded_file_groups: HashSet<PathBuf>,
-    /// Process start time for measuring startup latency.
-    process_start: Option<Instant>,
-    /// Frame-time tracking during scans.
-    scan_frame_times: Vec<Duration>,
+    /// The window starts hidden; show it once the first frame has rendered.
+    show_window: bool,
     /// Start of the current scan for total duration tracking.
     scan_start_time: Option<Instant>,
     /// Screenshot mode: file prefix for output PNGs.
@@ -569,14 +538,14 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        let (last_scan_path, show_hidden) = load_config();
+        let (scan_path, show_hidden) = load_config();
         Self {
             tree: None,
             category_worker: Default::default(),
             category_failed: false,
             pending_tree_edits: Vec::new(),
             scanning: false,
-            scan_path: None,
+            scan_path,
             scan_progress: Arc::new(ScanProgress {
                 file_count: 0.into(),
                 total_size: 0.into(),
@@ -597,7 +566,6 @@ impl Default for App {
             applied_search: String::new(),
             search_changed_at: None,
             focused_path: None,
-            last_scan_path,
             view_mode: ViewMode::Tree,
             treemap_zoom: None,
             treemap_zoom_anim: None,
@@ -616,13 +584,7 @@ impl Default for App {
             category_stats: None,
             show_hidden,
             icon_cache: None,
-            last_scan_file_count: 0,
-            last_scan_total_size: 0,
             last_scan_duration: None,
-            last_scan_fallback_count: 0,
-            last_scan_access_denied_fallback_count: 0,
-            last_scan_bulk_scan_fallback_count: 0,
-            last_scan_fallback_details: Vec::new(),
             show_categories: false,
             tree_scroll_to_focus: false,
             cached_rows: Vec::new(),
@@ -634,8 +596,7 @@ impl Default for App {
             selected_paths: HashSet::new(),
             selection_anchor: None,
             expanded_file_groups: HashSet::new(),
-            process_start: None,
-            scan_frame_times: Vec::new(),
+            show_window: false,
             scan_start_time: None,
             screenshot_prefix: None,
             screenshot_state: ScreenshotState::Idle,
@@ -683,20 +644,14 @@ impl App {
     }
 
     fn open_fallback_report(&mut self) {
-        match write_fallback_report(
+        if let Err(err) = write_fallback_report(
             self.scan_path.as_deref(),
             self.last_scan_duration,
-            self.last_scan_fallback_count,
-            self.last_scan_access_denied_fallback_count,
-            self.last_scan_bulk_scan_fallback_count,
-            &self.last_scan_fallback_details,
+            &self.scan_progress,
         )
         .and_then(|path| open_text_report(&path))
         {
-            Ok(()) => {}
-            Err(err) => {
-                self.error = Some(format!("Could not open compatibility report: {err}"));
-            }
+            self.error = Some(format!("Could not open compatibility report: {err}"));
         }
     }
 
@@ -705,7 +660,6 @@ impl App {
         self.scan_progress.cancelled.store(true, Ordering::Relaxed);
 
         save_config(&path, self.show_hidden);
-        self.last_scan_path = Some(path.clone());
         self.scanning = true;
         self.error = None;
         self.category_worker.cancel();
@@ -740,16 +694,11 @@ impl App {
 
         self.scan_start_time = Some(Instant::now());
         self.last_scan_duration = None;
-        self.last_scan_fallback_count = 0;
-        self.last_scan_access_denied_fallback_count = 0;
-        self.last_scan_bulk_scan_fallback_count = 0;
-        self.last_scan_fallback_details.clear();
-        self.scan_frame_times.clear();
 
         thread::spawn(move || {
             let mut tree = scanner::scan_directory(&path, progress);
             tree::auto_expand(&mut tree, 0, 2);
-            let _ = tx.send(ScanResult { tree });
+            let _ = tx.send(tree);
         });
     }
 
@@ -774,10 +723,14 @@ impl App {
         for edit in self.pending_tree_edits.drain(..) {
             match edit {
                 TreeEdit::Toggle(path) => {
-                    ui::toggle_expand(tree, &path);
+                    if let Some(node) = tree.find_mut(&path) {
+                        node.set_expanded(!node.expanded());
+                    }
                 }
                 TreeEdit::Expand(path, expanded) => {
-                    ui::set_expanded(tree, &path, expanded);
+                    if let Some(node) = tree.find_mut(&path) {
+                        node.set_expanded(expanded);
+                    }
                 }
                 TreeEdit::Remove(path) => {
                     removed |= ui::remove_node(tree, &path).is_some();
@@ -877,6 +830,22 @@ impl App {
         self.text_cache_memo = None;
     }
 
+    /// Move keyboard focus to `path`, clearing the selection so only the
+    /// focused row is highlighted.
+    fn focus_row(&mut self, path: PathBuf) {
+        self.focused_path = Some(path);
+        self.selected_paths.clear();
+        self.tree_scroll_to_focus = true;
+    }
+
+    fn focus_next_row(&mut self, path: &Path) {
+        if let Some(idx) = self.cached_rows.iter().position(|r| r.path == path)
+            && let Some(next) = self.cached_rows.get(idx + 1)
+        {
+            self.focus_row(next.path.clone());
+        }
+    }
+
     /// Mark both tree-view and treemap caches as needing rebuild.
     fn mark_dirty(&mut self) {
         self.rows_dirty = true;
@@ -887,16 +856,6 @@ impl App {
         let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
         let targets = self.batch_targets(paths);
         self.deleter.start(targets, true);
-    }
-
-    /// Expand one tree-row path into the real paths it represents.
-    fn deletion_targets(&self, path: &Path) -> Vec<PathBuf> {
-        resolve_deletion_targets(
-            &self.cached_rows,
-            self.tree.as_deref(),
-            path,
-            self.show_hidden,
-        )
     }
 
     /// Expand a batch of selected row paths into a de-duplicated target list.
@@ -923,7 +882,7 @@ impl App {
     /// Build a confirmed-delete plan, resolving targets now so a later "Yes"
     /// click is unaffected by intervening scroll, collapse, or rescan.
     fn pending_delete_for(&self, path: &Path) -> PendingDelete {
-        let targets = self.deletion_targets(path);
+        let targets = self.batch_targets(vec![path.to_path_buf()]);
         let is_group = row_is_file_group(&self.cached_rows, path);
         let prompt = if is_group {
             let dir = path.parent().unwrap_or(path);
@@ -944,19 +903,17 @@ impl App {
 
     /// Poll for background deletion completion and apply results to the tree.
     fn poll_delete_completion(&mut self) {
-        if let deleter::PollResult::Done(results) = self.deleter.poll() {
-            let mut deleted_paths = Vec::new();
+        if let Some(results) = self.deleter.poll() {
+            let mut deleted_any = false;
             for (path, err) in results {
                 if let Some(msg) = err {
                     self.error = Some(format!("Delete failed: {msg}"));
                 } else {
-                    if self.tree.is_some() {
-                        self.edit_tree(TreeEdit::Remove(path.clone()));
-                    }
-                    deleted_paths.push(path);
+                    self.edit_tree(TreeEdit::Remove(path));
+                    deleted_any = true;
                 }
             }
-            if !deleted_paths.is_empty() {
+            if deleted_any {
                 self.refresh_disk_info();
             }
         }
@@ -987,6 +944,59 @@ impl App {
     }
 }
 
+/// A centered yes/cancel dialog: `Some(true)` on yes (or Enter), `Some(false)`
+/// on cancel, `None` while still open.
+fn confirm_window(ctx: &egui::Context, title: &str, text: &str, yes_label: &str) -> Option<bool> {
+    let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let mut answer = None;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(text);
+            ui.horizontal(|ui| {
+                let yes =
+                    egui::Button::new(egui::RichText::new(yes_label).color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(220, 50, 50));
+                if ui.add(yes).clicked() || enter_pressed {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = answer.or(Some(false));
+                }
+            });
+        });
+    answer
+}
+
+/// A floating bar anchored above the bottom edge of the window.
+fn floating_bar(
+    ctx: &egui::Context,
+    id: &str,
+    interactable: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Area::new(egui::Id::new(id))
+        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
+        .interactable(interactable)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .inner_margin(egui::Margin::symmetric(16, 8))
+                .corner_radius(8.0)
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 2],
+                    blur: 8,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(60),
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(add_contents);
+                });
+        });
+}
+
 /// True if `path` is a synthetic file-group row among the rendered rows.
 ///
 /// The single source of truth for group identity: never the path string or
@@ -996,7 +1006,12 @@ fn row_is_file_group(rows: &[ui::CachedRow], path: &Path) -> bool {
     rows.iter().any(|r| r.is_file_group && r.path == path)
 }
 
-/// Expand a batch of selected row paths into a de-duplicated target list.
+/// Expand selected row paths into the de-duplicated real paths a delete should
+/// touch.
+///
+/// Identity comes from the rendered rows, never the filesystem: a path is a
+/// group only if a rendered row carries it with `is_file_group`. A group
+/// expands to the loose files in its parent dir; anything else maps to itself.
 /// Group-row paths are collected once so each lookup is O(1), keeping batch
 /// resolution O(rows + selected) rather than O(rows*selected).
 fn resolve_batch_targets(
@@ -1026,27 +1041,6 @@ fn resolve_batch_targets(
         }
     }
     targets
-}
-
-/// Expand a tree-row path into the real paths a delete should touch.
-///
-/// Identity comes from the rendered rows, never the filesystem: `path` is a
-/// group only if a rendered row carries it with `is_file_group`. A group
-/// expands to the loose files in its parent dir; anything else maps to itself.
-fn resolve_deletion_targets(
-    rows: &[ui::CachedRow],
-    tree: Option<&FileNode>,
-    path: &Path,
-    show_hidden: bool,
-) -> Vec<PathBuf> {
-    if row_is_file_group(rows, path) {
-        match (path.parent(), tree) {
-            (Some(dir), Some(tree)) => ui::file_group_files(tree, dir, show_hidden),
-            _ => Vec::new(),
-        }
-    } else {
-        vec![path.to_path_buf()]
-    }
 }
 
 fn save_screenshot_png(
@@ -1089,14 +1083,9 @@ impl eframe::App for App {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let frame_start = Instant::now();
-
         // Show window on first frame (was created hidden to avoid white flash)
-        if let Some(start) = self.process_start.take() {
+        if std::mem::take(&mut self.show_window) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            if debug_enabled() {
-                eprintln!("[perf] startup → first frame: {:?}", start.elapsed());
-            }
         }
 
         self.keep_titlebar_dark(ctx);
@@ -1117,74 +1106,17 @@ impl eframe::App for App {
 
         // Check if scan completed
         if let Some(ref rx) = self.receiver
-            && let Ok(result) = rx.try_recv()
+            && let Ok(tree) = rx.try_recv()
         {
             self.category_stats = None;
             self.category_failed = false;
-            self.tree = Some(Arc::new(result.tree));
+            self.tree = Some(Arc::new(tree));
             self.invalidate_match_memos();
-            self.last_scan_file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
-            self.last_scan_total_size = self.scan_progress.total_size.load(Ordering::Relaxed);
-            self.last_scan_fallback_count =
-                self.scan_progress.fallback_count.load(Ordering::Relaxed);
-            self.last_scan_access_denied_fallback_count = self
-                .scan_progress
-                .access_denied_fallback_count
-                .load(Ordering::Relaxed);
-            self.last_scan_bulk_scan_fallback_count = self
-                .scan_progress
-                .bulk_scan_fallback_count
-                .load(Ordering::Relaxed);
-            self.last_scan_fallback_details = self.scan_progress.fallback_details_snapshot();
             self.scanning = false;
             self.receiver = None;
             self.category_filter = None;
             self.mark_dirty();
-
-            // Report frame-time stats for the scan
-            if let Some(scan_start) = self.scan_start_time.take() {
-                let scan_dur = scan_start.elapsed();
-                self.last_scan_duration = Some(scan_dur);
-                if debug_enabled() {
-                    let ft = &mut self.scan_frame_times;
-                    ft.sort();
-                    let n = ft.len();
-                    if n > 0 {
-                        let avg: Duration = ft.iter().sum::<Duration>() / n as u32;
-                        let p99 = ft[((n as f64 * 0.99) as usize).min(n - 1)];
-                        let over = ft
-                            .iter()
-                            .filter(|d| **d > Duration::from_millis(16))
-                            .count();
-                        eprintln!(
-                            "[perf] scan done in {scan_dur:?} ({} files)",
-                            self.last_scan_file_count
-                        );
-                        if self.last_scan_fallback_count > 0 {
-                            eprintln!(
-                                "[perf] windows bulk fallbacks: {}",
-                                scanner::format_fallback_summary(
-                                    self.last_scan_fallback_count,
-                                    self.last_scan_access_denied_fallback_count,
-                                    self.last_scan_bulk_scan_fallback_count
-                                )
-                                .unwrap_or_else(|| self.last_scan_fallback_count.to_string())
-                            );
-                        }
-                        eprintln!(
-                            "[perf] frame times (n={n}): min={:?} med={:?} avg={avg:?} p99={p99:?} max={:?}",
-                            ft[0],
-                            ft[n / 2],
-                            ft[n - 1]
-                        );
-                        eprintln!(
-                            "[perf] frames >16ms: {over}/{n} ({:.1}%)",
-                            over as f64 / n as f64 * 100.0
-                        );
-                    }
-                }
-                self.scan_frame_times.clear();
-            }
+            self.last_scan_duration = self.scan_start_time.take().map(|start| start.elapsed());
         }
 
         // Check if background deletion completed
@@ -1325,24 +1257,24 @@ impl eframe::App for App {
                 )
             });
 
-            if up || down {
+            if (up || down) && !self.cached_rows.is_empty() {
                 let rows = &self.cached_rows;
-                if !rows.is_empty() {
-                    if let Some(ref focused) = self.focused_path {
-                        if let Some(idx) = rows.iter().position(|r| &r.path == focused) {
-                            let new_idx = if up {
-                                idx.saturating_sub(1)
-                            } else {
-                                (idx + 1).min(rows.len() - 1)
-                            };
-                            self.focused_path = Some(rows[new_idx].path.clone());
+                let target = match &self.focused_path {
+                    None => Some(0),
+                    Some(focused) => rows.iter().position(|r| &r.path == focused).map(|idx| {
+                        if up {
+                            idx.saturating_sub(1)
+                        } else {
+                            (idx + 1).min(rows.len() - 1)
                         }
-                    } else {
-                        self.focused_path = Some(rows[0].path.clone());
+                    }),
+                };
+                match target {
+                    Some(idx) => self.focus_row(rows[idx].path.clone()),
+                    None => {
+                        self.selected_paths.clear();
+                        self.tree_scroll_to_focus = true;
                     }
-                    // Clear selection so only the focused row is highlighted
-                    self.selected_paths.clear();
-                    self.tree_scroll_to_focus = true;
                 }
             }
 
@@ -1364,52 +1296,35 @@ impl eframe::App for App {
                                 self.mark_dirty();
                             } else {
                                 // Already collapsed — navigate to parent directory
-                                self.focused_path = Some(parent_dir.to_path_buf());
-                                self.selected_paths.clear();
-                                self.tree_scroll_to_focus = true;
+                                self.focus_row(key);
                             }
-                        } else if right {
-                            if !group_expanded {
-                                self.expanded_file_groups.insert(key);
-                                self.mark_dirty();
-                            } else {
-                                // Already expanded — move focus to first child row
-                                let rows = &self.cached_rows;
-                                if let Some(idx) = rows.iter().position(|r| &r.path == focused)
-                                    && idx + 1 < rows.len()
-                                {
-                                    self.focused_path = Some(rows[idx + 1].path.clone());
-                                    self.selected_paths.clear();
-                                    self.tree_scroll_to_focus = true;
-                                }
-                            }
+                        } else if !group_expanded {
+                            self.expanded_file_groups.insert(key);
+                            self.mark_dirty();
+                        } else {
+                            // Already expanded — move focus to first child row
+                            self.focus_next_row(focused);
                         }
                     }
                 } else if let Some(ref tree) = self.tree
-                    && let Some((is_dir, expanded, has_children)) =
-                        ui::find_node_info(tree, focused)
+                    && let Some(node) = tree.find(focused)
                 {
+                    let (is_dir, expanded) = (node.is_dir(), node.expanded());
+                    let has_children = !node.children().is_empty();
+                    let parent = (focused != Path::new(tree.name()))
+                        .then(|| focused.parent())
+                        .flatten()
+                        .map(Path::to_path_buf);
                     if left {
                         if is_dir && expanded {
                             self.edit_tree(TreeEdit::Expand(focused.clone(), false));
-                        } else if let Some(parent) = ui::find_parent_path(tree, focused) {
-                            self.focused_path = Some(parent);
-                            self.selected_paths.clear();
-                            self.tree_scroll_to_focus = true;
+                        } else if let Some(parent) = parent {
+                            self.focus_row(parent);
                         }
-                    } else if right {
-                        if is_dir && !expanded && has_children {
-                            self.edit_tree(TreeEdit::Expand(focused.clone(), true));
-                        } else if is_dir && expanded {
-                            let rows = &self.cached_rows;
-                            if let Some(idx) = rows.iter().position(|r| &r.path == focused)
-                                && idx + 1 < rows.len()
-                            {
-                                self.focused_path = Some(rows[idx + 1].path.clone());
-                                self.selected_paths.clear();
-                                self.tree_scroll_to_focus = true;
-                            }
-                        }
+                    } else if is_dir && !expanded && has_children {
+                        self.edit_tree(TreeEdit::Expand(focused.clone(), true));
+                    } else if is_dir && expanded {
+                        self.focus_next_row(focused);
                     }
                 }
             }
@@ -1427,7 +1342,7 @@ impl eframe::App for App {
                 } else if shift_del {
                     self.confirm_delete = Some(self.pending_delete_for(focused));
                 } else if del {
-                    let targets = self.deletion_targets(focused);
+                    let targets = self.batch_targets(vec![focused.clone()]);
                     self.selected_paths.remove(focused);
                     self.deleter.start(targets, true);
                     self.focused_path = None;
@@ -1435,83 +1350,29 @@ impl eframe::App for App {
             }
         }
 
-        // Batch delete confirmation dialog
-        let mut do_batch_delete = false;
-        let mut close_batch_dialog = false;
-
-        if let Some(ref pending) = self.confirm_batch_delete {
-            let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            egui::Window::new("Confirm Batch Delete")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Permanently delete {} selected item(s)? This cannot be undone.",
-                        pending.item_count
-                    ));
-                    ui.horizontal(|ui| {
-                        let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete all").color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(220, 50, 50));
-                        if ui.add(delete_btn).clicked() || enter_pressed {
-                            do_batch_delete = true;
-                            close_batch_dialog = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close_batch_dialog = true;
-                        }
-                    });
-                });
-        }
-
-        if do_batch_delete {
-            // Use the plan captured when the user asked, not a fresh lookup.
-            if let Some(pending) = self.confirm_batch_delete.take() {
+        if let Some(pending) = &self.confirm_batch_delete {
+            let text = format!(
+                "Permanently delete {} selected item(s)? This cannot be undone.",
+                pending.item_count
+            );
+            if let Some(yes) = confirm_window(ctx, "Confirm Batch Delete", &text, "Yes, delete all")
+                && let Some(pending) = self.confirm_batch_delete.take()
+                && yes
+            {
+                // Use the plan captured when the user asked, not a fresh lookup.
                 self.selected_paths.clear();
                 self.deleter.start(pending.targets, false);
             }
-        } else if close_batch_dialog {
-            self.confirm_batch_delete = None;
         }
 
-        // Single-item delete confirmation dialog
-        let mut do_delete = false;
-        let mut close_dialog = false;
-
-        if let Some(ref pending) = self.confirm_delete {
-            let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            egui::Window::new("Confirm Delete")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(&pending.prompt);
-                    ui.horizontal(|ui| {
-                        let delete_btn = egui::Button::new(
-                            egui::RichText::new("Yes, delete").color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(220, 50, 50));
-                        if ui.add(delete_btn).clicked() || enter_pressed {
-                            do_delete = true;
-                            close_dialog = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close_dialog = true;
-                        }
-                    });
-                });
-        }
-
-        if do_delete {
+        if let Some(pending) = &self.confirm_delete
+            && let Some(yes) = confirm_window(ctx, "Confirm Delete", &pending.prompt, "Yes, delete")
+            && let Some(pending) = self.confirm_delete.take()
+            && yes
+        {
             // Use the plan captured when the user asked, not a fresh lookup.
-            if let Some(pending) = self.confirm_delete.take() {
-                self.selected_paths.remove(&pending.path);
-                self.deleter.start(pending.targets, false);
-            }
-        } else if close_dialog {
-            self.confirm_delete = None;
+            self.selected_paths.remove(&pending.path);
+            self.deleter.start(pending.targets, false);
         }
 
         // Toolbar only in the results view — hidden on home and while scanning,
@@ -1602,41 +1463,30 @@ impl eframe::App for App {
                         // }
 
                         // Hidden files toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_hidden, "Show hidden")
-                                .clicked()
-                            {
-                                self.show_hidden = !self.show_hidden;
-                                self.mark_dirty();
-                                // Persist preference
-                                if let Some(ref path) = self.last_scan_path {
-                                    save_config(path, self.show_hidden);
-                                }
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_hidden, "Show hidden")
+                            .clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.mark_dirty();
+                            // Persist preference
+                            if let Some(ref path) = self.scan_path {
+                                save_config(path, self.show_hidden);
                             }
                         }
 
                         // File types panel toggle
-                        if self.tree.is_some() {
-                            ui.separator();
-                            if ui
-                                .selectable_label(self.show_categories, "File Types")
-                                .clicked()
-                            {
-                                self.show_categories = !self.show_categories;
-                                if !self.show_categories {
-                                    self.category_filter = None;
-                                    self.mark_dirty();
-                                }
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.show_categories, "File Types")
+                            .clicked()
+                        {
+                            self.show_categories = !self.show_categories;
+                            if !self.show_categories {
+                                self.category_filter = None;
+                                self.mark_dirty();
                             }
-                        }
-
-                        if self.scanning {
-                            // Throttle repaints during scanning — progress counter doesn't
-                            // need 1000fps. 100ms (~10fps) keeps the UI responsive without
-                            // starving scan threads or causing frame-pacing jank.
-                            ctx.request_repaint_after(Duration::from_millis(100));
                         }
 
                         if let Some(ref err) = self.error {
@@ -1761,25 +1611,22 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Left: static scan summary.
+                let file_count = self.scan_progress.file_count.load(Ordering::Relaxed);
+                let total_size =
+                    bytesize::ByteSize::b(self.scan_progress.total_size.load(Ordering::Relaxed));
                 if self.tree.is_some() && !self.scanning {
                     if self.scan_path.is_some() {
-                        let summary = format!(
-                            "{} files, {}",
-                            self.last_scan_file_count,
-                            bytesize::ByteSize::b(self.last_scan_total_size)
-                        );
+                        let summary = format!("{file_count} files, {total_size}");
                         ui.label(egui::RichText::new(summary).small());
                     }
                 } else if let Some(ref path) = self.scan_path
                     && !self.scanning
-                    && self.last_scan_file_count > 0
+                    && file_count > 0
                 {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Scanned: {} ({} files, {})",
+                            "Scanned: {} ({file_count} files, {total_size})",
                             path.display(),
-                            self.last_scan_file_count,
-                            bytesize::ByteSize::b(self.last_scan_total_size)
                         ))
                         .small(),
                     );
@@ -1831,29 +1678,14 @@ impl eframe::App for App {
                             ui.separator();
                         }
 
-                        if self.last_scan_fallback_count > 0 {
+                        if let Some(hover) = fallback_summary(&self.scan_progress) {
+                            let count = self.scan_progress.fallback_count.load(Ordering::Relaxed);
                             let button = egui::Button::new(
-                                egui::RichText::new(format!("⚠ {}", self.last_scan_fallback_count))
+                                egui::RichText::new(format!("⚠ {count}"))
                                     .small()
                                     .color(egui::Color32::from_rgb(230, 200, 80)),
                             )
                             .frame(false);
-                            let hover = scanner::format_fallback_summary(
-                                self.last_scan_fallback_count,
-                                self.last_scan_access_denied_fallback_count,
-                                self.last_scan_bulk_scan_fallback_count,
-                            )
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "{} fallback{}",
-                                    self.last_scan_fallback_count,
-                                    if self.last_scan_fallback_count == 1 {
-                                        ""
-                                    } else {
-                                        "s"
-                                    }
-                                )
-                            });
                             let response = ui
                                 .add(button)
                                 .on_hover_text(format!("{hover}\nClick to open details"));
@@ -2045,7 +1877,7 @@ impl eframe::App for App {
                 let short = ui.available_height() < 500.0;
                 let width = 540.0_f32.min(ui.available_width() - 32.0);
                 let rescan_path = self
-                    .last_scan_path
+                    .scan_path
                     .as_ref()
                     .filter(|last| !self.volumes.iter().any(|volume| volume.path == **last))
                     .cloned();
@@ -2384,8 +2216,6 @@ impl eframe::App for App {
                     if self.icon_cache.is_none() {
                         self.icon_cache = icons::IconCache::load(ctx);
                     }
-                    let render_start = std::time::Instant::now();
-                    let rebuild_needed = self.rows_dirty;
                     self.rebuild_rows_if_dirty();
                     let actions = ui::render_tree(
                         ui,
@@ -2396,15 +2226,6 @@ impl eframe::App for App {
                         &self.selected_paths,
                     );
                     self.tree_scroll_to_focus = false;
-                    let render_elapsed = render_start.elapsed();
-                    if debug_enabled() && render_elapsed > std::time::Duration::from_millis(16) {
-                        eprintln!(
-                            "[perf] tree frame: {:?} ({} rows, rebuild={})",
-                            render_elapsed,
-                            self.cached_rows.len(),
-                            rebuild_needed,
-                        );
-                    }
                     // Handle actions from tree rendering
                     for action in &actions {
                         match action {
@@ -2450,7 +2271,7 @@ impl eframe::App for App {
                                 self.focused_path = Some(path.clone());
                             }
                             ui::TreeAction::Trash(path) => {
-                                let targets = self.deletion_targets(path);
+                                let targets = self.batch_targets(vec![path.clone()]);
                                 self.selected_paths.remove(path);
                                 self.deleter.start(targets, true);
                             }
@@ -2476,26 +2297,24 @@ impl eframe::App for App {
                         }
                     }
                     // Apply expand/collapse changes to tree
-                    if self.tree.is_some() {
-                        for action in &actions {
-                            match action {
-                                ui::TreeAction::ToggleExpand(path) => {
-                                    self.edit_tree(TreeEdit::Toggle(path.clone()));
-                                    self.selected_paths.clear();
-                                    self.selection_anchor = None;
-                                }
-                                ui::TreeAction::ToggleFileGroup(path) => {
-                                    // path is parent_dir/__file_group__; extract parent
-                                    if let Some(parent) = path.parent() {
-                                        let p = parent.to_path_buf();
-                                        if !self.expanded_file_groups.remove(&p) {
-                                            self.expanded_file_groups.insert(p);
-                                        }
-                                    }
-                                    self.rows_dirty = true;
-                                }
-                                _ => {}
+                    for action in &actions {
+                        match action {
+                            ui::TreeAction::ToggleExpand(path) => {
+                                self.edit_tree(TreeEdit::Toggle(path.clone()));
+                                self.selected_paths.clear();
+                                self.selection_anchor = None;
                             }
+                            ui::TreeAction::ToggleFileGroup(path) => {
+                                // path is parent_dir/__file_group__; extract parent
+                                if let Some(parent) = path.parent() {
+                                    let p = parent.to_path_buf();
+                                    if !self.expanded_file_groups.remove(&p) {
+                                        self.expanded_file_groups.insert(p);
+                                    }
+                                }
+                                self.rows_dirty = true;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2542,53 +2361,36 @@ impl eframe::App for App {
             && !self.scanning
             && self.view_mode == ViewMode::Tree
         {
-            egui::Area::new(egui::Id::new("batch_actions_float"))
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
-                .interactable(true)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .inner_margin(egui::Margin::symmetric(16, 8))
-                        .corner_radius(8.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 2],
-                            blur: 8,
-                            spread: 0,
-                            color: egui::Color32::from_black_alpha(60),
-                        })
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{selected_count} item{} selected",
-                                        if selected_count == 1 { "" } else { "s" }
-                                    ))
-                                    .strong(),
-                                );
-                                ui.add_space(12.0);
-                                if ui.button("Move to Trash").clicked() {
-                                    self.batch_trash_selected();
-                                }
-                                if ui
-                                    .button(
-                                        egui::RichText::new("Delete Permanently")
-                                            .color(egui::Color32::from_rgb(220, 60, 60)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.confirm_batch_delete = Some(self.pending_batch_delete());
-                                }
-                                ui.add_space(4.0);
-                                if ui
-                                    .small_button("×")
-                                    .on_hover_text("Clear selection")
-                                    .clicked()
-                                {
-                                    self.selected_paths.clear();
-                                }
-                            });
-                        });
-                });
+            floating_bar(ctx, "batch_actions_float", true, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{selected_count} item{} selected",
+                        if selected_count == 1 { "" } else { "s" }
+                    ))
+                    .strong(),
+                );
+                ui.add_space(12.0);
+                if ui.button("Move to Trash").clicked() {
+                    self.batch_trash_selected();
+                }
+                if ui
+                    .button(
+                        egui::RichText::new("Delete Permanently")
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    )
+                    .clicked()
+                {
+                    self.confirm_batch_delete = Some(self.pending_batch_delete());
+                }
+                ui.add_space(4.0);
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Clear selection")
+                    .clicked()
+                {
+                    self.selected_paths.clear();
+                }
+            });
         }
 
         // Deletion progress overlay
@@ -2600,31 +2402,11 @@ impl eframe::App for App {
             } else {
                 0.0
             };
-            egui::Area::new(egui::Id::new("delete_progress_float"))
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -32.0])
-                .interactable(false)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    egui::Frame::popup(ui.style())
-                        .inner_margin(egui::Margin::symmetric(16, 8))
-                        .corner_radius(8.0)
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 2],
-                            blur: 8,
-                            spread: 0,
-                            color: egui::Color32::from_black_alpha(60),
-                        })
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(
-                                    egui::RichText::new(format!("Deleting {done}/{total}..."))
-                                        .strong(),
-                                );
-                                ui.add(egui::ProgressBar::new(fraction).desired_width(200.0));
-                            });
-                        });
-                });
+            floating_bar(ctx, "delete_progress_float", false, |ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new(format!("Deleting {done}/{total}...")).strong());
+                ui.add(egui::ProgressBar::new(fraction).desired_width(200.0));
+            });
         }
 
         // Start requests queued by this frame's actions and apply completed
@@ -2633,11 +2415,6 @@ impl eframe::App for App {
         self.start_categories();
         if self.category_worker.is_active() || !self.pending_tree_edits.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
-        }
-
-        // Record frame time while scanning (only when debug output is enabled)
-        if self.scanning && debug_enabled() {
-            self.scan_frame_times.push(frame_start.elapsed());
         }
     }
 }
@@ -2829,8 +2606,12 @@ mod tests {
                 .any(|r| r.is_file_group && r.path.as_path() == Path::new("root/__file_group__"))
         );
 
-        let got =
-            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true);
+        let got = resolve_batch_targets(
+            &rows,
+            Some(&tree),
+            vec![PathBuf::from("root/__file_group__")],
+            true,
+        );
 
         assert_eq!(
             got,
@@ -2854,8 +2635,12 @@ mod tests {
         let rows = rows_for(&tree);
         assert!(!rows.iter().any(|r| r.is_file_group));
 
-        let got =
-            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true);
+        let got = resolve_batch_targets(
+            &rows,
+            Some(&tree),
+            vec![PathBuf::from("root/__file_group__")],
+            true,
+        );
 
         assert_eq!(got, vec![PathBuf::from("root/__file_group__")]);
     }
@@ -2867,7 +2652,7 @@ mod tests {
         let rows = rows_for(&tree);
 
         assert_eq!(
-            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/a.txt"), true),
+            resolve_batch_targets(&rows, Some(&tree), vec![PathBuf::from("root/a.txt")], true),
             vec![PathBuf::from("root/a.txt")]
         );
     }
@@ -2938,7 +2723,12 @@ mod tests {
         let rows: Vec<ui::CachedRow> = Vec::new();
 
         assert_eq!(
-            resolve_deletion_targets(&rows, Some(&tree), Path::new("root/__file_group__"), true),
+            resolve_batch_targets(
+                &rows,
+                Some(&tree),
+                vec![PathBuf::from("root/__file_group__")],
+                true
+            ),
             vec![PathBuf::from("root/__file_group__")]
         );
     }
@@ -2949,8 +2739,13 @@ mod tests {
         tree.set_expanded(true);
         let rows = rows_for(&tree);
         assert!(
-            resolve_deletion_targets(&rows, None, Path::new("root/__file_group__"), true)
-                .is_empty()
+            resolve_batch_targets(
+                &rows,
+                None,
+                vec![PathBuf::from("root/__file_group__")],
+                true
+            )
+            .is_empty()
         );
     }
 }

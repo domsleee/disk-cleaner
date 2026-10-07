@@ -88,7 +88,6 @@ pub struct CategoryStats {
 }
 
 /// Compute file category statistics from a scanned tree.
-#[allow(dead_code)] // Library/benchmark entry point; the GUI uses the cancellable worker.
 pub fn compute_stats(tree: &FileNode) -> CategoryStats {
     compute_stats_inner(tree, &|| false).expect("uncancelled category count")
 }

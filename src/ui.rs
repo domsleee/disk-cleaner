@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use bytesize::ByteSize;
 use eframe::egui;
 
+use crate::categories::FileCategory;
 use crate::icons::IconCache;
 use crate::tree::FileNode;
 
@@ -158,19 +159,20 @@ pub enum TreeAction {
 /// Label for the "reveal in file manager" context-menu entry, named for the
 /// platform's native file manager.
 pub fn reveal_in_file_manager_label() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
+    if cfg!(windows) {
         "Reveal in File Explorer"
-    }
-    #[cfg(target_os = "macos")]
-    {
+    } else if cfg!(target_os = "macos") {
         "Reveal in Finder"
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
+    } else {
         "Open Containing Folder"
     }
 }
+
+/// Size column layout, shared by the header and the rows.
+const BAR_WIDTH: f32 = 80.0;
+const BAR_GAP: f32 = 4.0;
+/// Clears the floating scrollbar's expanded width.
+const TEXT_MARGIN: f32 = 14.0;
 
 /// Minimum number of loose files in a folder to trigger grouping.
 const FILE_GROUP_THRESHOLD: usize = 2;
@@ -208,147 +210,96 @@ pub struct CachedRow {
 pub fn collect_cached_rows(
     node: &FileNode,
     filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
+    category_filter: Option<FileCategory>,
     show_hidden: bool,
     text_cache: Option<&NodeMatchSet>,
     cat_cache: Option<&NodeMatchSet>,
     expanded_file_groups: Option<&HashSet<PathBuf>>,
 ) -> Vec<CachedRow> {
-    let mut result = Vec::new();
-    let mut path_buf = PathBuf::from(node.name());
-    collect_cached_rows_inner(
-        node,
-        0,
-        node.size(),
-        &mut path_buf,
+    let mut ctx = RowCtx {
         filter,
         category_filter,
         show_hidden,
         text_cache,
         cat_cache,
         expanded_file_groups,
-        &mut result,
-    );
-    result
+        path: PathBuf::from(node.name()),
+        rows: Vec::new(),
+    };
+    ctx.visit(node, 0, node.size());
+    ctx.rows
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_file_group(
-    result: &mut Vec<CachedRow>,
-    current_path: &mut PathBuf,
-    file_count: usize,
-    file_size: u64,
-    group_expanded: bool,
-    depth: usize,
-    parent_size: u64,
-    files: &[&crate::tree::FileNode],
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
+struct RowCtx<'a> {
+    filter: &'a str,
+    category_filter: Option<FileCategory>,
     show_hidden: bool,
-    text_cache: Option<&NodeMatchSet>,
-    cat_cache: Option<&NodeMatchSet>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
-) {
-    result.push(CachedRow {
-        path: current_path.join(FILE_GROUP_MARKER),
-        name: format!("[{file_count} files]").into(),
-        size: file_size,
-        is_dir: false,
-        expanded: group_expanded,
-        depth: depth + 1,
-        parent_size,
-        children_count: file_count,
-        category: crate::categories::FileCategory::Other,
-        is_hidden: false,
-        is_file_group: true,
-        is_hard_link: false,
-    });
-
-    if group_expanded {
-        for child in files {
-            current_path.push(child.name());
-            collect_cached_rows_inner(
-                child,
-                depth + 2,
-                file_size,
-                current_path,
-                filter,
-                category_filter,
-                show_hidden,
-                text_cache,
-                cat_cache,
-                expanded_file_groups,
-                result,
-            );
-            current_path.pop();
-        }
-    }
+    text_cache: Option<&'a NodeMatchSet>,
+    cat_cache: Option<&'a NodeMatchSet>,
+    expanded_file_groups: Option<&'a HashSet<PathBuf>>,
+    path: PathBuf,
+    rows: Vec<CachedRow>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_cached_rows_inner(
-    node: &FileNode,
-    depth: usize,
-    parent_size: u64,
-    current_path: &mut PathBuf,
-    filter: &str,
-    category_filter: Option<crate::categories::FileCategory>,
-    show_hidden: bool,
-    text_cache: Option<&NodeMatchSet>,
-    cat_cache: Option<&NodeMatchSet>,
-    expanded_file_groups: Option<&HashSet<PathBuf>>,
-    result: &mut Vec<CachedRow>,
-) {
-    if !show_hidden && node.is_hidden() {
-        return;
-    }
-    // Use pre-computed caches for O(1) lookup when available,
-    // fall back to recursive match for backwards compatibility.
-    if let Some(tc) = text_cache {
-        if !tc.contains(&node_id(node)) {
-            return;
-        }
-    } else if !filter.is_empty() && !node_matches(node, filter) {
-        return;
-    }
-    if let Some(cc) = cat_cache {
-        if !cc.contains(&node_id(node)) {
-            return;
-        }
-    } else if let Some(cat) = category_filter
-        && !crate::categories::node_matches_category(node, cat)
-    {
-        return;
+impl RowCtx<'_> {
+    fn visit_child(&mut self, child: &FileNode, depth: usize, parent_size: u64) {
+        self.path.push(child.name());
+        self.visit(child, depth, parent_size);
+        self.path.pop();
     }
 
-    result.push(CachedRow {
-        path: current_path.clone(),
-        name: node.name().into(),
-        size: node.size(),
-        is_dir: node.is_dir(),
-        expanded: node.expanded(),
-        depth,
-        parent_size,
-        children_count: node.children().len(),
-        category: if node.is_dir() {
-            crate::categories::FileCategory::Other
-        } else {
-            crate::categories::categorize(node.name())
-        },
-        is_hidden: node.is_hidden(),
-        is_file_group: false,
-        is_hard_link: node.is_hard_link(),
-    });
+    fn visit(&mut self, node: &FileNode, depth: usize, parent_size: u64) {
+        if !self.show_hidden && node.is_hidden() {
+            return;
+        }
+        // Use pre-computed caches for O(1) lookup when available,
+        // fall back to recursive match for backwards compatibility.
+        if let Some(tc) = self.text_cache {
+            if !tc.contains(&node_id(node)) {
+                return;
+            }
+        } else if !self.filter.is_empty() && !node_matches(node, self.filter) {
+            return;
+        }
+        if let Some(cc) = self.cat_cache {
+            if !cc.contains(&node_id(node)) {
+                return;
+            }
+        } else if let Some(cat) = self.category_filter
+            && !crate::categories::node_matches_category(node, cat)
+        {
+            return;
+        }
 
-    let show_children = node.is_dir() && (node.expanded() || !filter.is_empty());
-    if show_children {
+        self.rows.push(CachedRow {
+            path: self.path.clone(),
+            name: node.name().into(),
+            size: node.size(),
+            is_dir: node.is_dir(),
+            expanded: node.expanded(),
+            depth,
+            parent_size,
+            children_count: node.children().len(),
+            category: if node.is_dir() {
+                FileCategory::Other
+            } else {
+                crate::categories::categorize(node.name())
+            },
+            is_hidden: node.is_hidden(),
+            is_file_group: false,
+            is_hard_link: node.is_hard_link(),
+        });
+
+        if !node.is_dir() || !(node.expanded() || !self.filter.is_empty()) {
+            return;
+        }
         // Separate children into dirs and files for grouping.
         // Only consider visible files (respecting show_hidden).
         let dirs: Vec<_> = node.children().iter().filter(|c| c.is_dir()).collect();
         let files: Vec<_> = node
             .children()
             .iter()
-            .filter(|c| !c.is_dir() && (show_hidden || !c.is_hidden()))
+            .filter(|c| !c.is_dir() && (self.show_hidden || !c.is_hidden()))
             .collect();
         // Never group when any child (visible, hidden, or a dir) is named
         // `__file_group__`, so the synthetic group path stays unambiguous.
@@ -357,97 +308,51 @@ fn collect_cached_rows_inner(
             .iter()
             .any(|c| c.name() == FILE_GROUP_MARKER);
         let should_group_files = files.len() >= FILE_GROUP_THRESHOLD
-            && filter.is_empty()
-            && category_filter.is_none()
+            && self.filter.is_empty()
+            && self.category_filter.is_none()
             && !has_file_group_marker;
 
-        if should_group_files {
-            let file_size: u64 = files.iter().map(|f| f.size()).sum();
-            let group_expanded =
-                expanded_file_groups.is_some_and(|s| s.contains(current_path.as_path()));
-            let file_count = files.len();
-            let mut file_group_emitted = false;
-
-            // Interleave dirs and file group sorted by size (children are
-            // already size-sorted from the scanner).
-            for child in &dirs {
-                // Emit file group before the first dir that is smaller
-                if !file_group_emitted && child.size() < file_size {
-                    emit_file_group(
-                        result,
-                        current_path,
-                        file_count,
-                        file_size,
-                        group_expanded,
-                        depth,
-                        node.size(),
-                        &files,
-                        filter,
-                        category_filter,
-                        show_hidden,
-                        text_cache,
-                        cat_cache,
-                        expanded_file_groups,
-                    );
-                    file_group_emitted = true;
-                }
-                current_path.push(child.name());
-                collect_cached_rows_inner(
-                    child,
-                    depth + 1,
-                    node.size(),
-                    current_path,
-                    filter,
-                    category_filter,
-                    show_hidden,
-                    text_cache,
-                    cat_cache,
-                    expanded_file_groups,
-                    result,
-                );
-                current_path.pop();
-            }
-            // If all dirs were larger, emit file group at the end
-            if !file_group_emitted {
-                emit_file_group(
-                    result,
-                    current_path,
-                    file_count,
-                    file_size,
-                    group_expanded,
-                    depth,
-                    node.size(),
-                    &files,
-                    filter,
-                    category_filter,
-                    show_hidden,
-                    text_cache,
-                    cat_cache,
-                    expanded_file_groups,
-                );
-            }
-        } else {
-            // No grouping — emit all children in original order
+        if !should_group_files {
             for child in node.children() {
-                if !show_hidden && child.is_hidden() {
-                    continue;
-                }
-                current_path.push(child.name());
-                collect_cached_rows_inner(
-                    child,
-                    depth + 1,
-                    node.size(),
-                    current_path,
-                    filter,
-                    category_filter,
-                    show_hidden,
-                    text_cache,
-                    cat_cache,
-                    expanded_file_groups,
-                    result,
-                );
-                current_path.pop();
+                self.visit_child(child, depth + 1, node.size());
             }
+            return;
+        }
+
+        // The group sits among the dirs by size (children are already
+        // size-sorted from the scanner).
+        let file_size: u64 = files.iter().map(|f| f.size()).sum();
+        let split = dirs
+            .iter()
+            .position(|d| d.size() < file_size)
+            .unwrap_or(dirs.len());
+        for child in &dirs[..split] {
+            self.visit_child(child, depth + 1, node.size());
+        }
+        let group_expanded = self
+            .expanded_file_groups
+            .is_some_and(|s| s.contains(self.path.as_path()));
+        self.rows.push(CachedRow {
+            path: self.path.join(FILE_GROUP_MARKER),
+            name: format!("[{} files]", files.len()).into(),
+            size: file_size,
+            is_dir: false,
+            expanded: group_expanded,
+            depth: depth + 1,
+            parent_size: node.size(),
+            children_count: files.len(),
+            category: FileCategory::Other,
+            is_hidden: false,
+            is_file_group: true,
+            is_hard_link: false,
+        });
+        if group_expanded {
+            for child in &files {
+                self.visit_child(child, depth + 2, file_size);
+            }
+        }
+        for child in &dirs[split..] {
+            self.visit_child(child, depth + 1, node.size());
         }
     }
 }
@@ -472,19 +377,9 @@ pub fn render_tree(
 
     let row_total = row_height + ui.spacing().item_spacing.y;
 
-    // The table fills the window width (Size pinned to the right edge, Name
-    // flexes) — the file-manager convention, and it scales cleanly as the
-    // window widens. Set to a finite value to cap the width on ultra-wide
-    // displays; `INFINITY` means no cap.
-    const MAX_CONTENT_WIDTH: f32 = f32::INFINITY;
-
     // --- Sticky column header, aligned to the same columns as the rows ---
     {
-        let hfull = ui.max_rect();
-        let content_right = hfull.right().min(hfull.left() + MAX_CONTENT_WIDTH);
-        let bar_width = 80.0_f32;
-        let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
-        let bar_gap = 4.0_f32;
+        let right = ui.max_rect().right();
         let font_id = egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Body].size);
         let col = ui.visuals().weak_text_color();
         let sample = ui
@@ -506,14 +401,14 @@ pub fn render_tree(
             col,
         );
         painter.text(
-            egui::pos2(content_right - text_margin, cy),
+            egui::pos2(right - TEXT_MARGIN, cy),
             egui::Align2::RIGHT_CENTER,
             "Size",
             font_id.clone(),
             col,
         );
-        let text_x = content_right - text_margin - text_width;
-        let bar_center = text_x - bar_gap - bar_width / 2.0;
+        let text_x = right - TEXT_MARGIN - text_width;
+        let bar_center = text_x - BAR_GAP - BAR_WIDTH / 2.0;
         painter.text(
             egui::pos2(bar_center, cy),
             egui::Align2::CENTER_CENTER,
@@ -522,7 +417,7 @@ pub fn render_tree(
             col,
         );
         painter.hline(
-            hrect.left()..=content_right,
+            hrect.left()..=right,
             hrect.bottom(),
             ui.visuals().widgets.noninteractive.bg_stroke,
         );
@@ -551,12 +446,6 @@ pub fn render_tree(
         // Prevent shift+click from selecting label text (OS text highlight).
         ui.style_mut().interaction.selectable_labels = false;
         let full_width = ui.max_rect();
-        // Clamp where the size column sits so it stays beside the names on
-        // wide windows instead of pinned to the far-right edge.
-        let content_right = full_width
-            .right()
-            .min(full_width.left() + MAX_CONTENT_WIDTH);
-        let right_inset = full_width.right() - content_right;
         for i in range {
             let row = &rows[i];
             let indent = row.depth as f32 * 20.0;
@@ -611,10 +500,7 @@ pub fn render_tree(
 
                 // Size bar + label dimensions (computed first to reserve space
                 // for name truncation).
-                let bar_width = 80.0_f32;
                 let bar_h = 10.0_f32;
-                let text_margin = 14.0_f32; // clears the floating scrollbar's expanded width
-                let bar_gap = 4.0_f32;
                 let size_str = ByteSize::b(row.size).to_string();
                 let size_text = format!("{:>10}", size_str);
                 let font_id =
@@ -623,13 +509,12 @@ pub fn render_tree(
                     ui.painter()
                         .layout_no_wrap(size_text, font_id, ui.visuals().text_color());
                 let text_width = text_galley.size().x;
-                let right_reserved = text_margin + text_width + bar_gap + bar_width;
+                let right_reserved = TEXT_MARGIN + text_width + BAR_GAP + BAR_WIDTH;
 
                 // Name — truncate so it never overlaps the size bar area.
                 // Floor at 0 (not a fixed 20px) so a deeply-indented name clips
                 // to nothing rather than spilling over the pulled-in size bar.
-                let name_max_w =
-                    (ui.available_width() - right_inset - right_reserved - 4.0).max(0.0);
+                let name_max_w = (ui.available_width() - right_reserved - 4.0).max(0.0);
                 // Hard links get a 🔗 prefix (survives right-truncation) and are
                 // dimmed, since their storage is shared and counted once.
                 let name_text = if row.is_hard_link {
@@ -656,7 +541,7 @@ pub fn render_tree(
                 // center().y drifts with scroll position).
                 let row_center_y = ui.min_rect().center().y;
                 let painter = ui.painter();
-                let text_x = content_right - text_margin - text_width;
+                let text_x = full_width.right() - TEXT_MARGIN - text_width;
                 let text_y = row_center_y - text_galley.size().y / 2.0;
                 painter.galley(
                     egui::pos2(text_x, text_y),
@@ -664,14 +549,14 @@ pub fn render_tree(
                     ui.visuals().text_color(),
                 );
 
-                let bar_x = text_x - bar_gap - bar_width;
+                let bar_x = text_x - BAR_GAP - BAR_WIDTH;
                 let bar_y = row_center_y - bar_h / 2.0;
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(bar_x, bar_y),
-                    egui::vec2(bar_width, bar_h),
+                    egui::vec2(BAR_WIDTH, bar_h),
                 );
                 painter.rect_filled(bar_rect, 2.0, ui.visuals().extreme_bg_color);
-                let fill_w = (bar_width * proportion.clamp(0.0, 1.0)).max(1.0);
+                let fill_w = (BAR_WIDTH * proportion.clamp(0.0, 1.0)).max(1.0);
                 let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_h));
                 painter.rect_filled(fill_rect, 2.0, bcolor);
 
@@ -682,7 +567,7 @@ pub fn render_tree(
             // Match the interaction area to the visible content width so clicks
             // and hover in the blank right-hand gutter don't target the row.
             let row_rect = egui::Rect::from_x_y_ranges(
-                full_width.left()..=content_right,
+                full_width.x_range(),
                 row_response.response.rect.y_range(),
             );
 
@@ -856,7 +741,7 @@ pub fn render_tree(
                 let spacing_half = ui.spacing().item_spacing.y / 2.0;
                 let y = row_rect.y_range();
                 let bg_rect = egui::Rect::from_x_y_ranges(
-                    full_width.left()..=content_right,
+                    full_width.x_range(),
                     (y.min - spacing_half)..=(y.max + spacing_half),
                 );
                 ui.painter()
@@ -868,122 +753,30 @@ pub fn render_tree(
     actions
 }
 
-/// Get the next path component name to navigate toward when searching for `target`
-/// from the current position `buf`. Returns None if `target` doesn't start with `buf`.
-fn next_component_name<'a>(target: &'a Path, buf: &Path) -> Option<&'a str> {
-    target
-        .strip_prefix(buf)
-        .ok()
-        .and_then(|remaining| remaining.components().next())
-        .and_then(|c| c.as_os_str().to_str())
-}
-
-/// Toggle expand/collapse for the node at `target`. Returns true if found.
-pub fn toggle_expand(node: &mut FileNode, target: &Path) -> bool {
-    let mut buf = PathBuf::from(node.name());
-    toggle_expand_inner(node, target, &mut buf)
-}
-
-fn toggle_expand_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> bool {
-    if buf.as_path() == target {
-        let new_val = !node.expanded();
-        node.set_expanded(new_val);
-        return true;
-    }
-    if let FileNode::Dir(d) = node
-        && let Some(next) = next_component_name(target, buf)
-    {
-        for child in &mut d.children {
-            if child.name() == next {
-                buf.push(child.name());
-                let found = toggle_expand_inner(child, target, buf);
-                buf.pop();
-                return found;
-            }
-        }
-    }
-    false
-}
-
 /// Remove a node from the tree by path, returning the removed size so parents can update.
 pub fn remove_node(node: &mut FileNode, target: &Path) -> Option<u64> {
-    let mut buf = PathBuf::from(node.name());
-    remove_node_inner(node, target, &mut buf)
+    let rest = target.strip_prefix(node.name()).ok()?;
+    remove_node_inner(node, rest.components())
 }
 
-fn remove_node_inner(node: &mut FileNode, target: &Path, buf: &mut PathBuf) -> Option<u64> {
+fn remove_node_inner(node: &mut FileNode, mut rest: std::path::Components) -> Option<u64> {
+    let name = rest.next()?.as_os_str().to_str()?;
     let d = node.as_dir_mut()?;
-
-    if let Some(next) = next_component_name(target, buf) {
-        let next_str = next;
-
-        // Check if a direct child matches the full target
-        let found_pos = d.children.iter().enumerate().find_map(|(i, c)| {
-            if c.name() == next_str && buf.join(c.name()) == target {
-                Some(i)
-            } else {
-                None
-            }
-        });
-
-        if let Some(pos) = found_pos {
-            let removed_size = d.children[pos].size();
-            d.children.remove(pos);
-            d.size -= removed_size;
-            return Some(removed_size);
-        }
-
-        // Navigate to the matching child directory
-        for child in &mut d.children {
-            if child.is_dir() && child.name() == next_str {
-                buf.push(child.name());
-                if let Some(removed_size) = remove_node_inner(child, target, buf) {
-                    buf.pop();
-                    d.size -= removed_size;
-                    return Some(removed_size);
-                }
-                buf.pop();
-                return None; // name matched but target not found inside
-            }
-        }
-    }
-
-    None
-}
-
-/// Find the parent path of a node in the tree.
-pub fn find_parent_path(node: &FileNode, target: &Path) -> Option<PathBuf> {
-    let mut buf = PathBuf::from(node.name());
-    find_parent_path_inner(node, target, &mut buf)
-}
-
-fn find_parent_path_inner(node: &FileNode, target: &Path, buf: &mut PathBuf) -> Option<PathBuf> {
-    if let Some(next) = next_component_name(target, buf) {
-        let next_str = next;
-        for child in node.children() {
-            if child.name() == next_str {
-                let child_path = buf.join(child.name());
-                if child_path == target {
-                    return Some(buf.clone());
-                }
-                if child.is_dir() {
-                    buf.push(child.name());
-                    let result = find_parent_path_inner(child, target, buf);
-                    buf.pop();
-                    return result;
-                }
-            }
-        }
-    }
-    None
+    let pos = d.children.iter().position(|c| c.name() == name)?;
+    let removed_size = if rest.clone().next().is_none() {
+        d.children.remove(pos).size()
+    } else {
+        remove_node_inner(&mut d.children[pos], rest)?
+    };
+    d.size -= removed_size;
+    Some(removed_size)
 }
 
 /// Resolve a file-group row to the loose-file paths it represents: `dir`'s
 /// non-directory children, with hidden files included only when `show_hidden`.
 /// Empty if `dir` is not found.
 pub fn file_group_files(root: &FileNode, dir: &Path, show_hidden: bool) -> Vec<PathBuf> {
-    let mut buf = PathBuf::from(root.name());
-    let Some(node) = find_node(root, dir, &mut buf) else {
+    let Some(node) = root.find(dir) else {
         return Vec::new();
     };
     node.children()
@@ -993,80 +786,13 @@ pub fn file_group_files(root: &FileNode, dir: &Path, show_hidden: bool) -> Vec<P
         .collect()
 }
 
-fn find_node<'a>(node: &'a FileNode, target: &Path, buf: &mut PathBuf) -> Option<&'a FileNode> {
-    if buf.as_path() == target {
-        return Some(node);
+/// Format a percentage, showing "<1%" rather than a flat "0%" for small non-zero shares.
+pub fn fmt_pct(pct: f64) -> String {
+    if pct > 0.0 && pct < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{pct:.0}%")
     }
-    let next = next_component_name(target, buf)?;
-    for child in node.children() {
-        if child.name() == next {
-            buf.push(child.name());
-            let result = find_node(child, target, buf);
-            buf.pop();
-            return result;
-        }
-    }
-    None
-}
-
-/// Find a node by path and return (is_dir, expanded, has_children).
-pub fn find_node_info(node: &FileNode, target: &Path) -> Option<(bool, bool, bool)> {
-    let mut buf = PathBuf::from(node.name());
-    find_node_info_inner(node, target, &mut buf)
-}
-
-fn find_node_info_inner(
-    node: &FileNode,
-    target: &Path,
-    buf: &mut PathBuf,
-) -> Option<(bool, bool, bool)> {
-    if buf.as_path() == target {
-        return Some((node.is_dir(), node.expanded(), !node.children().is_empty()));
-    }
-    if let Some(next) = next_component_name(target, buf) {
-        let next_str = next;
-        for child in node.children() {
-            if child.name() == next_str {
-                buf.push(child.name());
-                let result = find_node_info_inner(child, target, buf);
-                buf.pop();
-                return result;
-            }
-        }
-    }
-    None
-}
-
-/// Set expanded state for a node at target path. Returns true if found.
-pub fn set_expanded(node: &mut FileNode, target: &Path, expanded: bool) -> bool {
-    let mut buf = PathBuf::from(node.name());
-    set_expanded_inner(node, target, expanded, &mut buf)
-}
-
-fn set_expanded_inner(
-    node: &mut FileNode,
-    target: &Path,
-    expanded: bool,
-    buf: &mut PathBuf,
-) -> bool {
-    if buf.as_path() == target {
-        node.set_expanded(expanded);
-        return true;
-    }
-    if let FileNode::Dir(d) = node
-        && let Some(next) = next_component_name(target, buf)
-    {
-        let next_str = next;
-        for child in &mut d.children {
-            if child.name() == next_str {
-                buf.push(child.name());
-                let found = set_expanded_inner(child, target, expanded, buf);
-                buf.pop();
-                return found;
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1088,24 +814,6 @@ mod tests {
         assert!(node_matches(&tree, "main"));
         assert!(node_matches(&tree, "src"));
         assert!(!node_matches(&tree, "missing"));
-    }
-
-    #[test]
-    fn toggle_expand_flips_target() {
-        let mut tree = dir("root", vec![dir("sub", vec![leaf("f.txt", 1)])]);
-        assert!(!tree.children()[0].expanded());
-
-        toggle_expand(&mut tree, Path::new("root/sub"));
-        assert!(tree.children()[0].expanded());
-
-        toggle_expand(&mut tree, Path::new("root/sub"));
-        assert!(!tree.children()[0].expanded());
-    }
-
-    #[test]
-    fn toggle_expand_returns_false_for_missing() {
-        let mut tree = dir("root", vec![]);
-        assert!(!toggle_expand(&mut tree, Path::new("nope")));
     }
 
     #[test]
@@ -1319,7 +1027,7 @@ mod tests {
     fn file_group_files_includes_a_real_file_named_group_marker() {
         // If a loose file is literally named __file_group__, it is part of the
         // group like any other loose file (path-level disambiguation happens in
-        // resolve_deletion_targets, not here).
+        // resolve_batch_targets, not here).
         let tree = dir("root", vec![leaf("a.txt", 10), leaf("__file_group__", 1)]);
         assert_eq!(
             file_group_files(&tree, Path::new("root"), true),

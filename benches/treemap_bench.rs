@@ -141,7 +141,7 @@ fn bench_tree_navigation(c: &mut Criterion) {
     let n = count_nodes(&tree);
 
     group.bench_with_input(BenchmarkId::new("find_node", n), &tree, |b, t| {
-        b.iter(|| treemap::find_node(t, &zoom))
+        b.iter(|| t.find(&zoom))
     });
 
     group.bench_with_input(BenchmarkId::new("breadcrumbs", n), &tree, |b, t| {
@@ -197,19 +197,19 @@ fn bench_navigation_at_scale(c: &mut Criterion) {
         // Shallow zoom (top-level dir)
         let shallow = std::path::PathBuf::from("/Applications/App_000.app");
         group.bench_with_input(BenchmarkId::new("find_node_shallow", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &shallow))
+            b.iter(|| t.find(&shallow))
         });
 
         // Deep zoom (near end — worst case traversal)
         let deep = std::path::PathBuf::from(format!("/Applications/App_{:03}.app", n_apps - 1));
         group.bench_with_input(BenchmarkId::new("find_node_deep", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &deep))
+            b.iter(|| t.find(&deep))
         });
 
         // Miss (nonexistent path)
         let miss = std::path::PathBuf::from("/Applications/NotAnApp.app");
         group.bench_with_input(BenchmarkId::new("find_node_miss", n), &tree, |b, t| {
-            b.iter(|| treemap::find_node(t, &miss))
+            b.iter(|| t.find(&miss))
         });
 
         // Breadcrumbs at scale
@@ -242,9 +242,56 @@ fn bench_squarify(c: &mut Criterion) {
     });
 }
 
+// Render egui frames without a GPU. Fonts are warmed before measurement;
+// first_frame includes layout construction, cached_frame reuses that layout.
+fn bench_render_frames(c: &mut Criterion) {
+    let mut group = c.benchmark_group("treemap_frame");
+    group.sample_size(20);
+    let tree = build_applications_like(500, 200);
+    let ctx = egui::Context::default();
+    let mut cache = None;
+    let mut dirty = true;
+    let render = |cache: &mut Option<treemap::TreemapCache>, dirty: &mut bool| {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    std::hint::black_box(treemap::render_treemap(
+                        ui, cache, dirty, &tree, &None, &None, None, None, true,
+                    ));
+                });
+            },
+        )
+    };
+    for _ in 0..3 {
+        std::hint::black_box(render(&mut cache, &mut dirty));
+    }
+    group.bench_function("first_frame_100501", |b| {
+        b.iter_batched(
+            || None,
+            |mut cache| {
+                let output = render(&mut cache, &mut true);
+                (output, cache)
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("cached_frame_100501", |b| {
+        b.iter(|| render(&mut cache, &mut dirty));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_build_cache,
+    bench_render_frames,
     bench_label_formatting,
     bench_tree_navigation,
     bench_fontid_alloc,

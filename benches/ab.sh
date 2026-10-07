@@ -57,7 +57,7 @@ git checkout "$REF_A" --quiet 2>/dev/null || git checkout "$REF_A"
 echo ""
 
 echo "Running benchmarks (saving as 'before')..."
-cargo bench -- --save-baseline before 2>&1 | tee /tmp/ab-bench-before.log
+cargo bench --bench scan_bench --bench tree_bench --bench treemap_bench -- --save-baseline before 2>&1 | tee /tmp/ab-bench-before.log
 echo ""
 
 # --- Phase 2: Comparison (REF_B) ---
@@ -66,7 +66,7 @@ git checkout "$REF_B" --quiet 2>/dev/null || git checkout "$REF_B"
 echo ""
 
 echo "Running benchmarks (comparing against 'before')..."
-cargo bench -- --baseline before 2>&1 | tee /tmp/ab-bench-after.log
+cargo bench --bench scan_bench --bench tree_bench --bench treemap_bench -- --baseline before 2>&1 | tee /tmp/ab-bench-after.log
 echo ""
 
 echo "=== A/B Benchmark Complete ==="

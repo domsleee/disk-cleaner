@@ -5,7 +5,6 @@ edition = "2024"
 default-run = "disk-cleaner"
 
 [features]
-default = []
 internal-tools = []
 
 [dependencies]
@@ -32,7 +31,6 @@ smallvec = "1"
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
-dirs = "7"
 
 [[bench]]
 name = "scan_bench"
@@ -44,10 +42,6 @@ harness = false
 
 [[bench]]
 name = "treemap_bench"
-harness = false
-
-[[bench]]
-name = "regression_bench"
 harness = false
 
 [[bench]]
@@ -78,12 +72,6 @@ bench = false
 [[bin]]
 name = "scan_only"
 path = "src/bin/scan_only.rs"
-bench = false
-required-features = ["internal-tools"]
-
-[[bin]]
-name = "bench_perf"
-path = "src/bin/bench_perf.rs"
 bench = false
 required-features = ["internal-tools"]
 

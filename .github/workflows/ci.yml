@@ -12,7 +12,6 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
       - '.github/workflows/release.yml'
-      - '*.rs'
   pull_request:
     paths:
       - 'src/**'
@@ -22,7 +21,6 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
       - '.github/workflows/release.yml'
-      - '*.rs'
 
 # Cancel in-progress runs on the same branch to avoid wasting CI minutes
 concurrency:
@@ -99,8 +97,6 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      - run: cargo nextest run --locked --no-fail-fast --status-level fail
-
       - run: cargo nextest run --locked --no-fail-fast --status-level fail --features internal-tools
 
   # Clippy only needs one platform — warnings are OS-agnostic for pure Rust
@@ -136,8 +132,6 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
-
-      - run: cargo clippy --all-targets --locked -- -D warnings
 
       - run: cargo clippy --all-targets --locked --features internal-tools -- -D warnings
 

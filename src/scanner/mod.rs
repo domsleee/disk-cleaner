@@ -6,10 +6,9 @@ mod windows;
 mod windows_volumes;
 #[cfg(target_os = "windows")]
 pub use windows_volumes::{disk_space, list_volumes};
-/// Raw NTFS `$MFT` fast path for elevated whole-volume scans; also used by the
-/// `ntfs_*` probe binaries.
+/// Raw NTFS `$MFT` fast path for elevated whole-volume scans.
 #[cfg(target_os = "windows")]
-pub mod windows_ntfs;
+mod windows_ntfs;
 
 use std::collections::HashSet;
 #[cfg(target_os = "windows")]

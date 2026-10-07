@@ -137,13 +137,22 @@ pwsh -NoProfile -File benches/ab_pairs.Tests.ps1
 
 ## Comparing branches
 
+`./benches/ab.sh main my-feature-branch` checks out and benchmarks both refs,
+then restores the original branch. To manage baselines manually:
+
 ```sh
-cargo bench --benches -- --save-baseline main   # on main
-cargo bench --benches -- --baseline main        # on your branch
+cargo bench --bench scan_bench --bench tree_bench --bench treemap_bench -- --save-baseline main   # on main
+cargo bench --bench scan_bench --bench tree_bench --bench treemap_bench -- --baseline main        # on your branch
 ```
 
 ## Competitive benchmarks
 
 ```sh
 ./benches/vs_all.sh [PATH]    # disk-cleaner vs du, dust, ncdu (requires hyperfine)
+```
+## Test coverage
+
+```sh
+./scripts/coverage.sh          # summary, requires cargo-llvm-cov
+./scripts/coverage.sh --html   # HTML report
 ```

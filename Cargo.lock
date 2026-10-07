@@ -576,7 +576,6 @@ dependencies = [
  "criterion",
  "dirs",
  "eframe",
- "image",
  "libc",
  "mimalloc",
  "objc2 0.6.4",

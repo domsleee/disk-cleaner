@@ -58,18 +58,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
           path: artifacts
 
-      - name: Generate app icon
+      - name: Build app icon
         run: |
-          cargo build --bin gen_icon --release --features internal-tools
-          ./target/release/gen_icon icon_1024.png
+          cp assets/app_icon.png icon_1024.png
 
           # Create iconset with all required sizes
           mkdir AppIcon.iconset
@@ -148,28 +144,28 @@ jobs:
             --icon "Disk Cleaner.app" 175 190 \
             --hide-extension "Disk Cleaner.app" \
             --app-drop-link 425 190 \
-            "Disk-Cleaner-${GITHUB_REF_NAME}-mac.dmg" \
+            "Disk-Cleaner-mac.dmg" \
             dmg-contents/ \
             || true
           # Verify DMG was created
-          ls -la Disk-Cleaner-*.dmg
+          ls -la Disk-Cleaner-mac.dmg
 
       - name: Package Linux
         run: |
           chmod +x artifacts/disk-cleaner-linux-x86_64/disk-cleaner
-          tar -czf "Disk-Cleaner-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+          tar -czf "Disk-Cleaner-linux-x86_64.tar.gz" \
             -C artifacts/disk-cleaner-linux-x86_64 disk-cleaner
 
       - name: Package Windows
         run: |
           cd artifacts/disk-cleaner-windows-x86_64
-          zip "../../Disk-Cleaner-${GITHUB_REF_NAME}-windows-x86_64.zip" disk-cleaner.exe
+          zip "../../Disk-Cleaner-windows-x86_64.zip" disk-cleaner.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: false
           files: |
-            Disk-Cleaner-*-mac.dmg
-            Disk-Cleaner-*-linux-x86_64.tar.gz
-            Disk-Cleaner-*-windows-x86_64.zip
+            Disk-Cleaner-mac.dmg
+            Disk-Cleaner-linux-x86_64.tar.gz
+            Disk-Cleaner-windows-x86_64.zip

@@ -28,9 +28,9 @@ Download the latest release for your platform:
 
 | Platform | Download |
 |----------|----------|
-| macOS (universal) | [Disk-Cleaner.dmg](https://github.com/domsleee/disk-cleaner/releases/latest) |
-| Linux x86_64 | [tar.gz](https://github.com/domsleee/disk-cleaner/releases/latest) |
-| Windows x86_64 | [.zip](https://github.com/domsleee/disk-cleaner/releases/latest) |
+| macOS (universal) | [Disk-Cleaner-mac.dmg](https://github.com/domsleee/disk-cleaner/releases/latest/download/Disk-Cleaner-mac.dmg) |
+| Linux x86_64 | [Disk-Cleaner-linux-x86_64.tar.gz](https://github.com/domsleee/disk-cleaner/releases/latest/download/Disk-Cleaner-linux-x86_64.tar.gz) |
+| Windows x86_64 | [Disk-Cleaner-windows-x86_64.zip](https://github.com/domsleee/disk-cleaner/releases/latest/download/Disk-Cleaner-windows-x86_64.zip) |
 
 > **macOS note:** The app is not notarized. On first launch, right-click the app and select "Open" to bypass Gatekeeper.
 
